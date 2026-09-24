@@ -3271,7 +3271,10 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             v.addLayout(h)
             h1m = QHBoxLayout()
             h1m.addWidget(QLabel("模型："))
-            ed_model = QLineEdit(str(self.settings.get("train_model") or "yolov8n.pt"))
+            ed_model = QComboBox()
+            ed_model.setEditable(True)
+            ed_model.addItems(["yolov8n.pt", "yolov8s.pt", "yolo26n.pt", "yolo26s.pt"])
+            ed_model.setCurrentText(str(self.settings.get("train_model") or "yolov8n.pt"))
             h1m.addWidget(ed_model, 1)
             b_mo = QPushButton("选…")
             h1m.addWidget(b_mo)
@@ -3408,7 +3411,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 if not (d and os.path.exists(d)):
                     lbl.setText("先选 data.yaml —— 就是「导出 YOLO 数据集…」生成的那个")
                     return
-                mdl = ed_model.text().strip() or "yolov8n.pt"
+                mdl = ed_model.currentText().strip() or "yolov8n.pt"
                 if os.path.sep in mdl or "/" in mdl:
                     if not os.path.exists(mdl):
                         lbl.setText("模型文件不存在：%s" % mdl)
@@ -3438,7 +3441,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     dlg, "选模型（默认 yolov8n.pt；也可以选自己训好的 best.pt）",
                     "", "模型 (*.pt)")
                 if f:
-                    ed_model.setText(f)
+                    ed_model.setCurrentText(f)
 
             b_mo.clicked.connect(do_pick_model_file)
             dlg.exec()
