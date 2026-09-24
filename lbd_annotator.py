@@ -43,6 +43,16 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
 ANNOTATOR_VERSION = "0.3"                       # 标注工具自己的版本号
+def _build_stamp():
+    """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
+    try:
+        p = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
+        return time.strftime("%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
+    except Exception:
+        return "?"
+
+
+BUILD_STAMP = _build_stamp()
 RACK_LEN_TOL = 0.10                             # 支架长度差 ≤10% 算同一类
 UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"      # 在线更新读这个仓库的 Release
 
@@ -1582,7 +1592,7 @@ def make_gui_classes():
                                    QMainWindow, QMessageBox, QPushButton, QStatusBar,
                                    QToolBar, QVBoxLayout, QWidget)
 
-    COLORS = {"Node": QColor(255, 40, 40), "Tracker": QColor(0, 120, 255),
+    COLORS = {"Node": QColor(0, 120, 255), "Tracker": QColor(255, 40, 40),
               "Box": QColor(0, 200, 0)}
     HANDLE_CURSORS = [Qt.CursorShape.SizeFDiagCursor,
                       Qt.CursorShape.SizeVerCursor,
@@ -2053,8 +2063,16 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a.triggered.connect(self.on_check_update)
             tb.addAction(a)
             a = QAction("训练环境…", self)
-            a.setToolTip("检测 Python / 一键装 ultralytics（CPU 版），下一步接一键训练")
+            a.setToolTip("检测 Python / 一键装 ultralytics（CPU 版）+ 一键训练")
             a.triggered.connect(self.on_train_panel)
+            tb.addAction(a)
+            a = QAction("用模型识别…", self)
+            a.setToolTip("用训练好的 YOLO 模型（best.pt）识别图纸，本页/整册自动把框画上来")
+            a.triggered.connect(self.on_ai_detect)
+            tb.addAction(a)
+            a = QAction("识别全册…", self)
+            a.setToolTip("同上，但范围默认选好「整册」：整本图纸逐页跑模型，自动把框画上来")
+            a.triggered.connect(lambda _c=False: self.on_ai_detect(True))
             tb.addAction(a)
             tb.addWidget(QLabel("  名字 "))
             self.cmb_name = QComboBox()
@@ -2535,8 +2553,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 return
             c = self.pm.counts()
             src = ("底图 %d DPI" % self.dpi) if self.dpi > 0 else "底图 内嵌图"
-            self.setWindowTitle("LBD 标注工具 v0.2 — %s ｜ %s"
-                                % (os.path.basename(self.dbg.path), src))
+            self.setWindowTitle("LBD 标注工具 v%s [%s] — %s ｜ %s"
+                                % (ANNOTATOR_VERSION, BUILD_STAMP,
+                                   os.path.basename(self.dbg.path), src))
             self.lbl_info.setText(
                 "第 %d 页 / 共 %d 页\n坐标尺寸 %d × %d\n底图：%s\n"
                 "标签表：%s\nNode %d　Tracker %d　Box %d%s"
@@ -3025,6 +3044,207 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 % (out, n_img, n_box, " / ".join(names),
                    out.replace("\\", "/")))
 
+        def on_ai_detect(self, whole=False):
+            """用训练好的 YOLO 模型识别图纸：选模型 → 阈值 → 本页/整册 → 自动把框画上去。"""
+            # 点了先给一个反馈：这样"没反应"到底是"没点进来"还是"面板没弹出来"一目了然
+            try:
+                self.statusBar().showMessage("正在打开「用模型识别」面板…", 4000)
+                QApplication.processEvents()
+            except Exception:
+                pass
+            # 出任何错都弹出来（窗口版看不到控制台，不然就是"点了没反应"）
+            try:
+                self._ai_detect_impl(whole)
+            except Exception:
+                import traceback
+                QMessageBox.critical(self, "识别面板出错（把这段发我）", traceback.format_exc())
+
+        def _ai_detect_impl(self, whole=False):
+            from PySide6.QtWidgets import (QDialog, QPlainTextEdit, QVBoxLayout, QHBoxLayout,
+                                           QPushButton, QLabel, QComboBox, QLineEdit)
+            from PySide6.QtCore import QObject as _QO, Signal as _SIG
+            import subprocess
+            import tempfile
+            import threading
+            if not (self.dbg and self.pdf and os.path.exists(self.pdf)):
+                QMessageBox.information(self, "缺 PDF", "识别要用 PDF 渲染底图，请先「选 PDF…」。")
+                return
+            pyp = str(self.settings.get("python") or "")
+            if not (pyp and os.path.exists(pyp)):
+                QMessageBox.information(self, "缺 Python",
+                                        "先在「训练环境…」里选好 Python 解释器（3.12 那个）。")
+                return
+            dlg = QDialog(self)
+            dlg.setWindowTitle("用模型识别（YOLO）")
+            dlg.resize(860, 560)
+            v = QVBoxLayout(dlg)
+            h1 = QHBoxLayout()
+            h1.addWidget(QLabel("模型："))
+            ed_m = QLineEdit(str(self.settings.get("model") or ""))
+            h1.addWidget(ed_m, 1)
+            b_m = QPushButton("选…")
+            h1.addWidget(b_m)
+            v.addLayout(h1)
+            h2 = QHBoxLayout()
+            h2.addWidget(QLabel("conf"))
+            ed_c = QLineEdit("0.25")
+            ed_c.setMaximumWidth(60)
+            h2.addWidget(ed_c)
+            h2.addWidget(QLabel("imgsz"))
+            ed_i = QLineEdit("1280")
+            ed_i.setMaximumWidth(70)
+            h2.addWidget(ed_i)
+            h2.addWidget(QLabel("范围"))
+            cmb_scope = QComboBox()
+            cmb_scope.addItems(["本页", "整册"])
+            cmb_scope.setCurrentIndex(1 if whole else 0)
+            h2.addWidget(cmb_scope)
+            h2.addStretch(1)
+            v.addLayout(h2)
+            log = QPlainTextEdit()
+            log.setReadOnly(True)
+            v.addWidget(log, 1)
+            hb = QHBoxLayout()
+            b_run = QPushButton("开始识别")
+            b_cl = QPushButton("关闭")
+            hb.addWidget(b_run)
+            hb.addStretch(1)
+            hb.addWidget(b_cl)
+            v.addLayout(hb)
+            dpi = self.dpi if self.dpi > 0 else 250
+            # 让外部 python 干活的脚本（只干一件事：给一张图，吐一行 JSON 框）
+            script = os.path.join(tempfile.gettempdir(), "lbd_predict.py")
+            try:
+                with open(script, "w", encoding="utf-8") as f:
+                    f.write(
+                        "import sys, json\n"
+                        "from ultralytics import YOLO\n"
+                        "m = YOLO(sys.argv[1])\n"
+                        "r = m.predict(source=sys.argv[2], imgsz=int(sys.argv[4]),\n"
+                        "              conf=float(sys.argv[3]), verbose=False)[0]\n"
+                        "out = []\n"
+                        "names = getattr(r, 'names', None) or {}\n"
+                        "for c, xy, cf in zip(r.boxes.cls.tolist(), r.boxes.xyxy.tolist(),\n"
+                        "                     r.boxes.conf.tolist()):\n"
+                        "    out.append([str(names.get(int(c), c)), float(xy[0]), float(xy[1]),\n"
+                        "                float(xy[2]), float(xy[3]), float(cf)])\n"
+                        "print('@@' + json.dumps(out))\n")
+            except Exception as e:
+                QMessageBox.warning(self, "建脚本失败", "%s" % e)
+                return
+
+            class _Sig(_QO):
+                res = _SIG(int, str, str)      # 页号, 图片路径, JSON 框
+                msg = _SIG(str)
+
+            em = _Sig()
+            em.msg.connect(lambda s: (log.appendPlainText(s),
+                                      log.clear() if log.blockCount() > 3000 else None))
+            labels = ["Node", "Tracker", "Box"]
+
+            def _apply(pg, img_path, js):
+                def _map_label(nm):
+                    """按模型的类别名映射到工具里的标签（模型可能是 {0:Tracker,1:Node}）"""
+                    s = str(nm).strip().lower()
+                    if s.isdigit():                      # 老格式：只有索引
+                        i = int(s)
+                        return labels[i] if 0 <= i < len(labels) else "Tracker"
+                    if "node" in s:
+                        return "Node"
+                    if "box" in s:
+                        return "Box"
+                    return "Tracker"                     # tracker / typical / rack 都归 Tracker
+
+                try:
+                    boxes = json.loads(js) if js else []
+                except Exception:
+                    boxes = []
+                # 类别名：优先用模型旁边的 classes.txt
+                nonlocal labels
+                if labels == ["Node", "Tracker", "Box"]:
+                    try:
+                        ct = os.path.join(os.path.dirname(ed_m.text().strip()), "classes.txt")
+                        if os.path.exists(ct):
+                            with open(ct, encoding="utf-8") as f:
+                                labels = [x.strip() for x in f.read().splitlines() if x.strip()]
+                    except Exception:
+                        pass
+                pm = self.pm if pg == self.page else (self.edited.get(pg)
+                                                      or PageModel(self.dbg, pg))
+                try:
+                    from PySide6.QtGui import QImage as _QI
+                    iw = _QI(img_path).width() or pm.width
+                except Exception:
+                    iw = pm.width
+                sx = float(pm.width) / float(iw or pm.width)
+                sy = sx
+                if not boxes:
+                    em.msg.emit("第 %s 页：没检出框" % pg)
+                    return
+                for c, x1, y1, x2, y2, cf in boxes:
+                    lab = _map_label(c)
+                    pm.shapes.append({"label": lab, "name": "", "confidence": cf,
+                                      "class_id": DEFAULT_CLASS_ID.get(lab, 0),
+                                      "source": "model", "raw": {"conf": cf},
+                                      "ocr_index": None,
+                                      "bbox": [x1 * sx, y1 * sy, x2 * sx, y2 * sy]})
+                pm.dirty = True
+                self.edited[pg] = pm
+                if pg == self.page:
+                    self._rebuild_items()
+                em.msg.emit("第 %s 页：加进来 %d 个框" % (pg, len(boxes)))
+
+            em.res.connect(_apply)
+
+            def work():
+                if cmb_scope.currentIndex() == 0:
+                    pages = [self.page]
+                else:
+                    # 整册 = 文档里的**所有页**（识别模型本来就是给"还没框的图"找框的，
+                    # 不能只挑"已经画过 Node 的页"，否则一张没标过的图会显示 0 页）
+                    pages = sorted(self.dbg.page_numbers())
+                model = ed_m.text().strip()
+                conf = ed_c.text().strip() or "0.25"
+                imgsz = ed_i.text().strip() or "1280"
+                em.msg.emit("开始：%d 页，模型 %s" % (len(pages), os.path.basename(model)))
+                for n, pg in enumerate(pages):
+                    em.msg.emit("[%d/%d] 第 %s 页 …" % (n + 1, len(pages), pg))
+                    try:
+                        img = self.renderer.render(self.pdf, pg, dpi)
+                        pr = subprocess.run([pyp, script, model, img, conf, imgsz],
+                                            capture_output=True, text=True, encoding="utf-8",
+                                            errors="replace", timeout=3600,
+                                            creationflags=_NO_WINDOW)
+                        js = ""
+                        for line in (pr.stdout or "").splitlines():
+                            if line.startswith("@@"):
+                                js = line[2:]
+                        if not js:
+                            em.msg.emit("    没拿到结果：" + ((pr.stderr or "").strip()[-300:]))
+                        em.res.emit(pg, img, js)
+                    except Exception as e:
+                        em.msg.emit("    第 %s 页出错：%s" % (pg, e))
+                em.msg.emit("识别结束")
+
+            def do_run():
+                if not (ed_m.text().strip() and os.path.exists(ed_m.text().strip())):
+                    log.appendPlainText("先选模型文件（best.pt）")
+                    return
+                self.settings["model"] = ed_m.text().strip()
+                save_settings(self.settings)
+                threading.Thread(target=work, daemon=True).start()
+
+            def do_pick_model():
+                f, _x = QFileDialog.getOpenFileName(dlg, "选模型", "",
+                                                    "模型 (*.pt *.onnx)")
+                if f:
+                    ed_m.setText(f)
+
+            b_m.clicked.connect(do_pick_model)
+            b_run.clicked.connect(do_run)
+            b_cl.clicked.connect(dlg.accept)
+            dlg.exec()
+
         def on_train_panel(self):
             """训练环境面板：探测 Python / 检测 ultralytics / 一键装（日志实时显示）。"""
             from PySide6.QtWidgets import (QDialog, QPlainTextEdit, QVBoxLayout, QHBoxLayout,
@@ -3049,6 +3269,18 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             b_br = QPushButton("浏览…")
             h.addWidget(b_br)
             v.addLayout(h)
+            h1m = QHBoxLayout()
+            h1m.addWidget(QLabel("模型："))
+            ed_model = QLineEdit(str(self.settings.get("train_model") or "yolov8n.pt"))
+            h1m.addWidget(ed_model, 1)
+            b_mo = QPushButton("选…")
+            h1m.addWidget(b_mo)
+            v.addLayout(h1m)
+            from PySide6.QtWidgets import QCheckBox
+            chk_resume = QCheckBox("续训(resume)：用 last.pt 接着原来那次跑")
+            chk_resume.setToolTip("勾上后 data.yaml / epochs / imgsz / batch / device 都会被忽略"
+                                  "（resume 会沿用原来那次的设置和剩余轮数）")
+            v.addWidget(chk_resume)
             lbl = QLabel("Python 3.14 装不上 torch —— 请选 3.11 / 3.12。"
                          "这台机器是 GT 1030(2GB)+老驱动，只能跑 CPU 版。")
             lbl.setWordWrap(True)
@@ -3099,6 +3331,22 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             def run(args, tag):
                 log.appendPlainText("$ " + " ".join(args))
 
+                # ★ 子线程绝对不能直接动 Qt 控件（ultralytics 每秒吐上百行，直接 append
+                #   会把 Qt 刷崩 = 闪退）。改用信号：子线程 emit，GUI 线程 append。
+                from PySide6.QtCore import QObject as _QO, Signal as _SIG
+
+                class _Emit(_QO):
+                    sig = _SIG(str)
+
+                em = _Emit()
+
+                def _add(s):
+                    log.appendPlainText(s)
+                    if log.blockCount() > 3000:      # 别让日志无限长
+                        log.clear()
+
+                em.sig.connect(_add)
+
                 def work():
                     try:
                         pr = subprocess.Popen(args, stdout=subprocess.PIPE,
@@ -3106,11 +3354,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                               encoding="utf-8", errors="replace",
                                               creationflags=_NO_WINDOW)
                         for line in pr.stdout:
-                            log.appendPlainText(line.rstrip())
+                            em.sig.emit(line.rstrip())
                         pr.wait()
-                        log.appendPlainText("[%s] 结束，退出码 %s" % (tag, pr.returncode))
+                        em.sig.emit("[%s] 结束，退出码 %s" % (tag, pr.returncode))
                     except Exception as e:
-                        log.appendPlainText("[%s] 出错：%s" % (tag, e))
+                        em.sig.emit("[%s] 出错：%s" % (tag, e))
                 threading.Thread(target=work, daemon=True).start()
 
             def do_check():
@@ -3160,18 +3408,39 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 if not (d and os.path.exists(d)):
                     lbl.setText("先选 data.yaml —— 就是「导出 YOLO 数据集…」生成的那个")
                     return
-                code = ("from ultralytics import YOLO;"
-                        "YOLO('yolov8n.pt').train(data=r'%s', imgsz=%s, epochs=%s, "
-                        "batch=%s, device='%s')"
-                        % (d, ed_im.text().strip() or "1280",
-                           ed_ep.text().strip() or "20",
-                           ed_ba.text().strip() or "4",
-                           ed_dv.text().strip() or "cpu"))
+                mdl = ed_model.text().strip() or "yolov8n.pt"
+                if os.path.sep in mdl or "/" in mdl:
+                    if not os.path.exists(mdl):
+                        lbl.setText("模型文件不存在：%s" % mdl)
+                        return
+                self.settings["train_model"] = mdl
+                save_settings(self.settings)
+                if chk_resume.isChecked():
+                    code = ("from ultralytics import YOLO;"
+                            "YOLO(r'%s').train(resume=True)" % mdl)
+                    lbl.setText("续训：用 last.pt 接着原来那次跑"
+                                "（data/epochs 这些参数会被忽略）")
+                else:
+                    code = ("from ultralytics import YOLO;"
+                            "YOLO(r'%s').train(data=r'%s', imgsz=%s, epochs=%s, "
+                            "batch=%s, device='%s')"
+                            % (mdl, d, ed_im.text().strip() or "1280",
+                               ed_ep.text().strip() or "20",
+                               ed_ba.text().strip() or "4",
+                               ed_dv.text().strip() or "cpu"))
                 lbl.setText("训练已启动（日志在下面滚；权重在 runs/detect/train/weights/best.pt）")
                 run([p, "-c", code], "训练")
 
             b4.clicked.connect(do_train)
             b_d.clicked.connect(do_pick_data)
+            def do_pick_model_file():
+                f, _x = QFileDialog.getOpenFileName(
+                    dlg, "选模型（默认 yolov8n.pt；也可以选自己训好的 best.pt）",
+                    "", "模型 (*.pt)")
+                if f:
+                    ed_model.setText(f)
+
+            b_mo.clicked.connect(do_pick_model_file)
             dlg.exec()
 
         def on_check_update(self):
