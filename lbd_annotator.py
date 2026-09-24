@@ -3028,7 +3028,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         def on_train_panel(self):
             """训练环境面板：探测 Python / 检测 ultralytics / 一键装（日志实时显示）。"""
             from PySide6.QtWidgets import (QDialog, QPlainTextEdit, QVBoxLayout, QHBoxLayout,
-                                           QPushButton, QLabel, QComboBox)
+                                           QPushButton, QLabel, QComboBox, QLineEdit)
             import subprocess
             import threading
             dlg = QDialog(self)
@@ -3056,12 +3056,38 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             log = QPlainTextEdit()
             log.setReadOnly(True)
             v.addWidget(log, 1)
+            hv = QHBoxLayout()
+            hv.addWidget(QLabel("data.yaml："))
+            ed_data = QLineEdit()
+            hv.addWidget(ed_data, 1)
+            b_d = QPushButton("选…")
+            hv.addWidget(b_d)
+            v.addLayout(hv)
+            hv2 = QHBoxLayout()
+            for _t, _w, _d in (("epochs", 60, "20"), ("imgsz", 70, "1280"),
+                               ("batch", 50, "4"), ("device", 70, "cpu")):
+                hv2.addWidget(QLabel(_t))
+                _e = QLineEdit(_d)
+                _e.setMaximumWidth(_w)
+                hv2.addWidget(_e)
+                if _t == "epochs":
+                    ed_ep = _e
+                elif _t == "imgsz":
+                    ed_im = _e
+                elif _t == "batch":
+                    ed_ba = _e
+                else:
+                    ed_dv = _e
+            hv2.addStretch(1)
+            v.addLayout(hv2)
             hb = QHBoxLayout()
             b1 = QPushButton("检测环境")
             b2 = QPushButton("一键装环境(CPU)")
+            b4 = QPushButton("开始训练")
             b3 = QPushButton("关闭")
             hb.addWidget(b1)
             hb.addWidget(b2)
+            hb.addWidget(b4)
             hb.addStretch(1)
             hb.addWidget(b3)
             v.addLayout(hb)
@@ -3119,6 +3145,33 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             b2.clicked.connect(do_install)
             b3.clicked.connect(dlg.accept)
             b_br.clicked.connect(do_browse)
+            def do_pick_data():
+                f, _x = QFileDialog.getOpenFileName(dlg, "选 data.yaml（导出数据集时生成的）",
+                                                    "", "YAML (*.yaml *.yml)")
+                if f:
+                    ed_data.setText(f)
+
+            def do_train():
+                p = cur_py()
+                if not p:
+                    lbl.setText("先选一个有效的 python.exe（「浏览…」）")
+                    return
+                d = ed_data.text().strip()
+                if not (d and os.path.exists(d)):
+                    lbl.setText("先选 data.yaml —— 就是「导出 YOLO 数据集…」生成的那个")
+                    return
+                code = ("from ultralytics import YOLO;"
+                        "YOLO('yolov8n.pt').train(data=r'%s', imgsz=%s, epochs=%s, "
+                        "batch=%s, device='%s')"
+                        % (d, ed_im.text().strip() or "1280",
+                           ed_ep.text().strip() or "20",
+                           ed_ba.text().strip() or "4",
+                           ed_dv.text().strip() or "cpu"))
+                lbl.setText("训练已启动（日志在下面滚；权重在 runs/detect/train/weights/best.pt）")
+                run([p, "-c", code], "训练")
+
+            b4.clicked.connect(do_train)
+            b_d.clicked.connect(do_pick_data)
             dlg.exec()
 
         def on_check_update(self):
