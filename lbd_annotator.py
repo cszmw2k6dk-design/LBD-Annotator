@@ -1,0 +1,3779 @@
+# -*- coding: utf-8 -*-
+"""LBD 标注工具 v0.2（内嵌标注页原型）
+
+直接读写 agent3-debug 识别结果 JSON：改框、改 LBD 名字，另存出一份完整 JSON 给下游程序用。
+
+用法:
+    python lbd_annotator.py                 # 打开对话框选 JSON
+    python lbd_annotator.py 识别结果.json
+    python lbd_annotator.py --selftest      # 无界面自检（改一页 -> 另存 -> 用下游代码验证）
+
+设计要点:
+  * 不动原文件。默认「另存为」xxx_annotated.json；「覆盖保存」会先备份 .bak-时间戳。
+  * 图片直接从 JSON 里内嵌的 png_base64 解出来，不落地 PNG。
+  * 246MB 的 JSON 按字节流式读写：只替换改过的页所在的三个顶层数组，
+    其它段落（含没改过的页）逐字节保留原样。
+  * Node 框与 ocr_node_name_results 记录一一对应（按 node_bbox 对齐），
+    改名写进 final_node_name —— 这正是下游 extract_lines_from_debug 读的字段。
+"""
+import argparse
+import copy
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+CLASSES = ("Node", "Tracker", "Box")
+# 调外部程序（pdftoppm / pdfinfo）时别弹那个黑窗口：Windows 下加 CREATE_NO_WINDOW
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+# Qt 默认单张图片解码上限 256MB：6000x4000(96MB) 没问题，但 333dpi 的
+# 11988x7992 要 383MB，会被拒（表现就是"渲染结果读不出来"）。放宽到 1GB。
+os.environ.setdefault("QT_IMAGEIO_MAXALLOC", "1024")
+TRACKER_SECTION = "yolo_tracker_detection_results"
+BOX_SECTION = "yolo_box_detection_results"
+OCR_SECTION = "ocr_node_name_results"
+SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
+DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
+WS = b" \t\r\n"
+DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
+ANNOTATOR_VERSION = "0.3"                       # 标注工具自己的版本号
+RACK_LEN_TOL = 0.10                             # 支架长度差 ≤10% 算同一类
+UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"      # 在线更新读这个仓库的 Release
+
+
+def find_pythons():
+    """机器上可能能用的 Python 解释器（训练/推理要用）。
+
+    注意：Python 3.14 现在装不上 torch，所以优先列 3.12 / 3.11。
+    """
+    out = []
+    try:
+        w = shutil.which("python")
+        if w:
+            out.append(w)
+    except Exception:
+        pass
+    bases = ["C:\\", os.environ.get("LOCALAPPDATA") or "",
+             os.path.join(os.environ.get("USERPROFILE") or "", "anaconda3"),
+             os.path.join(os.environ.get("USERPROFILE") or "", "miniconda3")]
+    for base in bases:
+        if not base:
+            continue
+        for ver in ("312", "311", "313", "310", "39"):
+            for p in (os.path.join(base, "Python%s" % ver, "python.exe"),
+                      os.path.join(base, "Programs", "Python", "Python%s" % ver, "python.exe"),
+                      os.path.join(base, "python%s" % ver, "python.exe"),
+                      os.path.join(base, "envs", "py%s" % ver, "python.exe")):
+                if os.path.exists(p) and p not in out:
+                    out.append(p)
+        p = os.path.join(base, "python.exe")
+        if os.path.exists(p) and p not in out:
+            out.append(p)
+    return out
+
+# ------------------------------------------------------- 高分辨率底图（重新渲染 PDF）
+POPPLER_HINTS = (
+    # 便携位置：放个 poppler 文件夹，或直接把 pdftoppm.exe 放程序旁边，都认
+    r"poppler\pdftoppm.exe",
+    r"pdftoppm.exe",
+    r"poppler\Library\bin\pdftoppm.exe",
+    r"%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies"
+    r"\native\poppler\Library\bin\pdftoppm.exe",
+    r"C:\Program Files\poppler\Library\bin\pdftoppm.exe",
+    r"C:\Program Files (x86)\poppler\Library\bin\pdftoppm.exe",
+    r"C:\poppler\Library\bin\pdftoppm.exe",
+)
+
+
+def app_dir():
+    """程序所在目录：打包成 exe 后是 exe 的目录，源码运行时是脚本目录。
+
+    设置文件、渲染缓存都放这儿，打包后才是「跟着程序走」的便携目录 ——
+    不会写进 exe 解包出来的临时目录（那里面一关就没了）。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_pdftoppm():
+    for h in POPPLER_HINTS:
+        p = os.path.expandvars(h)
+        if not os.path.isabs(p):
+            p = os.path.join(app_dir(), p)          # 相对路径按程序目录找
+        if os.path.exists(p):
+            return p
+    return shutil.which("pdftoppm") or ""
+
+
+def find_poppler(exe):
+    """同一个 poppler 目录下的其它工具（pdfinfo 等）。"""
+    for h in POPPLER_HINTS:
+        p = os.path.expandvars(h)
+        if not os.path.isabs(p):
+            p = os.path.join(app_dir(), p)
+        cand = os.path.join(os.path.dirname(p), exe)
+        if os.path.exists(cand):
+            return cand
+    return shutil.which(exe) or ""
+
+
+def pdf_page_sizes(pdf):
+    """{页号: (宽pt, 高pt, 旋转角)}：一次 pdfinfo 读完整册页尺寸。
+
+    注意 pdfinfo 报的是**未旋转**的 mediabox，而 pdftoppm 渲染时会应用 /Rotate，
+    所以这里把旋转角一并带出来，让调用方决定要不要把宽高对调。
+    """
+    exe = find_poppler("pdfinfo.exe")
+    if not exe:
+        return {}
+    try:
+        out = subprocess.run([exe, pdf], capture_output=True, text=True,
+                             errors="replace", timeout=120,
+                             creationflags=_NO_WINDOW).stdout
+        m = re.search(r"^Pages:\s+(\d+)", out, re.M)
+        if not m:
+            return {}
+        n = int(m.group(1))
+        out = subprocess.run([exe, "-f", "1", "-l", str(n), pdf], capture_output=True,
+                             text=True, errors="replace", timeout=600,
+                             creationflags=_NO_WINDOW).stdout
+    except Exception:
+        return {}
+    sizes = {}
+    for m in re.finditer(r"^Page\s+(\d+)\s+size:\s+([\d.]+)\s+x\s+([\d.]+)\s+pts", out, re.M):
+        sizes[int(m.group(1))] = [float(m.group(2)), float(m.group(3)), 0]
+    for m in re.finditer(r"^Page\s+(\d+)\s+rot:\s+(-?\d+)", out, re.M):
+        n = int(m.group(1))
+        if n in sizes:
+            sizes[n][2] = int(m.group(2)) % 360
+    sizes = {n: tuple(v) for n, v in sizes.items()}
+    return sizes
+
+
+def rss_mb():
+    """当前进程占用的物理内存（MB）：Windows 用 psapi，其它平台尽力而为。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PMC(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t)]
+        p = PMC()
+        p.cb = ctypes.sizeof(PMC)
+        h = ctypes.windll.kernel32.GetCurrentProcess()
+        ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(p), p.cb)
+        return p.WorkingSetSize / 1048576.0
+    except Exception:
+        return 0.0
+
+
+class BlankDoc:
+    """没有识别结果、直接拿 PDF 标注时用的空文档：页数/尺寸来自 PDF，标注从零开始。
+
+    坐标空间 = 按 self.dpi 渲染出来的像素（和底图渲染分辨率一致，框不会飘）。
+    保存时生成一份和识别结果同格式的 JSON，可以直接喂给下游。
+    """
+
+    is_blank = True
+
+    def __init__(self, pdf, dpi=250.0):
+        self.path = pdf
+        self.dpi = float(dpi)
+        self.project = os.path.splitext(os.path.basename(pdf))[0]
+        self.pages = {}
+        for n, (w_pt, h_pt, rot) in sorted(pdf_page_sizes(pdf).items()):
+            if rot in (90, 270):                 # 渲染时会旋转，宽高对调
+                w_pt, h_pt = h_pt, w_pt
+            self.pages[n] = {"page_number": n,
+                             "width": max(1, int(round(w_pt * self.dpi / 72.0))),
+                             "height": max(1, int(round(h_pt * self.dpi / 72.0))),
+                             "png_span": None}
+
+    def page_numbers(self):
+        return sorted(self.pages)
+
+    def page_data(self, key, page_number):
+        return None
+
+    def save(self, dest, modified):
+        doc = {"schema_version": "agent3-debug-v1",
+               "generator": "lbd_annotator（直接标注 PDF，无识别结果）",
+               "source_pdf": os.path.basename(self.path),
+               "render_dpi": self.dpi,
+               "input_data": {"project_name": self.project,
+                              "pages": [{"page_number": n, "media_type": "image/png",
+                                         "width": self.pages[n]["width"],
+                                         "height": self.pages[n]["height"]}
+                                        for n in self.page_numbers()]},
+               "yolo_tracker_detection_results": [],
+               "yolo_box_detection_results": [],
+               "ocr_node_name_results": []}
+        for n in self.page_numbers():
+            m = modified.get(n)
+            if not m:
+                # 没标注的页不写记录：下游是按"有东西的页"给底图排页号的，
+                # 给每页都写一条空记录会让页号映射退化成 1:1，底图就对不上了。
+                continue
+            doc["yolo_tracker_detection_results"].append({"page_number": n, "data": m["tracker"]})
+            doc["yolo_box_detection_results"].append({"page_number": n, "data": m["box"]})
+            doc["ocr_node_name_results"].append({"page_number": n, "data": m["ocr"]})
+        tmp = dest + ".part"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        os.replace(tmp, dest)
+        return sorted(modified)
+
+
+def project_name(json_path):
+    """从 JSON 开头取 project_name（只读头 4KB，不整份解析）。"""
+    try:
+        with open(json_path, "rb") as f:
+            head = f.read(4096).decode("utf-8", "ignore")
+        m = re.search(r'"project_name"\s*:\s*"([^"]+)"', head)
+        return m.group(1).strip() if m else ""
+    except Exception:
+        return ""
+
+
+def guess_pdf(json_path, exact_only=False):
+    """按 JSON 里的 project_name 猜 PDF（同目录优先，其次 Downloads / 桌面）。
+    exact_only=True 时只认文件名完全对得上的，不用兜底。"""
+    name = project_name(json_path)
+    home = os.path.expanduser("~")
+    dirs = [os.path.dirname(os.path.abspath(json_path)),
+            os.path.join(home, "Downloads"), os.path.join(home, "Desktop")]
+    if name:
+        want = (name + ".pdf").lower()
+        for d in dirs:
+            p = os.path.join(d, name + ".pdf")
+            if os.path.exists(p):
+                return p
+        for d in dirs:
+            if not os.path.isdir(d):
+                continue
+            base_depth = d.rstrip(os.sep).count(os.sep)
+            for root, subdirs, files in os.walk(d):
+                if root.count(os.sep) - base_depth > 3:
+                    subdirs[:] = []
+                    continue
+                for f in files:
+                    if f.lower() == want:
+                        return os.path.join(root, f)
+    if exact_only:
+        return ""
+    d = dirs[0]
+    if os.path.isdir(d):
+        for f in sorted(os.listdir(d)):
+            if f.lower().endswith(".pdf"):
+                return os.path.join(d, f)
+    return ""
+
+
+class Renderer:
+    """用 poppler 按更高 DPI 重渲染某一页，结果缓存到磁盘。"""
+
+    def __init__(self, exe, cache_root):
+        self.exe = exe
+        self.cache_root = cache_root
+        self.sweep()
+
+    def sweep(self):
+        """清掉上次被中断留下的临时文件（渲染到一半被杀会残留）。"""
+        try:
+            for p in glob.glob(os.path.join(self.cache_root, "*", "_tmp_*.png")):
+                if time.time() - os.path.getmtime(p) > 1800:
+                    os.remove(p)
+        except Exception:
+            pass
+
+    @staticmethod
+    def pdf_tag(pdf):
+        """把 PDF 的身份揉进缓存路径：换一份 PDF 必须换一套缓存，否则会拿到别人的图。"""
+        try:
+            st = os.stat(pdf)
+            key = "%s|%d|%d" % (os.path.abspath(pdf).lower(), st.st_size, int(st.st_mtime))
+        except OSError:
+            key = os.path.abspath(pdf).lower()
+        return hashlib.md5(key.encode("utf-8")).hexdigest()[:8]
+
+    def target(self, pdf, page, dpi):
+        return os.path.join(self.cache_root, "%ddpi_%s" % (dpi, self.pdf_tag(pdf)),
+                            "p%03d.png" % page)
+
+    def render(self, pdf, page, dpi):
+        out = self.target(pdf, page, dpi)
+        if os.path.exists(out) and os.path.getsize(out) > 1000:
+            return out
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        # 每个线程用各自的临时前缀，避免预取和当前页撞车（os.replace 是原子的）
+        tmp_prefix = os.path.join(os.path.dirname(out),
+                                  "_tmp_p%03d_%d" % (page, threading.get_ident()))
+        for old in glob.glob(tmp_prefix + "*.png"):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        subprocess.run([self.exe, "-png", "-r", str(dpi), "-f", str(page),
+                        "-l", str(page), pdf, tmp_prefix],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=300, creationflags=_NO_WINDOW)
+        made = sorted(glob.glob(tmp_prefix + "*.png"))
+        if not made:
+            raise RuntimeError("渲染没有产出文件")
+        os.replace(made[0], out)
+        for extra in made[1:]:
+            try:
+                os.remove(extra)
+            except OSError:
+                pass
+        return out
+
+
+def settings_path():
+    """设置文件放 %LOCALAPPDATA%，不放在程序旁边。
+
+    打包成文件夹版放到桌面后，程序旁边就是桌面 —— 设置和渲染缓存写在程序目录，
+    桌面上就会冒出一堆文件和文件夹。老位置里的设置会自动搬过来。
+    """
+    return os.path.join(work_dir(), "annotator_settings.json")
+
+
+def work_dir():
+    """放设置 / 渲染缓存的地方（不动程序目录）。"""
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if base:
+        d = os.path.join(base, "LBD标注工具")
+        try:
+            os.makedirs(d, exist_ok=True)
+            return d
+        except Exception:
+            pass
+    return app_dir()
+
+
+def cache_dir():
+    return os.path.join(work_dir(), "render_cache")
+
+
+def load_settings():
+    old = os.path.join(app_dir(), "annotator_settings.json")
+    try:
+        with open(settings_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        pass
+    # 老版本把设置放在程序旁边：读得到就搬过来（PDF/标签表路径不用重选）
+    try:
+        if os.path.exists(old):
+            with open(old, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            save_settings(d)
+            return d
+    except Exception:
+        pass
+    return {}
+
+
+def save_settings(d):
+    try:
+        with open(settings_path(), "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------- PDF 文字层：框内找 LBD 标签
+# 这一套和主程序 app.py 里的 _pdf_text_items 等价，搬到标注工具里是为了
+# "从已经框好的 LBD 区域里取标签文字"，不依赖任何识别模型。
+def _pdf_rotate(page):
+    try:
+        return int(page.get("/Rotate") or 0) % 360
+    except Exception:
+        return 0
+
+
+def _pdf_norm_pt(page, x, y):
+    """PDF 用户坐标 -> 底图（渲染图）归一化坐标 (fx, fy)，fy 从下往上。
+
+    PDF 带 /Rotate 时文字层坐标是没转过的，而底图是按转过的样子渲染的，
+    不换算整片文字会跑到错位置。
+    """
+    try:
+        cb = page.cropbox
+        x0, y0 = float(cb.left), float(cb.bottom)
+        pw = float(cb.right) - x0
+        ph = float(cb.top) - y0
+    except Exception:
+        x0, y0, pw, ph = 0.0, 0.0, 1.0, 1.0
+    pw = pw or 1.0
+    ph = ph or 1.0
+    x = float(x) - x0
+    y = float(y) - y0
+    rot = _pdf_rotate(page)
+    if rot == 90:
+        return (y / ph, (pw - x) / pw)
+    if rot == 180:
+        return ((pw - x) / pw, (ph - y) / ph)
+    if rot == 270:
+        return ((ph - y) / ph, x / pw)
+    return (x / pw, y / ph)
+
+
+def _pdf_text_items(page):
+    """一页 -> [(文字, fx中心, fy中心, fx1, fy1, fx2, fy2)]（底图归一化坐标）。"""
+    items = []
+
+    def visit_text(text, cm, tm, font, size):
+        if not text or not text.strip():
+            return
+        try:
+            m0 = cm[0] * tm[0] + cm[2] * tm[1]
+            m1 = cm[1] * tm[0] + cm[3] * tm[1]
+            m2 = cm[0] * tm[2] + cm[2] * tm[3]
+            m3 = cm[1] * tm[2] + cm[3] * tm[3]
+            m4 = cm[0] * tm[4] + cm[2] * tm[5] + cm[4]
+            m5 = cm[1] * tm[4] + cm[3] * tm[5] + cm[5]
+        except Exception:
+            m0, m1, m2, m3, m4, m5 = 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
+        try:
+            cs = float(size)
+        except Exception:
+            cs = 0.0
+        w = cs * 0.5 * len(text)
+        h = cs
+        xs, ys = [], []
+        for tx, ty in ((0.0, 0.0), (w, 0.0), (0.0, h), (w, h)):
+            xs.append(m0 * tx + m2 * ty + m4)
+            ys.append(m1 * tx + m3 * ty + m5)
+        pts = [_pdf_norm_pt(page, px, py)
+               for px, py in ((min(xs), min(ys)), (max(xs), min(ys)),
+                              (min(xs), max(ys)), (max(xs), max(ys)))]
+        fx1, fx2 = min(p[0] for p in pts), max(p[0] for p in pts)
+        fy1, fy2 = min(p[1] for p in pts), max(p[1] for p in pts)
+        items.append((text.strip(), (fx1 + fx2) * 0.5, (fy1 + fy2) * 0.5,
+                      fx1, fy1, fx2, fy2))
+
+    page.extract_text(visitor_text=visit_text)
+    return items
+
+
+class PdfText:
+    """按页取 PDF 文字块（复用同一个 reader + 缓存：整册跑才不至于太慢）。"""
+
+    def __init__(self, pdf):
+        from pypdf import PdfReader
+        self.pdf = pdf
+        self.reader = PdfReader(pdf)
+        self._cache = {}
+
+    def count(self):
+        return len(self.reader.pages)
+
+    def items(self, page_number):
+        if page_number not in self._cache:
+            try:
+                self._cache[page_number] = _pdf_text_items(
+                    self.reader.pages[int(page_number) - 1])
+            except Exception:
+                self._cache[page_number] = []
+        return self._cache[page_number]
+
+
+# ------------------------------------------------------- LBD 标签表（xlsx）
+_XL_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_XL_RN = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+def _xlsx_sheets(path, want_cols=("A", "C")):
+    """xlsx -> 有序的 [(分表名, {行号: {列: 文字}})]。不用 Excel，直接解 zip。"""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    out = []
+    with zipfile.ZipFile(path) as z:
+        have = set(z.namelist())
+
+        def _read(name):
+            return z.read(name) if name in have else None
+
+        wb = ET.fromstring(_read("xl/workbook.xml"))
+        rels = ET.fromstring(_read("xl/_rels/workbook.xml.rels"))
+        rid2t = {r.get("Id"): r.get("Target") for r in rels}
+        shared = []
+        sst = _read("xl/sharedStrings.xml")
+        if sst is not None:
+            for si in ET.fromstring(sst):
+                shared.append("".join(t.text or "" for t in si.iter(_XL_NS + "t")))
+        for el in wb.iter():
+            if not el.tag.endswith("}sheet"):
+                continue
+            sheet = (el.get("name") or "").strip()
+            tgt = (rid2t.get(el.get(_XL_RN + "id")) or "").lstrip("/")
+            if not sheet or not tgt:
+                continue
+            if not tgt.startswith("xl/"):
+                tgt = "xl/" + tgt
+            data = _read(tgt)
+            if data is None:
+                continue
+            cells = {}
+            for row in ET.fromstring(data).iter(_XL_NS + "row"):
+                rn = int(row.get("r") or 0)
+                for c in row:
+                    if c.tag != _XL_NS + "c":
+                        continue
+                    ref = c.get("r") or ""
+                    m = re.match(r"[A-Z]+", ref)
+                    col = m.group(0) if m else ""
+                    if col not in want_cols:
+                        continue
+                    typ = c.get("t")
+                    v = c.find(_XL_NS + "v")
+                    val = ""
+                    if typ == "s" and v is not None:
+                        try:
+                            val = shared[int(v.text)]
+                        except Exception:
+                            val = ""
+                    elif typ == "inlineStr":
+                        ins = c.find(_XL_NS + "is")
+                        val = ("".join(x.text or "" for x in ins.iter(_XL_NS + "t"))
+                               if ins is not None else "")
+                    else:
+                        val = v.text if v is not None else ""
+                    cells.setdefault(rn, {})[col] = (val or "").strip()
+            out.append((sheet, cells))
+    return out
+
+
+def xlsx_sheet_names(path):
+    """标签表的分表名（按表顺序）。"""
+    try:
+        return [nm for nm, _c in _xlsx_sheets(path)]
+    except Exception:
+        return []
+
+
+def xlsx_lbd_rows(path, sheet_name):
+    """一个分表的 LBD 行（按表里的行顺序）-> [(编号, 名称串)]。
+
+    编号规则和 CAD 插件对齐：A 列写了 "LBD-15" 就用 15；A 列没有纯编号
+    （比如 Yellow Viking 的 "1.C.1"）就按"这个分表里第几个 LBD 行"算 1,2,3…
+    —— 两边同一套键，标签才对得上。
+    """
+    cells_all = None
+    for name, cells in _xlsx_sheets(path):
+        if name.strip().upper() == str(sheet_name).strip().upper():
+            cells_all = cells
+            break
+    if not cells_all:
+        return []
+    order = sorted(cells_all)
+    # 表头（C 列 "Item Code" / A 列 "LBD NO."）之后才开始算 LBD 行，
+    # 不然 "Lynx Plus 1.01" 这种标题行会被当成第一行
+    start = 0
+    for k, rn in enumerate(order):
+        a = cells_all[rn].get("A", "")
+        c = cells_all[rn].get("C", "")
+        if re.search(r"item\s*code", c, re.I) or re.match(r"^LBD\s*NO", a, re.I):
+            start = k + 1
+            break
+    rows = []
+    for rn in order[start:]:
+        a = cells_all[rn].get("A", "")
+        c = cells_all[rn].get("C", "")
+        if a:
+            rows.append([a, []])
+        if c and rows:
+            rows[-1][1].append(c)
+    numbered = [_lbd_num_in(a) for a, _l in rows]
+    # 只要有一行 A 列写了 "LBD-15" 这种真编号，就按真编号走（South Platte）；
+    # 否则按"这个分表里的第几行"编号（Yellow Viking 的 "1.C.1" 这种）
+    use_num = any(n is not None for n in numbered)
+    out = []
+    k = 0
+    for (a, labels), n in zip(rows, numbered):
+        if not labels:
+            continue
+        k += 1
+        num = n if (use_num and n is not None) else k
+        out.append((num, "/".join(labels)))
+    return out
+
+
+# ------------------------------------------------------- 框内取标签 / 编号
+LBD_NUM_RE = re.compile(r"LBD\s*[_\-–—]?\s*0*(\d+)", re.I)
+# 有些图里框内只印一个裸编号（"07" / "#7"），文字层里并没有 "LBD" 三个字母。
+# 只认"整条就是数字"的，别把 3.5、1:100 这种尺寸/比例当编号。
+BARE_NUM_RE = re.compile(r"^#?\s*0*(\d{1,3})\.?$")
+# 兜底：框里任何文字里的第一个数字（"1.C.1"、"LBD-07"、"07" 都行）
+ANY_NUM_RE = re.compile(r"(\d{1,3})")
+INV_RE = re.compile(r"INV\s*0*(\d+)\s*([A-Za-z])\s*0*(\d+)", re.I)
+SHEET_CLEAN_RE = re.compile(r"[^0-9A-Za-z.]")
+
+
+def _clean_key(s):
+    return SHEET_CLEAN_RE.sub("", str(s or "")).upper()
+
+
+def _lbd_num_in(text):
+    m = LBD_NUM_RE.search(str(text or ""))
+    return int(m.group(1)) if m else None
+
+
+def _inv_in(text):
+    """文字里自带的 INV 分表名（如 INV31B102_LBD_07 -> INV31B102），没有返回 None。"""
+    m = INV_RE.search(str(text or ""))
+    if not m:
+        return None
+    return ("INV%s%s%s" % (m.group(1), m.group(2).upper(), m.group(3))).upper()
+
+
+def norm_sheet(s):
+    """分表名归一化：INV31B102 / inv31b102 / INV31B102_LBD_07 都能对上。"""
+    return _clean_key(s)
+
+
+def sheet_in_text(text, sheet_names):
+    """文字里命中的分表名（取最长的那个，避免 "1.0" 抢 "1.01"）。"""
+    key = _clean_key(text)
+    if not key:
+        return None
+    best = None
+    for nm in sheet_names:
+        k = _clean_key(nm)
+        if k and k in key and (best is None or len(k) > len(_clean_key(best))):
+            best = nm
+    return best
+
+
+def page_sheet_by_text(text_items, sheet_names):
+    """页面文字里出现次数最多的分表名 + 次数（用来校验"按顺序"推断的对不对）。"""
+    counts = {}
+    for it in text_items:
+        nm = sheet_in_text(it[0], sheet_names)
+        if nm:
+            counts[nm] = counts.get(nm, 0) + 1
+    if not counts:
+        return None, 0
+    nm = max(counts, key=lambda k: counts[k])
+    return nm, counts[nm]
+
+
+def _box_dist(b, x, y):
+    dx = max(b[0] - x, 0.0, x - b[2])
+    dy = max(b[1] - y, 0.0, y - b[3])
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _box_center(b):
+    return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+
+
+def _flag_suspicious(shapes):
+    """同一行里相邻两个框的号不连续（比如 3、7）-> 标 _check，返回清单。
+
+    自动补号最常见的错法就是"这一排的号跳了"，拿它当"位置可能错"的提示。
+    返回 [(名字, x, y), ...]，坐标是底图像素（人照着这个去图上找）。
+    """
+    nodes = []
+    for s in shapes:
+        if s.get("label") != "Node":
+            continue
+        n = _lbd_num_in(s.get("name") or "")
+        if n is None:
+            continue
+        cx, cy = _box_center(s["bbox"])
+        nodes.append((cy, cx, n, s))
+    if len(nodes) < 2:
+        return []
+    rows = _rows_of(nodes, _row_tol(shapes))
+    out = []
+    for row in rows:
+        for k in range(len(row) - 1):
+            if abs(row[k][2] - row[k + 1][2]) != 1:
+                for it in (row[k], row[k + 1]):
+                    if not it[3].get("_check"):
+                        it[3]["_check"] = True
+                        out.append((it[3].get("name"), round(it[1]), round(it[0])))
+    return out
+
+
+def _row_tol(shapes):
+    """分行容差：按 Node 框高度的中位数取 60%（条带框长、中心点浮动大，容差得放宽）。"""
+    hs = sorted(abs(s["bbox"][3] - s["bbox"][1])
+                for s in shapes if s.get("label") == "Node")
+    med = hs[len(hs) // 2] if hs else 1.0
+    return max(2.0, med * 0.6)
+
+
+def _rows_of(items, tol):
+    """[(y中点, x中点, ...)] -> 按 y 分成一排排（行内从左到右排好）。
+
+    注意不能直接按 (y, x) 排序：同一条带排里的框高度不一样，y 中点能差好几百像素，
+    直接排会把同一排的号打乱（补号顺序就错了）。
+    """
+    ps = sorted(items, key=lambda t: t[0])
+    rows, cur = [], []
+    for it in ps:
+        if not cur or abs(it[0] - cur[-1][0]) <= tol:
+            cur.append(it)
+        else:
+            rows.append(cur)
+            cur = [it]
+    if cur:
+        rows.append(cur)
+    for r in rows:
+        r.sort(key=lambda t: t[1])
+    return rows
+
+
+def drawing_pages(dbg):
+    """「有框的页」按页码升序 —— 和主程序 debug_page_map 同一套规则。
+
+    分表顺序按这个列表排（不是 PDF 页码）：第 1 张图纸对标签表第 1 个分表。
+    封面/说明页、以及"整本都写了空记录"的空页都不算，否则一律错位一格。
+    """
+    got = set()
+    for key in SECTION_ORDER:
+        for el in dbg._elements(key):
+            try:
+                data = dbg.page_data(key, el["page"])
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                if data.get("detections"):
+                    got.add(el["page"])
+            elif isinstance(data, list) and data:
+                got.add(el["page"])
+    return sorted(got)
+
+
+def _page_candidates(text_items, sheet, num_set, width, height):
+    """这一页可用的编号文字 -> (强候选, 裸数字候选, 分表名对不上的条数)。
+
+    强候选：文字里有 LBD+数字（如 INV31B102_LBD_07），且号码在本分表号码表里，
+            再把"图例/引线名单"（同列密排）滤掉。
+    裸数字候选：整条文字就是个号（"07"），有些图框里只印这个，没有 "LBD" 字样 —
+            这条通道以前没有，所以"每个框里都有号、有的却取不到"。
+    """
+    raw, bare, wrong = [], [], 0
+    for it in text_items:
+        num = _lbd_num_in(it[0])
+        inv = _inv_in(it[0])
+        if inv and _clean_key(sheet) and _clean_key(inv) != _clean_key(sheet):
+            wrong += 1
+            continue
+        px = it[1] * width
+        py = (1.0 - it[2]) * height
+        if num is not None:
+            if sheet and num_set and num not in num_set:
+                continue
+            raw.append((px, py, num, it[0]))
+        else:
+            m = BARE_NUM_RE.match(it[0].strip())
+            if m:
+                bare.append((px, py, int(m.group(1)), it[0]))
+    return _drop_legend(raw, height), bare, wrong
+
+
+def _box_texts(shapes, text_items, width, height, tol_ratio=0.006):
+    """框里 / 框边上找到的**所有文字**（先全拿出来，谁是什么号后面再判断）。
+
+    返回 {框下标: [(距离, 文字)]}；每条文字只归给离它最近的那个框。
+    """
+    nodes = [(i, s) for i, s in enumerate(shapes) if s.get("label") == "Node"]
+    tol = max(6.0, float(tol_ratio) * max(width, height))
+    out = {}
+    for it in text_items:
+        txt = (it[0] or "").strip()
+        if not txt:
+            continue
+        px, py = it[1] * width, (1.0 - it[2]) * height
+        best, bd = None, None
+        for i, s in nodes:
+            d = _box_dist(s["bbox"], px, py)
+            if bd is None or d < bd:
+                best, bd = i, d
+        if best is not None and bd is not None and bd <= tol:
+            out.setdefault(best, []).append((round(bd), txt))
+    for k in out:
+        out[k].sort()
+    return out
+
+
+def _drop_legend(cands, page_h):
+    """滤掉"引线名单/图例"：同一列上密集挤着 ≥3 条编号的那种。
+
+    图纸上每个区域自己的号是孤零零一条；名单是十几条一列排下来 —— 靠这个区分。
+    """
+    if len(cands) < 4:
+        return list(cands)
+    gx = max(4.0, page_h * 0.004)
+    gy = max(8.0, page_h * 0.02)
+    out = []
+    for i, (px, py, num, txt) in enumerate(cands):
+        n = 0
+        for j, (qx, qy, _n, _t) in enumerate(cands):
+            if i != j and abs(qx - px) <= gx and abs(qy - py) <= gy:
+                n += 1
+        if n < 3:
+            out.append((px, py, num, txt))
+    return out
+
+
+def check_rows(shapes, text_items, sheet, num_set, width, height):
+    """核对表：每个 Node 框一行 —— 现有名字 + 框内找到的候选 + 按现在规则重算的建议。
+
+    返回 (rows, dry_stat)。rows 里每个 dict：
+      ix 框序号 / cx,cy 框中心（底图像素）/ now 现有名字 / sug 建议名字
+      cand 框内候选（"号@距离"）/ src 建议来源（框内 / 推 / 缺）
+    """
+    cands, bare, _wrong = _page_candidates(text_items, sheet, num_set, width, height)
+    alltext = _box_texts(shapes, text_items, width, height)
+    tol = max(6.0, 0.006 * max(width, height))
+    nodes = [(i, s) for i, s in enumerate(shapes) if s.get("label") == "Node"]
+    got = {}
+    for px, py, num, txt in cands:
+        best, bd = None, None
+        for i, s in nodes:
+            d = _box_dist(s["bbox"], px, py)
+            if bd is None or d < bd:
+                best, bd = i, d
+        if best is not None and bd is not None and bd <= tol:
+            got.setdefault(best, []).append((bd, num, txt))
+    # 只印裸编号的（文字层里没有 "LBD" 字样）也一起列出来，标个 (裸)
+    for px, py, val, txt in bare:
+        best, bd = None, None
+        for i, s in nodes:
+            d = _box_dist(s["bbox"], px, py)
+            if bd is None or d < bd:
+                best, bd = i, d
+        if best is not None and bd is not None and bd <= tol:
+            got.setdefault(best, []).append((bd, val, txt + "(裸)"))
+    tmp = [dict(s) for s in shapes]
+    for s in tmp:
+        s.pop("_auto", None)
+        s.pop("_miss", None)
+        s.pop("_check", None)
+        if s.get("label") == "Node":
+            s["name"] = ""
+    dry = autofill_shapes(tmp, text_items, sheet, num_set, width, height)
+    rows = []
+    for i, s in nodes:
+        cx, cy = _box_center(s["bbox"])
+        cand = sorted(got.get(i) or [])[:3]
+        raw = []
+        for d, txt in (alltext.get(i) or [])[:6]:
+            mark = ""
+            # 标 × 的：这条文字被过滤掉了（号不在本分表号码表里 / 结尾像是被截断）
+            mm = ANY_NUM_RE.search(re.sub(r"INV\s*\d+\s*[A-Za-z]\s*\d+", " ", txt, flags=re.I))
+            if (txt.rstrip().endswith(("-", "_", ".", "(", "#"))
+                    or (mm and sheet and num_set and int(mm.group(1)) not in num_set)):
+                mark = "×"
+            raw.append((d, txt + mark))
+        t = tmp[i]
+        src = ("框内" if raw else ("推" if t.get("_auto") else
+                                    ("缺" if t.get("_miss") else "已有")))
+        rows.append({"ix": i, "cx": round(cx), "cy": round(cy),
+                     "now": s.get("name") or "", "sug": t.get("name") or "",
+                     "src": src,
+                     "cand": " | ".join("%s@%d" % (txt, d) for d, txt in raw)
+                             or " / ".join("%02d@%d" % (n, round(d)) for d, n, _t in cand)})
+    return rows, dry
+
+
+def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
+                    tol_ratio=0.006):
+    """给一页的 Node 框补 LBD 名字。返回统计 dict。
+
+    shapes: 这一页的框（就地改 name / _auto / _miss 标记，只动 label == "Node"）
+    text_items: [(文字, fx中心, fy中心, fx1, fy1, fx2, fy2)]（底图归一化坐标）
+    sheet: 本页分表名（来自标签表）
+    num_set: 这个分表可用的 LBD 编号集合（用来滤掉框里的干扰文字）
+    规则：
+      1) 每条文字只归给离它最近的那个框（不是一个框把周围文字全拿走）
+      2) 文字里的编号必须在这个分表的号码表里
+      3) 文字自带 INV 分表名、且和本页分表不一致 -> 当干扰丢掉
+      4) 框里没有可用文字的，按标签表的号（还没被用掉的）按位置顺序补，标黄
+      5) 连标签表的号都没有了 -> 标红，等人手填
+    """
+    nodes = [(i, s) for i, s in enumerate(shapes) if s.get("label") == "Node"]
+    tol = max(6.0, float(tol_ratio) * max(width, height))
+    stat = {"total": len(nodes), "filled": 0, "auto": 0, "missed": 0,
+            "wrong_sheet": 0, "kept": 0}
+    if not nodes:
+        return stat
+
+    # 已经有人写过的名字：不动（免得把手工改的冲掉）
+    todo = []
+    for i, s in nodes:
+        if (s.get("name") or "").strip() and not s.get("_auto"):
+            stat["kept"] += 1
+            s["_miss"] = False
+        else:
+            s["name"] = ""
+            s["_miss"] = False
+            s["_check"] = False
+            todo.append((i, s))
+    if not todo:
+        return stat
+
+    # 1) 候选文字：编号 + 分表名过滤 + 去掉图例/引线名单
+    cands, bare, n_wrong = _page_candidates(text_items, sheet, num_set, width, height)
+    stat["wrong_sheet"] = n_wrong
+
+    # 2) 归属：① 文字中心落在哪个框里，就归那个框（谁的框谁拿字）
+    #          ② 落在框外的，才按"最近 + 那个框还没拿到字"分给别人
+    #    （老写法是"每条文字只给最近的框"，两个框抢同一条字时多的那条直接被丢掉，
+    #      结果本该拿到它的框就空了 —— 表现就是"4 个框只读到 2 个"。）
+    got = {}
+    left_c = []
+    for px, py, num, _txt in cands:
+        inside = None
+        for i, s in todo:
+            b = s["bbox"]
+            if b[0] <= px <= b[2] and b[1] <= py <= b[3]:
+                inside = i
+                break
+        if inside is None:
+            left_c.append((px, py, num))
+            continue
+        old = got.get(inside)
+        if old is None or 0.0 < old[0]:
+            got[inside] = (0.0, num)
+    for px, py, num in left_c:
+        best, bd = None, None
+        for i, s in todo:
+            if i in got:                 # 已经有字了，别再抢
+                continue
+            d = _box_dist(s["bbox"], px, py)
+            if bd is None or d < bd:
+                best, bd = i, d
+        if best is None or bd is None or bd > tol:
+            continue
+        got[best] = (bd, num)
+
+    # 3) 抢号：同一个号只留最近的那个框
+    keep = {}
+    for i, (d, num) in sorted(got.items(), key=lambda kv: kv[1][0]):
+        if num in keep:
+            continue
+        keep[i] = num
+
+    used = set(keep.values())
+    for i, s in todo:
+        if i in keep:
+            s["name"] = "%s-LBD-%02d" % (sheet, keep[i]) if sheet else "LBD-%02d" % keep[i]
+            s["_auto"] = False
+            stat["filled"] += 1
+
+    # 3b) 框里只印裸编号的（文字层里没有 "LBD" 字样）：按"离框最近 + 号在号码表里优先"补。
+    #     这正是"每个框里都有号、有的却取不到"那批 —— 以前只认带 LBD 字样的文字。
+    if bare and len(keep) < len(todo):
+        left = [t for t in todo if t[0] not in keep]
+        bare_got = {}
+        for px, py, val, txt in bare:
+            best, bd = None, None
+            for i, s in left:
+                d = _box_dist(s["bbox"], px, py)
+                if bd is None or d < bd:
+                    best, bd = i, d
+            if best is None or bd is None or bd > tol or best in bare_got:
+                continue
+            if val in used and any(v == val for _d, v, _t in [bare_got.get(best) or (0, -1, "")]):
+                continue
+            bare_got[best] = (bd, val, txt)
+        # 同一号码只留一个框
+        seen_num = set()
+        for i in sorted(bare_got, key=lambda k: bare_got[k][0]):
+            _d, val, _t = bare_got[i]
+            if val in seen_num or val in used:
+                continue
+            # 号码不在这个分表号码表里 -> 当"文字不全/被截断"过滤掉，不填
+            if sheet and num_set and val not in num_set:
+                stat["dropped"] = stat.get("dropped", 0) + 1
+                continue
+            seen_num.add(val)
+            s = dict(todo)[i]
+            s["name"] = "%s-LBD-%02d" % (sheet, val) if sheet else "LBD-%02d" % val
+            s["_auto"] = False
+            s["_check"] = False
+            keep[i] = val
+            used.add(val)
+            stat["bare"] = stat.get("bare", 0) + 1
+            stat["filled"] += 1
+
+    # 3c) 最后兜底：框里的文字先全拿出来，只要里面带数字就试一把
+    #     （"1.C.1"、"LBD-07"、"07" 都行；号码不在本分表表里的标紫，让人核）
+    if len(keep) < len(todo):
+        bt = _box_texts(shapes, text_items, width, height, tol_ratio)
+        left = [t for t in todo if t[0] not in keep]
+        picks = {}
+        for i, _s in left:
+            for d, txt in (bt.get(i) or []):
+                # ★ 先把分表名（INV31B101 这种）从文字里剔掉再找数字，
+                #   不然"任意数字"会抓到分表名里的 31，填出 INV31B101-LBD-31 这种鬼东西
+                if txt.rstrip().endswith(("-", "_", ".", "(", "#", "|")):
+                    continue           # 结尾是分隔符 -> 文字被截断了，不拿它猜号
+                t2 = re.sub(r"INV\s*\d+\s*[A-Za-z]\s*\d+", " ", txt, flags=re.I)
+                # "1.01.1.C.5" 这种：把所有数字段都拆出来，从**最后往前**找，
+                # 只要有一个能在本分表号码表里对上就用它（不再要求带 "LBD" 字样）
+                segs = [int(g) for g in re.findall(r"\d{1,3}", t2)]
+                if not segs:
+                    continue
+                val = None
+                for v in reversed(segs):
+                    if not sheet or not num_set or v in num_set:
+                        val = v
+                        break
+                if val is None:
+                    stat["dropped"] = stat.get("dropped", 0) + 1
+                    continue
+                in_set = (not sheet or not num_set or val in num_set)
+                picks.setdefault(i, []).append((0 if in_set else 1, d, val, txt))
+        for i, lst in picks.items():
+            if i in keep:
+                continue
+            lst.sort()
+            pref = [t for t in lst if t[0] == 0]
+            if not pref:
+                # 框里那些字里的数字都不在本分表号码表里（多半是被拆开/截断的文字）
+                # -> 过滤掉，不猜号
+                stat["dropped"] = stat.get("dropped", 0) + 1
+                continue
+            flag, _d, val, _txt = pref[0]
+            if val in used:
+                continue
+            s = dict(todo)[i]
+            s["name"] = "%s-LBD-%02d" % (sheet, val) if sheet else "LBD-%02d" % val
+            s["_auto"] = False
+            s["_check"] = False
+            keep[i] = val
+            used.add(val)
+            stat["any"] = stat.get("any", 0) + 1
+            stat["filled"] += 1
+
+    # 4) 框里没取到号的：按标签表的号顺序补（标黄，提示人工核）
+    rest = [t for t in todo if t[0] not in keep]
+    if rest and sheet and num_set:
+        free = [n for n in sorted(num_set) if n not in used]
+        # 位置顺序 = 一排排（先分行，行内从左到右）——和图纸上读的顺序一致
+        pairs = [(round(_box_center(s["bbox"])[1], 3), round(_box_center(s["bbox"])[0], 3), i, s)
+                 for i, s in rest]
+        k = 0
+        for row in _rows_of(pairs, _row_tol(shapes)):
+            for _cy, _cx, i, s in row:
+                if k >= len(free):
+                    break
+                s["name"] = "%s-LBD-%02d" % (sheet, free[k])
+                s["_auto"] = True
+                stat["auto"] += 1
+                k += 1
+    for i, s in rest:
+        if not (s.get("name") or "").strip():
+            s["_miss"] = True
+            stat["missed"] += 1
+    # 5) 位置可疑：同一行里号码跳号 -> 标紫（紫 = 从框内取到号了，但和同排的号对不上，
+    #    也可能是框画错/取到了隔壁）；黄 = 按标签表顺序推的，同样要人核一眼。
+    stat["sus"] = _flag_suspicious(shapes)
+    stat["auto_list"] = [(s.get("name") or "") for _i, s in todo if s.get("_auto")]
+    stat["sus_list"] = [(s.get("name") or "", round(_box_center(s["bbox"])[0]),
+                         round(_box_center(s["bbox"])[1]))
+                        for _i, s in todo if s.get("_check")]
+    return stat
+
+
+# ------------------------------------------------------- 字节级 JSON 定位
+def skip_ws(b, i):
+    while i < len(b) and b[i] in WS:
+        i += 1
+    return i
+
+
+def skip_str(b, i):
+    """b[i] 是开引号，返回闭引号之后的下标。"""
+    i += 1
+    while i < len(b):
+        c = b[i]
+        if c == 0x5C:
+            i += 2
+            continue
+        if c == 0x22:
+            return i + 1
+        i += 1
+    raise ValueError("字符串没有收尾")
+
+
+def skip_val(b, i):
+    """返回值的结束下标（不含）。"""
+    i = skip_ws(b, i)
+    c = b[i]
+    if c == 0x22:
+        return skip_str(b, i)
+    if c in b"{[":
+        depth = 0
+        while i < len(b):
+            c = b[i]
+            if c == 0x22:
+                i = skip_str(b, i)
+                continue
+            if c in b"{[":
+                depth += 1
+            elif c in b"}]":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        raise ValueError("容器没有收尾")
+    j = i
+    while j < len(b) and b[j] not in b",}] \t\r\n":
+        j += 1
+    return j
+
+
+def top_spans(b):
+    """对象 -> {键: (值起, 值止)}，只扫一层。"""
+    out = {}
+    i = skip_ws(b, 0)
+    if b[i] != 0x7B:
+        raise ValueError("不是对象")
+    i += 1
+    while True:
+        i = skip_ws(b, i)
+        if b[i] == 0x7D:
+            return out
+        ke = skip_str(b, i)
+        key = json.loads(b[i:ke])
+        i = skip_ws(b, ke)
+        if b[i] != 0x3A:
+            raise ValueError("缺少冒号")
+        vs = skip_ws(b, i + 1)
+        ve = skip_val(b, vs)
+        out[key] = (vs, ve)
+        i = skip_ws(b, ve)
+        if b[i] == 0x2C:
+            i += 1
+            continue
+        return out
+
+
+def round_box_key(b):
+    """和 lbd_regions.py 一样按 0.1 像素取整对齐 node_bbox。"""
+    return (round(float(b["x1"]), 1), round(float(b["y1"]), 1),
+            round(float(b["x2"]), 1), round(float(b["y2"]), 1))
+
+
+class DebugJson:
+    """识别结果 JSON 的字节级索引：图片按需取，段落按需解析，保存时定点替换。"""
+
+    def __init__(self, path):
+        self.path = path
+        t0 = time.time()
+        with open(path, "rb") as f:
+            self.raw = f.read()
+        self.load_seconds = time.time() - t0
+        self.size = len(self.raw)
+        self.sections = {}
+        for key in SECTION_ORDER:
+            span = self._find_array_span(key)
+            if span:
+                self.sections[key] = {"span": span, "elements": None}
+        self.pages = {}
+        self._index_pages()
+
+    def _find_key(self, key):
+        pat = ('"%s"' % key).encode()
+        i = self.raw.find(pat)
+        return None if i < 0 else i + len(pat)
+
+    def _find_array_span(self, key):
+        """返回 (数组 '[' 下标, ']' 之后下标)。用后一个顶层键兜底找收尾方括号。"""
+        d = self.raw
+        at = self._find_key(key)
+        if at is None:
+            return None
+        i = skip_ws(d, at)
+        if d[i] != 0x3A:
+            return None
+        i = skip_ws(d, i + 1)
+        if d[i] != 0x5B:
+            return None
+        start = i
+        limit = len(d)
+        for other in ("yolo_tracker_detection_results", "yolo_box_detection_results",
+                      "ocr_node_name_results", "claude_node_name_review_results"):
+            if other == key:
+                continue
+            o = self._find_key(other)
+            if o is not None and o > at:
+                limit = min(limit, o)
+        end = d.rfind(b"]", start, limit)
+        if end < 0:
+            end = skip_val(d, start) - 1
+        return (start, end + 1)
+
+    def _index_pages(self):
+        """用 media_type 当锚点找每页元素（纯 C 速度的 find，不整份扫）。"""
+        d = self.raw
+        pos = 0
+        while True:
+            mt = d.find(b'"media_type"', pos)
+            if mt < 0:
+                break
+            pos = mt + 1
+            pn_at = d.rfind(b'"page_number"', max(0, mt - 400), mt)
+            if pn_at < 0:
+                continue
+            colon = d.find(b":", pn_at, mt)
+            m = re.match(rb"\s*(\d+)", d[colon + 1:colon + 32])
+            if not m:
+                continue
+            number = int(m.group(1))
+            width = height = 0
+            for key, which in ((b'"width"', "w"), (b'"height"', "h")):
+                at = d.find(key, mt, mt + 600)
+                if at < 0:
+                    continue
+                c2 = d.find(b":", at, at + 20)
+                m2 = re.match(rb"\s*(\d+)", d[c2 + 1:c2 + 32])
+                if m2:
+                    if which == "w":
+                        width = int(m2.group(1))
+                    else:
+                        height = int(m2.group(1))
+            pk = d.find(b'"png_base64"', mt, mt + 4000)
+            q1 = q2 = -1
+            if pk >= 0:
+                q1 = d.find(b'"', pk + 12)
+                q2 = d.find(b'"', q1 + 1)
+            # 没有内嵌图片也要登记这一页（只存检测结果的 JSON 就是这样），
+            # 底图到时候用 PDF 现渲染。
+            self.pages[number] = {"page_number": number, "width": width,
+                                  "height": height,
+                                  "png_span": ((q1 + 1, q2) if 0 <= q1 < q2 else None)}
+
+    def page_numbers(self):
+        return sorted(self.pages)
+
+    def png_bytes(self, number):
+        import base64
+        span = self.pages[number].get("png_span")
+        if not span:
+            raise RuntimeError("第 %s 页没有内嵌图片" % number)
+        return base64.b64decode(self.raw[span[0]:span[1]])
+
+    def _elements(self, key):
+        """[{page, span, data_span}]，第一次用到才建。"""
+        sec = self.sections.get(key)
+        if sec is None:
+            return []
+        if sec["elements"] is None:
+            d = self.raw
+            start, end = sec["span"]
+            out = []
+            i = start + 1
+            while True:
+                i = skip_ws(d, i)
+                if i >= end or d[i] == 0x5D:
+                    break
+                s = i
+                e = skip_val(d, i)
+                sub = d[s:e]
+                try:
+                    spans = top_spans(sub)
+                    pn = int(json.loads(sub[spans["page_number"][0]:spans["page_number"][1]]))
+                    ds, de = spans["data"]
+                    out.append({"page": pn, "span": (s, e),
+                                "data_span": (s + ds, s + de)})
+                except Exception:
+                    pass
+                i = skip_ws(d, e)
+                if i < len(d) and d[i] == 0x2C:
+                    i += 1
+            sec["elements"] = out
+        return sec["elements"]
+
+    def element_for(self, key, page_number):
+        for el in self._elements(key):
+            if el["page"] == page_number:
+                return el
+        return None
+
+    def page_data(self, key, page_number):
+        el = self.element_for(key, page_number)
+        if not el:
+            return None
+        a, b = el["data_span"]
+        return json.loads(self.raw[a:b])
+
+    @staticmethod
+    def _field_of(section):
+        return {TRACKER_SECTION: "tracker", BOX_SECTION: "box",
+                OCR_SECTION: "ocr"}[section]
+
+    def save(self, dest, modified):
+        """modified: {页号: {"tracker": dict, "box": dict, "ocr": list}}
+        只替换这些页所在的段落，其余逐字节照搬。"""
+        jobs = []
+        for key in SECTION_ORDER:
+            field = self._field_of(key)
+            pages = {p: m for p, m in modified.items() if m.get(field) is not None}
+            sec = self.sections.get(key)
+            if not pages or not sec:
+                continue
+            jobs.append((sec["span"][0], key, field, pages, sec))
+        # 必须从后往前替换：前面的数组一变长，后面记录的偏移量就作废了。
+        jobs.sort(key=lambda j: -j[0])
+        out = self.raw
+        for a, key, field, pages, sec in jobs:
+            parts = []
+            seen = set()
+            for el in self._elements(key):
+                seen.add(el["page"])
+                if el["page"] in pages:
+                    elem = {"page_number": el["page"], "data": pages[el["page"]][field]}
+                    parts.append(json.dumps(elem, ensure_ascii=False).encode("utf-8"))
+                else:
+                    s, e = el["span"]
+                    parts.append(self.raw[s:e])
+            # 原文件里没有这一页的记录（比如原来没检测到东西的页，现在手工画了框）：
+            # 补一条，否则新画的框存不进去。
+            for p in sorted(p for p in pages if p not in seen):
+                elem = {"page_number": p, "data": pages[p][field]}
+                parts.append(json.dumps(elem, ensure_ascii=False).encode("utf-8"))
+            new_arr = b"[\n    " + b",\n    ".join(parts) + b"\n  ]"
+            b = sec["span"][1]
+            out = out[:a] + new_arr + out[b:]
+        tmp = dest + ".part"
+        with open(tmp, "wb") as f:
+            f.write(out)
+        os.replace(tmp, dest)
+
+
+class PageModel:
+    """一页的框 + 名字。shapes 是纯 dict，界面和自检共用。"""
+
+    def __init__(self, dbg, page_number):
+        self.dbg = dbg
+        self.page = page_number
+        info = dbg.pages[page_number]
+        self.width = info["width"] or 6000
+        self.height = info["height"] or 4000
+        self.shapes = []
+        self.dirty = False
+        self._orig_tracker = None
+        self._orig_box = None
+        self._orig_ocr = None
+        self.load()
+
+    def load(self):
+        dbg = self.dbg
+        self._orig_tracker = dbg.page_data(TRACKER_SECTION, self.page) or {}
+        self._orig_box = dbg.page_data(BOX_SECTION, self.page) or {}
+        self._orig_ocr = dbg.page_data(OCR_SECTION, self.page) or []
+
+        ocr_by_key = {}
+        for idx, rec in enumerate(self._orig_ocr):
+            nb = rec.get("node_bbox") or {}
+            if all(k in nb for k in ("x1", "y1", "x2", "y2")):
+                ocr_by_key[round_box_key(nb)] = idx
+
+        self.shapes = []
+        for det in (self._orig_tracker.get("detections") or []):
+            b = det.get("bbox") or {}
+            if not all(k in b for k in ("x1", "y1", "x2", "y2")):
+                continue
+            label = (det.get("label") or "").strip() or "Tracker"
+            ocr_index, name = None, ""
+            if label.lower() == "node":
+                ocr_index = ocr_by_key.get(round_box_key(b))
+                if ocr_index is not None:
+                    rec = self._orig_ocr[ocr_index]
+                    name = (rec.get("final_node_name")
+                            or rec.get("preliminary_node_name") or "").strip()
+            self.shapes.append({
+                "label": label, "name": name,
+                "bbox": [float(b["x1"]), float(b["y1"]), float(b["x2"]), float(b["y2"])],
+                "confidence": det.get("confidence"),
+                "class_id": det.get("class_id"),
+                "source": det.get("source") or "manual",
+                "raw": det.get("raw") or {},
+                "ocr_index": ocr_index,
+            })
+        for det in (self._orig_box.get("detections") or []):
+            b = det.get("bbox") or {}
+            if not all(k in b for k in ("x1", "y1", "x2", "y2")):
+                continue
+            self.shapes.append({
+                "label": (det.get("label") or "Box").strip(),
+                "name": (det.get("description") or "").strip(),
+                "bbox": [float(b["x1"]), float(b["y1"]), float(b["x2"]), float(b["y2"])],
+                "confidence": det.get("confidence"),
+                "class_id": det.get("class_id"),
+                "source": det.get("source") or "manual",
+                "raw": det.get("raw") or {},
+                "ocr_index": None,
+            })
+
+    def counts(self):
+        c = {k: 0 for k in CLASSES}
+        for s in self.shapes:
+            c[s["label"]] = c.get(s["label"], 0) + 1
+        return c
+
+    def _det(self, s):
+        cid = s.get("class_id")
+        return {
+            "label": s["label"],
+            "confidence": s.get("confidence"),
+            "class_id": cid if cid is not None else DEFAULT_CLASS_ID.get(s["label"], 0),
+            "bbox": {"x1": s["bbox"][0], "y1": s["bbox"][1],
+                     "x2": s["bbox"][2], "y2": s["bbox"][3]},
+            "source": s.get("source") or "manual",
+            "raw": s.get("raw") or {},
+        }
+
+    def tracker_data(self):
+        data = copy.deepcopy(self._orig_tracker) if self._orig_tracker else {
+            "model_type": "tracker", "coordinates": "original_page_pixels",
+            "detections": [], "error": None}
+        data["detections"] = [self._det(s) for s in self.shapes
+                              if s["label"] in ("Node", "Tracker")]
+        return data
+
+    def box_data(self):
+        data = copy.deepcopy(self._orig_box) if self._orig_box else {
+            "model_type": "box", "detections": [], "error": None}
+        data["detections"] = [self._det(s) for s in self.shapes if s["label"] == "Box"]
+        return data
+
+    def ocr_data(self):
+        """Node 框 -> ocr 记录一一对应；人改的名字写进 final_node_name。"""
+        orig = self._orig_ocr or []
+        used = set()
+        for rec in orig:
+            try:
+                used.add(int(rec.get("node_index")))
+            except Exception:
+                pass
+        nxt = 1
+        out = []
+        for s in self.shapes:
+            if s["label"] != "Node":
+                continue
+            idx = s.get("ocr_index")
+            if idx is not None and 0 <= idx < len(orig):
+                rec = copy.deepcopy(orig[idx])
+            else:
+                while nxt in used:
+                    nxt += 1
+                used.add(nxt)
+                rec = {
+                    "node_index": nxt,
+                    "entity_id": "p%d:node:%d" % (self.page, nxt),
+                    "readings": [],
+                    "selected": {"text": s["name"], "angle_deg": 0, "confidence": None},
+                    "matched_table_name": None,
+                    "preliminary_node_name": s["name"],
+                    "error": None,
+                }
+            rec["node_bbox"] = {"x1": s["bbox"][0], "y1": s["bbox"][1],
+                                "x2": s["bbox"][2], "y2": s["bbox"][3]}
+            rec["final_node_name"] = s["name"]
+            out.append(rec)
+        return out
+
+    def result(self):
+        return {"tracker": self.tracker_data(), "box": self.box_data(),
+                "ocr": self.ocr_data()}
+
+
+def selftest(src, out=None):
+    """无界面走一遍：载入 -> 改框改名 -> 另存 -> 用下游代码验证。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = out or os.path.join(app_dir(), "selftest_annotated.json")
+    print("源文件:", src)
+    dbg = DebugJson(src)
+    pgs = dbg.page_numbers()
+    print("页数 %d（%d..%d），读入 %.2fs，%.1f MB"
+          % (len(pgs), pgs[0], pgs[-1], dbg.load_seconds, dbg.size / 1048576))
+
+    page = pgs[0]
+    t0 = time.time()
+    pm = PageModel(dbg, page)
+    c0 = pm.counts()
+    print("第 %d 页解析 %.2fs：Node %d / Tracker %d / Box %d"
+          % (page, time.time() - t0, c0["Node"], c0["Tracker"], c0["Box"]))
+
+    nodes = [s for s in pm.shapes if s["label"] == "Node"]
+    trks = [s for s in pm.shapes if s["label"] == "Tracker"]
+    if nodes:
+        n0 = nodes[0]
+        print("  原名字:", n0["name"], "原位置: %.0f,%.0f" % (n0["bbox"][0], n0["bbox"][1]))
+        n0["bbox"] = [n0["bbox"][0] + 12, n0["bbox"][1] + 12,
+                      n0["bbox"][2] + 12, n0["bbox"][3] + 12]
+        n0["name"] = "SELFTEST-LBD-99"
+    if len(trks) > 1:
+        t = trks[-1]
+        pm.shapes.append({"label": "Tracker", "name": "", "confidence": None,
+                          "class_id": 0, "source": "manual", "raw": {},
+                          "ocr_index": None,
+                          "bbox": [t["bbox"][0], t["bbox"][1] + 5,
+                                   t["bbox"][2], t["bbox"][3] + 5]})
+        pm.shapes.remove(trks[0])
+    c1 = pm.counts()
+    print("改动：Node %d->%d（首框平移 12px 并改名），Tracker %d->%d（末尾加一个、删首一个）"
+          % (c0["Node"], c1["Node"], c0["Tracker"], c1["Tracker"]))
+
+    t0 = time.time()
+    dbg.save(out, {page: pm.result()})
+    print("另存 %.2fs -> %s（%.1f MB）"
+          % (time.time() - t0, out, os.path.getsize(out) / 1048576))
+
+    sys.path.insert(0, os.path.join(os.path.dirname(here), "CAD-MAP-main", "编排器"))
+    import lbd_regions as lr
+    lines_path = os.path.join(here, "selftest_lines.txt")
+    r = lr.extract_lines_from_debug(out, lines_path, prefix="STR")
+    rows = open(lines_path, encoding="utf-8").read().splitlines()
+    names = [ln.split("\t")[4] for ln in rows if "-LBD-" in ln.upper()]
+    # 下游是按「名字以 STR 开头」认支架号的，LBD 行就是其余那些
+    pcols = [ln.split("\t") for ln in rows if ln.split("\t")[1] == str(page)]
+    page_str = [c[4] for c in pcols if c[4].upper().startswith("STR")]
+    page_lbd = [c[4] for c in pcols if not c[4].upper().startswith("STR")]
+    print("下游 extract_lines_from_debug：ok=%s lines=%s lbd=%s str=%s pages=%s"
+          % (r.get("ok"), r.get("lines"), r.get("lbd"), r.get("str"), r.get("pages")))
+    ok_name = "SELFTEST-LBD-99" in names
+    ok_lbd = len(page_lbd) == c1["Node"]
+    ok_str = len(page_str) == c1["Tracker"]
+    print("改的名字被下游读到:", ok_name)
+    print("第 %d 页 LBD 行数 == 该页 Node 数: %s (%d vs %d)"
+          % (page, ok_lbd, len(page_lbd), c1["Node"]))
+    print("第 %d 页 支架行数 == 该页 Tracker 数: %s (%d vs %d)"
+          % (page, ok_str, len(page_str), c1["Tracker"]))
+    print("名字示例:", names[:3])
+    good = bool(r.get("ok")) and ok_name and ok_lbd and ok_str
+    print("自检:", "通过" if good else "失败")
+    return 0 if good else 1
+
+
+def make_gui_classes():
+    """延迟导入 Qt（自检模式不需要 Qt）。"""
+    from PySide6.QtCore import QPointF, QRectF, Qt
+    from PySide6.QtGui import (QAction, QBrush, QColor, QFont, QImage, QKeySequence,
+                               QPainter, QPen, QPixmap)
+    from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout,
+                                   QGraphicsItem, QGraphicsRectItem, QGraphicsScene,
+                                   QGraphicsView, QHBoxLayout, QLabel, QLineEdit,
+                                   QMainWindow, QMessageBox, QPushButton, QStatusBar,
+                                   QToolBar, QVBoxLayout, QWidget)
+
+    COLORS = {"Node": QColor(255, 40, 40), "Tracker": QColor(0, 120, 255),
+              "Box": QColor(0, 200, 0)}
+    HANDLE_CURSORS = [Qt.CursorShape.SizeFDiagCursor,
+                      Qt.CursorShape.SizeVerCursor,
+                      Qt.CursorShape.SizeBDiagCursor,
+                      Qt.CursorShape.SizeHorCursor,
+                      Qt.CursorShape.SizeHorCursor,
+                      Qt.CursorShape.SizeBDiagCursor,
+                      Qt.CursorShape.SizeVerCursor,
+                      Qt.CursorShape.SizeFDiagCursor]
+
+    class BoxItem(QGraphicsRectItem):
+        # 名字字号（屏幕像素）：工具栏可调，默认小号不挡图
+        name_px = 11.0
+        # True = 只给"选中的那个框"画名字（默认，图上不会一堆名字压在一起）
+        name_sel_only = True
+        # 自动补的号（标黄）/ 没取到号（标红）用的颜色
+        AUTO_COLOR = QColor(230, 150, 0)
+        MISS_COLOR = QColor(255, 40, 40)
+        CHECK_COLOR = QColor(150, 60, 220)
+
+        def __init__(self, shape):
+            super().__init__(0, 0, shape["bbox"][2] - shape["bbox"][0],
+                             shape["bbox"][3] - shape["bbox"][1])
+            self.shape_data = shape          # 不能叫 self.shape：会盖掉 Qt 的虚函数 shape()
+            self.setPos(shape["bbox"][0], shape["bbox"][1])
+            self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+                          | QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+            self.setZValue(10)
+            self.apply_pen()
+
+        def apply_pen(self):
+            if self.shape_data.get("_miss"):
+                c = self.MISS_COLOR
+            elif self.shape_data.get("_check"):
+                c = self.CHECK_COLOR
+            elif self.shape_data.get("_auto"):
+                c = self.AUTO_COLOR
+            else:
+                c = COLORS.get(self.shape_data["label"], QColor(255, 0, 255))
+            pen = QPen(c)
+            pen.setCosmetic(True)
+            pen.setWidthF(2.0)
+            self.setPen(pen)
+            self.setBrush(QBrush(QColor(c.red(), c.green(), c.blue(), 26)))
+
+        def scene_box(self):
+            r, p = self.rect(), self.pos()
+            return [p.x(), p.y(), p.x() + r.width(), p.y() + r.height()]
+
+        def sync_shape(self):
+            self.shape_data["bbox"] = self.scene_box()
+
+        def itemChange(self, change, value):
+            if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+                self.sync_shape()
+            return super().itemChange(change, value)
+
+        def view_scale(self):
+            views = self.scene().views() if self.scene() else []
+            return views[0].transform().m11() if views else 1.0
+
+        def paint(self, painter, option, widget=None):
+            super().paint(painter, option, widget)
+            sc = self.view_scale()
+            name = self.shape_data.get("name") or ""
+            if name and sc > 0.02 and (not BoxItem.name_sel_only or self.isSelected()):
+                self._paint_name(painter, name, sc)
+            if self.isSelected():
+                h = 9.0 / max(sc, 1e-6)
+                r = self.rect()
+                pts = [(r.left(), r.top()), (r.center().x(), r.top()),
+                       (r.right(), r.top()), (r.left(), r.center().y()),
+                       (r.right(), r.center().y()), (r.left(), r.bottom()),
+                       (r.center().x(), r.bottom()), (r.right(), r.bottom())]
+                painter.setBrush(QBrush(QColor(255, 255, 255)))
+                pen = QPen(QColor(0, 0, 0))
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                for x, y in pts:
+                    painter.drawRect(QRectF(x - h / 2, y - h / 2, h, h))
+
+        def _paint_name(self, painter, name, sc):
+            """把 LBD 名字画在框里：屏幕上恒定小字号、永远不出自己的框，所以不会互相压。
+
+            横放和竖放哪个能排得下就选哪个（图上那种细长条带框会走竖排）。
+            """
+            if BoxItem.name_px <= 0:
+                return
+            r = self.rect()
+            w, h = max(r.width(), 1.0), max(r.height(), 1.0)
+            need = max(1, len(name)) * 0.58
+            # 字号上限：屏幕上恒定 name_px；再夹住"文字厚度"，保证永远不出自己的框
+            base = min(BoxItem.name_px / sc, max(0.0, (min(w, h) - 2.0) / 1.4))
+            if base <= 0:
+                return
+            horiz = min(base, (w - 2.0) / need)
+            vert = min(base, (h - 2.0) / need)
+            size = max(horiz, vert)
+            if size * sc < 4.0:            # 屏幕上太小了，干脆不画
+                return
+            f = QFont()
+            f.setBold(True)
+            f.setPixelSize(max(1, int(size)))
+            col = (self.MISS_COLOR if self.shape_data.get("_miss")
+                   else (self.CHECK_COLOR if self.shape_data.get("_check")
+                         else (self.AUTO_COLOR if self.shape_data.get("_auto")
+                               else QColor(0, 140, 0))))
+            painter.save()
+            painter.setFont(f)
+            if horiz >= vert:
+                box = QRectF(r.left() + 1.0, r.top() + 1.0, w - 2.0, size * 1.35)
+                painter.fillRect(box, QColor(255, 255, 255, 200))
+                painter.setPen(QPen(col))
+                painter.drawText(box, Qt.AlignmentFlag.AlignLeft
+                                 | Qt.AlignmentFlag.AlignTop, name)
+            else:
+                # 竖排：从框的左下角往上排（和图纸上那些转 90° 的标注一样）
+                box = QRectF(0.0, 0.0, h - 2.0, size * 1.4)
+                painter.translate(r.left() + 1.0, r.bottom() - 1.0)
+                painter.rotate(-90.0)
+                painter.fillRect(box, QColor(255, 255, 255, 200))
+                painter.setPen(QPen(col))
+                painter.drawText(box, Qt.AlignmentFlag.AlignLeft
+                                 | Qt.AlignmentFlag.AlignTop, name)
+            painter.restore()
+
+    class Canvas(QGraphicsView):
+        def __init__(self, win):
+            super().__init__()
+            self.win = win
+            self.mode = "select"
+            self._pan = False
+            self._pan_pt = None
+            self._rubber = None
+            self._origin = None
+            self._resize = None
+            self.setRenderHints(QPainter.RenderHint.Antialiasing
+                                | QPainter.RenderHint.SmoothPixmapTransform)
+            self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+            self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+            self.setBackgroundBrush(QBrush(QColor(30, 30, 30)))
+            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        def set_mode(self, mode):
+            self.mode = mode
+            if mode == "select":
+                self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+                self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            else:
+                self.setDragMode(QGraphicsView.DragMode.NoDrag)
+                self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+
+        def cancel_draw(self):
+            """画到一半按 ESC：把临时框丢掉。返回是不是真的取消了。"""
+            if self._rubber is not None:
+                self.scene().removeItem(self._rubber)
+                self._rubber = None
+                self._origin = None
+                return True
+            return False
+
+        def keyPressEvent(self, ev):
+            # 键盘统一交给主窗口处理（ESC/Delete/A/D…），避免两处各一套
+            self.win.keyPressEvent(ev)
+
+        def wheelEvent(self, ev):
+            # 每次滚轮都重设锚点：fitInView / 100% 会把锚点变回视口中心，
+            # 不重设的话缩放就不是跟着十字光标走的
+            self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+            f = 1.18 if ev.angleDelta().y() > 0 else 1 / 1.18
+            cur = self.transform().m11()
+            if 0.01 < cur * f < 40:
+                self.scale(f, f)
+
+        def mousePressEvent(self, ev):
+            if ev.button() == Qt.MouseButton.MiddleButton:
+                self._pan = True
+                self._pan_pt = ev.position()
+                self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+                return
+            if ev.button() == Qt.MouseButton.LeftButton and self.mode == "select":
+                it = self.win.current_item()
+                if it is not None:
+                    sp = self.mapToScene(ev.position().toPoint())
+                    idx = self.handle_at(it, sp)
+                    if idx is not None:
+                        self._resize = {"item": it, "idx": idx, "start": sp,
+                                        "box": it.scene_box()}
+                        self.win.begin_change()
+                        return
+            if ev.button() == Qt.MouseButton.LeftButton and self.mode != "select":
+                sp = self.mapToScene(ev.position().toPoint())
+                # 两点画法：已经点过第一角了，这次点击就是对角点，直接成框
+                if self._rubber is not None:
+                    r = self._rubber.rect()
+                    self.scene().removeItem(self._rubber)
+                    self._rubber = None
+                    self._origin = None
+                    if r.width() >= 3 and r.height() >= 3:
+                        self.win.add_shape(self.mode,
+                                           [r.left(), r.top(), r.right(), r.bottom()])
+                    return
+                self._origin = sp
+                c = COLORS.get(self.mode, QColor(255, 0, 255))
+                pen = QPen(c)
+                pen.setCosmetic(True)
+                pen.setWidthF(2.0)
+                self._rubber = self.scene().addRect(
+                    QRectF(sp, sp), pen,
+                    QBrush(QColor(c.red(), c.green(), c.blue(), 40)))
+                self._rubber.setZValue(50)
+                return
+            self.win.begin_change()
+            super().mousePressEvent(ev)
+
+        def mouseMoveEvent(self, ev):
+            if self._pan and self._pan_pt is not None:
+                d = ev.position() - self._pan_pt
+                self._pan_pt = ev.position()
+                self.horizontalScrollBar().setValue(
+                    int(self.horizontalScrollBar().value() - d.x()))
+                self.verticalScrollBar().setValue(
+                    int(self.verticalScrollBar().value() - d.y()))
+                return
+            if self._rubber is not None and self._origin is not None:
+                sp = self.mapToScene(ev.position().toPoint())
+                self._rubber.setRect(QRectF(self._origin, sp).normalized())
+                return
+            if self._resize is not None:
+                d = self._resize
+                p = self.mapToScene(ev.position().toPoint())
+                box = self.apply_handle(d["box"], d["idx"],
+                                        p.x() - d["start"].x(), p.y() - d["start"].y())
+                it = d["item"]
+                it.setPos(box[0], box[1])
+                it.setRect(QRectF(0, 0, box[2] - box[0], box[3] - box[1]))
+                it.sync_shape()
+                it.update()
+                return
+            if not self._pan and self.mode == "select":
+                it = self.win.current_item()
+                if it is not None:
+                    sp = self.mapToScene(ev.position().toPoint())
+                    i = self.handle_at(it, sp)
+                    self.viewport().setCursor(HANDLE_CURSORS[i] if i is not None
+                                              else Qt.CursorShape.ArrowCursor)
+            super().mouseMoveEvent(ev)
+            # 拖动框的时候实时同步坐标（Qt 不会给 itemChange 派发"位置变了"）
+            if self.mode == "select" and not self._pan and self._resize is None:
+                self.win.sync_shapes()
+
+        def mouseReleaseEvent(self, ev):
+            if ev.button() == Qt.MouseButton.MiddleButton:
+                self._pan = False
+                self.viewport().setCursor(
+                    Qt.CursorShape.CrossCursor if self.mode != "select"
+                    else Qt.CursorShape.ArrowCursor)
+                return
+            if self._rubber is not None and ev.button() == Qt.MouseButton.LeftButton:
+                r = self._rubber.rect()
+                # 只是点了一下（面积≈0）→ 留在"两点画法"里等第二次点击；
+                # 拖着画出来的（有点面积）→ 按老习惯直接成框
+                if r.width() < 3 or r.height() < 3:
+                    return
+                self.scene().removeItem(self._rubber)
+                self._rubber = None
+                self._origin = None
+                if r.width() >= 3 and r.height() >= 3:
+                    self.win.add_shape(self.mode,
+                                       [r.left(), r.top(), r.right(), r.bottom()])
+                return
+            if self._resize is not None and ev.button() == Qt.MouseButton.LeftButton:
+                self._resize = None
+                self.win.end_change()
+                self.win.on_selection()
+                return
+            super().mouseReleaseEvent(ev)
+            # ★ 必须自己同步：这个 PySide6 版本的 QGraphicsItem::itemChange 收不到
+            #   ItemPositionHasChanged，靠它同步的话"拖动框"永远不会写回数据，
+            #   保存出来还是老坐标（用户反馈的"移动支架位置保存不生效"就是这个）。
+            self.win.sync_shapes()
+            self.win.end_change()
+
+        @staticmethod
+        def handle_points(box):
+            x1, y1, x2, y2 = box
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            return [(x1, y1), (cx, y1), (x2, y1), (x1, cy),
+                    (x2, cy), (x1, y2), (cx, y2), (x2, y2)]
+
+        @staticmethod
+        def apply_handle(box, idx, dx, dy):
+            """按第 idx 个控制点拖动 (dx,dy)，返回新的 [x1,y1,x2,y2]（允许拖过头翻转）。"""
+            x1, y1, x2, y2 = box
+            if idx in (0, 3, 5):
+                x1 += dx
+            if idx in (2, 4, 7):
+                x2 += dx
+            if idx in (0, 1, 2):
+                y1 += dy
+            if idx in (5, 6, 7):
+                y2 += dy
+            nx1, nx2 = (x1, x2) if x1 <= x2 else (x2, x1)
+            ny1, ny2 = (y1, y2) if y1 <= y2 else (y2, y1)
+            return [nx1, ny1, nx2, ny2]
+
+        def handle_at(self, item, scene_pos):
+            """鼠标是不是落在选中框的控制点上，返回控制点序号。"""
+            sc = max(self.transform().m11(), 1e-6)
+            tol = 9.0 / sc * 0.8
+            for i, (x, y) in enumerate(self.handle_points(item.scene_box())):
+                if abs(scene_pos.x() - x) <= tol and abs(scene_pos.y() - y) <= tol:
+                    return i
+            return None
+
+    return BoxItem, Canvas, COLORS
+
+
+def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QAction, QImage, QKeySequence, QPixmap
+    from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout,
+                                   QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+                                   QMessageBox, QPushButton, QStatusBar, QToolBar,
+                                   QVBoxLayout, QWidget)
+
+    BoxItem, Canvas, COLORS = make_gui_classes()
+    MODE_TEXT = {"select": "选择", "Node": "画 Node", "Tracker": "画 Tracker",
+                 "Box": "画 Box"}
+
+    class Win(QMainWindow):
+        def __init__(self, src=None):
+            super().__init__()
+            self.setWindowTitle("LBD 标注工具 v0.2")
+            self.resize(1500, 950)
+            self.dbg = None
+            self.page = None
+            self.pm = None
+            self.items = []
+            self.undo = []
+            self.redo = []
+            self._pending = None
+            self.edited = {}
+            self._pixmap = None
+            self.clip = []                 # 复制/粘贴框用的内部剪贴板
+            self._paste_n = 0
+            self.settings = load_settings()
+            self.pdf = self.settings.get("pdf") or ""
+            self.dpi = int(self.settings.get("dpi") or 0)
+            self.xlsx = self.settings.get("xlsx") or ""
+            self._sheet_cache = None
+            self.poppler = find_pdftoppm()
+            self.renderer = Renderer(self.poppler,
+                                     cache_dir())
+            self._img_note = ""
+            # 窗口：给个合理的最小尺寸（不然侧栏会被挤没），大小记住上次的
+            self.setMinimumSize(1180, 740)
+            try:
+                w = int(self.settings.get("win_w") or 0)
+                h = int(self.settings.get("win_h") or 0)
+                if w > 600 and h > 400:
+                    self.resize(w, h)
+            except Exception:
+                pass
+
+            self.scene = self._make_scene()
+            self.canvas = Canvas(self)
+            self.canvas.setScene(self.scene)
+
+            tb = QToolBar("工具栏")
+            tb.setMovable(False)
+            self.addToolBar(tb)
+            # 画图相关的工具栏放左边（竖排），保存/输出相关的留在上面
+            tb2 = QToolBar("画图")
+            tb2.setMovable(False)
+            try:
+                tb2.setOrientation(Qt.Orientation.Vertical)
+                self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, tb2)
+            except Exception:
+                self.addToolBar(tb2)
+
+            act = QAction("打开 JSON", self)
+            act.triggered.connect(self.on_open)
+            tb.addAction(act)
+            act = QAction("打开 PDF（无 JSON，直接标注）", self)
+            act.triggered.connect(self.on_open_pdf)
+            tb.addAction(act)
+            tb2.addSeparator()
+            for m in ("select",) + CLASSES:
+                a = QAction(MODE_TEXT[m], self)
+                a.setCheckable(True)
+                a.triggered.connect(lambda _c=False, mm=m: self.set_mode(mm))
+                tb2.addAction(a)
+                setattr(self, "act_" + m, a)
+            tb2.addSeparator()
+            a = QAction("撤销", self)
+            a.setShortcut(QKeySequence("Ctrl+Z"))
+            a.triggered.connect(self.on_undo)
+            tb2.addAction(a)
+            a = QAction("重做", self)
+            a.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
+            a.setToolTip("重做刚撤销的操作（Ctrl+Y 或 Ctrl+Shift+Z）")
+            a.triggered.connect(self.on_redo)
+            tb2.addAction(a)
+            a = QAction("支架按长度分档", self)
+            a.setToolTip("Tracker（支架）框按长边长度分档：短的算 2 串、长的算 3 串（可改），"
+                         "结果写进 JSON 的 raw.strings")
+            a.triggered.connect(self.on_rack_grade)
+            tb2.addAction(a)
+            a = QAction("重载本页", self)
+            a.setToolTip("把当前页恢复成上次打开/保存时的样子（画乱了的出口；可用 Ctrl+Z 撤销）")
+            a.triggered.connect(self.on_reload_page)
+            tb.addAction(a)
+            a = QAction("复制框", self)
+            a.setToolTip("把选中的框复制到剪贴板（Ctrl+C），可以粘到别的页")
+            a.triggered.connect(self.on_copy)
+            tb.addAction(a)
+            a = QAction("粘贴框", self)
+            a.setToolTip("粘贴刚复制的框（Ctrl+V），每贴一次自动错开一点")
+            a.triggered.connect(self.on_paste)
+            tb.addAction(a)
+            a = QAction("适应窗口", self)
+            a.setShortcut(QKeySequence("Ctrl+0"))
+            a.triggered.connect(self.fit)
+            tb.addAction(a)
+            a = QAction("100%", self)
+            a.triggered.connect(self.zoom_reset)
+            tb.addAction(a)
+            tb.addSeparator()
+            a = QAction("另存为…", self)
+            a.setShortcut(QKeySequence("Ctrl+S"))
+            a.triggered.connect(self.on_save_as)
+            tb.addAction(a)
+            a = QAction("覆盖原文件", self)
+            a.triggered.connect(self.on_save_over)
+            tb.addAction(a)
+
+            tb.addSeparator()
+            a = QAction("选标签表…", self)
+            a.setToolTip("选 LBD 标签表(xlsx)：分表名、LBD 编号、要填的名字都从这张表来")
+            a.triggered.connect(self.on_pick_xlsx)
+            tb.addAction(a)
+            a = QAction("补全编号(本页)", self)
+            a.setToolTip("从框内文字取 LBD 编号补名字（只跑当前页）")
+            a.triggered.connect(lambda: self.on_autofill(False))
+            tb.addAction(a)
+            a = QAction("补全编号(整册)", self)
+            a.setToolTip("整册逐页补：框内文字取号；取不到的按标签表顺序补（标黄）；"
+                         "再取不到标红等人手填")
+            a.triggered.connect(lambda: self.on_autofill(True))
+            tb.addAction(a)
+            from PySide6.QtWidgets import QCheckBox
+            self.chk_force = QCheckBox("重算(覆盖已有名字)")
+            self.chk_force.setToolTip(
+                "勾上：已经有名字的框也重算一遍（识别给的名字不对时用这个）")
+            self.chk_force.setChecked(bool(self.settings.get("force")))
+            tb.addWidget(self.chk_force)
+            a = QAction("导出核对表…", self)
+            a.setToolTip("每个框一行：现有名字 / 框内找到的候选 / 建议名字 —— 导出 CSV 在 Excel 里核")
+            a.triggered.connect(self.on_export_check)
+            tb.addAction(a)
+            a = QAction("导出 YOLO 数据集…", self)
+            a.setToolTip("导出成 YOLO 训练集（images/ + labels/ + data.yaml），可以丢给 yolo26 训练")
+            a.triggered.connect(self.on_export_dataset)
+            tb.addAction(a)
+            a = QAction("检查更新", self)
+            a.setToolTip("看 Release 里有没有新的标注工具包（名字里带 LBD 的那个）")
+            a.triggered.connect(self.on_check_update)
+            tb.addAction(a)
+            a = QAction("训练环境…", self)
+            a.setToolTip("检测 Python / 一键装 ultralytics（CPU 版），下一步接一键训练")
+            a.triggered.connect(self.on_train_panel)
+            tb.addAction(a)
+            tb.addWidget(QLabel("  名字 "))
+            self.cmb_name = QComboBox()
+            # (显示方式, 字号, 只画选中的那个)
+            for text, px, selonly in (("不显示", 0, True),
+                                      ("只看选中的", 11, True),
+                                      ("全部·小", 9, False),
+                                      ("全部·中", 11, False),
+                                      ("全部·大", 14, False)):
+                self.cmb_name.addItem(text, (px, selonly))
+            i = int(self.settings.get("name_mode") or 1)
+            self.cmb_name.setCurrentIndex(i if 0 <= i < self.cmb_name.count() else 1)
+            self.cmb_name.currentIndexChanged.connect(self.on_name_px)
+            tb.addWidget(self.cmb_name)
+            self.act_lock = QAction("锁定窗口大小", self)
+            self.act_lock.setCheckable(True)
+            self.act_lock.setToolTip("勾上以后窗口就不能再拉大拉小了（再点一下解锁）")
+            self.act_lock.triggered.connect(self.on_lock_window)
+            tb.addAction(self.act_lock)
+
+            tb.addSeparator()
+            tb.addWidget(QLabel("  底图 "))
+            self.cmb_dpi = QComboBox()
+            for text, val in (("内嵌图（快）", 0), ("250 DPI", 250),
+                              ("333 DPI", 333), ("400 DPI", 400)):
+                self.cmb_dpi.addItem(text, val)
+            i = self.cmb_dpi.findData(self.dpi)
+            self.cmb_dpi.setCurrentIndex(i if i >= 0 else 0)
+            self.cmb_dpi.currentIndexChanged.connect(self.on_dpi_changed)
+            tb.addWidget(self.cmb_dpi)
+            self.btn_pdf = QPushButton("选 PDF…")
+            self.btn_pdf.clicked.connect(self.on_pick_pdf)
+            tb.addWidget(self.btn_pdf)
+            self.update_pdf_button()
+
+            side = QWidget()
+            sl = QVBoxLayout(side)
+            self.lbl_info = QLabel("用「打开 JSON」载入识别结果")
+            self.lbl_info.setWordWrap(True)
+            sl.addWidget(self.lbl_info)
+            nav = QHBoxLayout()
+            b = QPushButton("◀ 上一页")
+            b.clicked.connect(lambda: self.goto_offset(-1))
+            nav.addWidget(b)
+            self.cmb_page = QComboBox()
+            self.cmb_page.currentIndexChanged.connect(self.on_page_combo)
+            nav.addWidget(self.cmb_page, 1)
+            b = QPushButton("下一页 ▶")
+            b.clicked.connect(lambda: self.goto_offset(1))
+            nav.addWidget(b)
+            sl.addLayout(nav)
+            sl.addWidget(QLabel("———— 选中的框 ————"))
+            form = QFormLayout()
+            self.cmb_label = QComboBox()
+            self.cmb_label.addItems(list(CLASSES))
+            self.cmb_label.currentIndexChanged.connect(self.on_label_changed)
+            form.addRow("类别", self.cmb_label)
+            self.ed_name = QLineEdit()
+            self.ed_name.editingFinished.connect(self.on_name_changed)
+            form.addRow("LBD 名字", self.ed_name)
+            self.lbl_bbox = QLabel("-")
+            form.addRow("位置", self.lbl_bbox)
+            sl.addLayout(form)
+            self.btn_del = QPushButton("删除这个框（Delete）")
+            self.btn_del.clicked.connect(self.on_delete)
+            sl.addWidget(self.btn_del)
+            sl.addStretch(1)
+            side.setMaximumWidth(330)
+
+            central = QWidget()
+            cl = QHBoxLayout(central)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.addWidget(self.canvas, 1)
+            cl.addWidget(side)
+            self.setCentralWidget(central)
+
+            self.setStatusBar(QStatusBar())
+            self.scene.selectionChanged.connect(self.on_selection)
+            self.set_mode("select")
+            self.on_name_px()
+            if self.settings.get("win_locked"):
+                self.act_lock.setChecked(True)
+                self.on_lock_window(True)
+            self.refresh_info()
+            if src:
+                self.load_file(src)
+
+        def _make_scene(self):
+            from PySide6.QtWidgets import QGraphicsScene
+            return QGraphicsScene(self)
+
+        # ---------------- 载入与翻页
+        def on_open(self):
+            p, _ = QFileDialog.getOpenFileName(self, "选择识别结果 JSON", "",
+                                               "JSON (*.json)")
+            if p:
+                self.load_file(p)
+
+        def on_open_pdf(self):
+            """没有识别结果时，直接打开一份 PDF 从零标注。"""
+            p, _ = QFileDialog.getOpenFileName(self, "选择要直接标注的 PDF", "",
+                                               "PDF (*.pdf)")
+            if not p:
+                return
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                doc = BlankDoc(p, dpi=float(self.dpi or 0) or 250.0)
+            except Exception as e:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.critical(self, "读不了这份 PDF", "%s" % e)
+                return
+            QApplication.restoreOverrideCursor()
+            if not doc.page_numbers():
+                QMessageBox.warning(
+                    self, "读不出页数",
+                    "没能从这份 PDF 读出页码/页尺寸。\n\n"
+                    "这条路径要用 poppler 的 pdfinfo.exe（和渲染底图用的 pdftoppm 在一起）。")
+                return
+            self.dbg = doc
+            self.pdf = p
+            self.settings["pdf"] = p
+            save_settings(self.settings)
+            self.update_pdf_button()
+            self.edited.clear()
+            self.undo.clear()
+            self.redo.clear()
+            self.cmb_page.blockSignals(True)
+            self.cmb_page.clear()
+            for n in doc.page_numbers():
+                self.cmb_page.addItem(str(n), n)
+            self.cmb_page.blockSignals(False)
+            self.setWindowTitle("LBD 标注工具 v0.2 — %s（直接标注，无识别结果）"
+                                % os.path.basename(p))
+            self.statusBar().showMessage("空白文档：%d 页，框从零开始画；保存会生成识别结果 JSON"
+                                         % len(doc.page_numbers()), 8000)
+            self.goto_page(doc.page_numbers()[0])
+
+        def load_file(self, path):
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self.dbg = DebugJson(path)
+            except Exception as e:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.critical(self, "读不了", "%s" % e)
+                return
+            QApplication.restoreOverrideCursor()
+            self.undo.clear()
+            # 记住这份 JSON：打包成 exe 后双击就能接着打开上次那份
+            self.settings["json"] = os.path.abspath(path)
+            save_settings(self.settings)
+            pgs = self.dbg.page_numbers()
+            if not pgs:
+                raw = getattr(self.dbg, "raw", b"") or b""
+                marks = []
+                for key, desc in ((b'"input_data"', "input_data（但没有 pages）"),
+                                  (b'"pages"', "pages 字段"),
+                                  (b'"yolo_tracker_detection_results"', "yolo_tracker_detection_results（识别结果的框）"),
+                                  (b'"ocr_node_name_results"', "ocr_node_name_results（编号名字）"),
+                                  (b'"shapes"', "shapes（X-AnyLabeling / labelme 标注文件）"),
+                                  (b'"imagePath"', "imagePath（标注文件里的图片名）"),
+                                  (b'"lbd_regions"', "lbd_regions（区域范围导出）"),
+                                  (b'"config"', "config（配置文件）")):
+                    if key in raw:
+                        marks.append(desc)
+                QMessageBox.warning(
+                    self, "这份 JSON 里没有页面",
+                    "没找到 input_data.pages（每页的页号和尺寸）——"
+                    "标注工具靠它把标注定位到页面上。\n\n"
+                    "这份文件里看到：\n  %s\n\n"
+                    "要标注请打开完整的「识别结果」JSON（agent3-debug 那份，"
+                    "input_data.pages 里带每页宽高）。" % ("\n  ".join(marks) or "（没有认出来的内容）"))
+                return
+            # PDF 对不上就纠正：文件名里没有 project_name 的，说明是别的项目的图纸
+            if self.pdf and not os.path.exists(self.pdf):
+                self.pdf = ""
+            pname = project_name(path)
+            if self.pdf and pname and pname.lower() not in os.path.basename(self.pdf).lower():
+                better = guess_pdf(path, exact_only=True)
+                if better:
+                    self.pdf = better
+            if not self.pdf:
+                self.pdf = guess_pdf(path)
+            if self.pdf:
+                self.settings["pdf"] = self.pdf
+                save_settings(self.settings)
+                self.update_pdf_button()
+            self.cmb_page.blockSignals(True)
+            self.cmb_page.clear()
+            for n in self.dbg.page_numbers():
+                self.cmb_page.addItem(str(n), n)
+            self.cmb_page.blockSignals(False)
+            self.setWindowTitle("LBD 标注工具 v0.2 — %s" % os.path.basename(path))
+            # 有框的页优先：整册 JSON（每页都写了空记录的那份）本来会停在第 1 页，
+            # 明明有图纸却是一片空白，得自己翻半天。
+            drw = drawing_pages(self.dbg)
+            self.goto_page(drw[0] if drw else pgs[0])
+
+        def goto_page(self, number):
+            if not self.dbg or number not in self.dbg.pages:
+                return
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self._stash_dirty()
+                # 这一页改过就还用内存里那份，别重新从文件读（否则改动会没）
+                self.pm = self.edited.get(number) or PageModel(self.dbg, number)
+                self._img_note = ""
+                img = None
+                try:
+                    img, self._img_note = self.load_image(number)
+                except Exception as e:
+                    self._img_note = "底图没出来：%s" % e
+                if img is None or img.isNull():
+                    img = QImage(600, 400, QImage.Format.Format_RGB32)
+                    img.fill(0x303030)
+                self._pixmap = QPixmap.fromImage(img)
+            finally:
+                QApplication.restoreOverrideCursor()
+            self.page = number
+            self._rebuild_items()
+            i = self.cmb_page.findData(number)
+            if i >= 0:
+                self.cmb_page.blockSignals(True)
+                self.cmb_page.setCurrentIndex(i)
+                self.cmb_page.blockSignals(False)
+            self.fit()
+            self.refresh_info()
+            self.on_selection()
+            self.prefetch_next()
+
+        def prefetch_next(self):
+            """后台把下一页渲染好，翻页就不用等。"""
+            if self.dpi <= 0 or not self.pdf or not self.poppler:
+                return
+            pgs = self.dbg.page_numbers()
+            i = pgs.index(self.page) + 1
+            if i >= len(pgs):
+                return
+            page, dpi, pdf = pgs[i], self.dpi, self.pdf
+            if os.path.exists(self.renderer.target(pdf, page, dpi)):
+                return
+
+            def work():
+                try:
+                    self.renderer.render(pdf, page, dpi)
+                except Exception:
+                    pass
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _stash_dirty(self):
+            """离开一页前，把改过的页留下来，保存时一起写。"""
+            if self.pm is not None and self.pm.dirty:
+                self.edited[self.pm.page] = self.pm
+
+        def _rebuild_items(self):
+            self.scene.clear()
+            self.items = []
+            self.scene.setSceneRect(0, 0, self.pm.width, self.pm.height)
+            item = self.scene.addPixmap(self._pixmap)
+            # 场景坐标始终用 JSON 里的原始坐标（6000×4000）；
+            # 高分辨率底图按比例缩回来放，放大看时 Qt 会用它的原始像素。
+            item.setScale(self.pm.width / float(self._pixmap.width() or self.pm.width))
+            item.setZValue(0)
+            for s in self.pm.shapes:
+                it = BoxItem(s)
+                self.scene.addItem(it)
+                self.items.append(it)
+
+        def load_image(self, page):
+            """返回 (QImage, 说明文字)。dpi=0 用 JSON 内嵌图，否则重渲染 PDF。"""
+            info = self.dbg.pages.get(page) or {}
+            if self.dpi <= 0 and info.get("png_span"):
+                img = QImage.fromData(self.dbg.png_bytes(page))
+                return img, "内嵌图 %d×%d（约 167 dpi）" % (img.width(), img.height())
+            if not self.poppler:
+                raise RuntimeError("找不到 pdftoppm/poppler")
+            if not self.pdf or not os.path.exists(self.pdf):
+                raise RuntimeError("这份 JSON 没有内嵌图，需要点「选 PDF…」指定对应的 PDF")
+            dpi = self.dpi if self.dpi > 0 else 250      # 没内嵌图时用 250 DPI 渲染
+            t0 = time.time()
+            self.statusBar().showMessage(
+                "正在用 %s 重渲染第 %d 页（%d DPI）…"
+                % (os.path.basename(self.pdf), page, dpi))
+            QApplication.processEvents()
+            path = self.renderer.render(self.pdf, page, dpi)
+            img = QImage(path)
+            if img.isNull():
+                raise RuntimeError("渲染结果读不出来")
+            k = img.width() / float(self.dbg.pages[page]["width"] or img.width())
+            return img, "%d DPI 重渲染 %d×%d（%.2f 倍，%.1fs）" % (
+                dpi, img.width(), img.height(), k, time.time() - t0)
+
+        def on_dpi_changed(self, _i):
+            want = int(self.cmb_dpi.currentData() or 0)
+            if want >= 400 and self.dbg:
+                mem = self.pm.width * 400 // 167 * self.pm.height * 400 // 167 * 4 / 1048576.0
+                if QMessageBox.question(
+                        self, "内存提醒",
+                        "400 DPI 时每页底图约占 %.0f MB 内存，机器不够会卡甚至崩。\n"
+                        "日常建议 250 或 333 DPI。要继续吗？" % mem
+                ) != QMessageBox.StandardButton.Yes:
+                    self.cmb_dpi.blockSignals(True)
+                    i = self.cmb_dpi.findData(self.dpi)
+                    self.cmb_dpi.setCurrentIndex(i if i >= 0 else 0)
+                    self.cmb_dpi.blockSignals(False)
+                    return
+            self.dpi = want
+            self.settings["dpi"] = self.dpi
+            save_settings(self.settings)
+            if self.dbg:
+                self.goto_page(self.page)
+
+        def on_pick_pdf(self):
+            p, _ = QFileDialog.getOpenFileName(self, "选择这份识别结果对应的 PDF", "",
+                                               "PDF (*.pdf)")
+            if not p:
+                return
+            self.pdf = p
+            self.settings["pdf"] = p
+            if self.dpi <= 0:
+                # 底图还停在内嵌图的话，换 PDF 看不出任何变化，直接切到 250 DPI
+                self.dpi = 250
+                self.settings["dpi"] = 250
+                i = self.cmb_dpi.findData(250)
+                if i >= 0:
+                    self.cmb_dpi.blockSignals(True)
+                    self.cmb_dpi.setCurrentIndex(i)
+                    self.cmb_dpi.blockSignals(False)
+            save_settings(self.settings)
+            self.update_pdf_button()
+            if self.dbg:
+                self.goto_page(self.page)
+
+        def update_pdf_button(self):
+            if self.pdf:
+                self.btn_pdf.setText("PDF：%s…" % os.path.basename(self.pdf)[:18])
+            else:
+                self.btn_pdf.setText("选 PDF…")
+            self.btn_pdf.setToolTip(self.pdf or
+                                    "选一份 PDF，再用 250/333/400 DPI 重渲染更清晰的底图")
+
+        def goto_offset(self, d):
+            if not self.dbg:
+                return
+            pgs = self.dbg.page_numbers()
+            i = pgs.index(self.page) + d
+            if 0 <= i < len(pgs):
+                self.goto_page(pgs[i])
+
+        def on_page_combo(self, _i):
+            n = self.cmb_page.currentData()
+            if n is not None and n != self.page:
+                self.goto_page(n)
+
+        def fit(self):
+            if self.pm:
+                self.canvas.fitInView(self.scene.sceneRect(),
+                                      Qt.AspectRatioMode.KeepAspectRatio)
+
+        def zoom_reset(self):
+            self.canvas.resetTransform()
+
+        # ---------------- 改动
+        def begin_change(self):
+            if self.pm:
+                self._pending = [(i, dict(s)) for i, s in enumerate(self.pm.shapes)]
+
+        def end_change(self):
+            if not self.pm or self._pending is None:
+                return
+            now = [(i, dict(s)) for i, s in enumerate(self.pm.shapes)]
+            if now != self._pending:
+                self.undo.append((self.page, self._pending))
+                del self.undo[:-200]       # 只留最近 200 步，别无限涨（一步快照很小）
+                self.redo.clear()          # 有了新改动，"重做"就失效了（和常见编辑器一致）
+                self.mark_dirty()
+            self._pending = None
+
+        def mark_dirty(self):
+            if self.pm:
+                self.pm.dirty = True
+            self.refresh_info()
+
+        def add_shape(self, label, bbox):
+            if not self.pm:
+                return
+            s = {"label": label, "name": "", "bbox": bbox, "confidence": None,
+                 "class_id": DEFAULT_CLASS_ID.get(label, 0), "source": "manual",
+                 "raw": {}, "ocr_index": None}
+            self.begin_change()
+            self.pm.shapes.append(s)
+            it = BoxItem(s)
+            self.scene.addItem(it)
+            self.items.append(it)
+            self.scene.clearSelection()
+            it.setSelected(True)
+            self.end_change()
+            if label == "Node":
+                self.statusBar().showMessage("新加的 Node 请填 LBD 名字", 6000)
+
+        def on_delete(self):
+            if not self.pm:
+                return
+            sel = [i for i in self.scene.selectedItems() if isinstance(i, BoxItem)]
+            if not sel:
+                return
+            self.begin_change()
+            for it in sel:
+                if it.shape_data in self.pm.shapes:
+                    self.pm.shapes.remove(it.shape_data)
+                if it in self.items:
+                    self.items.remove(it)
+                self.scene.removeItem(it)
+            self.end_change()
+            self.on_selection()
+
+        def current_item(self):
+            sel = [i for i in self.scene.selectedItems() if isinstance(i, BoxItem)]
+            return sel[0] if sel else None
+
+        def on_selection(self):
+            it = self.current_item()
+            self.cmb_label.blockSignals(True)
+            self.ed_name.blockSignals(True)
+            if it is None:
+                self.ed_name.setText("")
+                self.lbl_bbox.setText("-")
+                self.ed_name.setEnabled(False)
+                self.cmb_label.setEnabled(False)
+                self.btn_del.setEnabled(False)
+            else:
+                self.ed_name.setEnabled(True)
+                self.cmb_label.setEnabled(True)
+                self.btn_del.setEnabled(True)
+                self.ed_name.setText(it.shape_data.get("name") or "")
+                i = self.cmb_label.findText(it.shape_data["label"])
+                if i >= 0:
+                    self.cmb_label.setCurrentIndex(i)
+                b = it.scene_box()
+                self.lbl_bbox.setText("%.0f, %.0f → %.0f, %.0f" % (b[0], b[1], b[2], b[3]))
+            self.cmb_label.blockSignals(False)
+            self.ed_name.blockSignals(False)
+
+        def on_label_changed(self, _i):
+            it = self.current_item()
+            if it is None:
+                return
+            it.shape_data["label"] = self.cmb_label.currentText()
+            it.shape_data["class_id"] = DEFAULT_CLASS_ID.get(it.shape_data["label"], 0)
+            if it.shape_data["label"] != "Node":
+                it.shape_data["name"] = ""
+                self.ed_name.setText("")
+            it.apply_pen()
+            it.update()
+            self.mark_dirty()
+
+        def on_name_changed(self):
+            it = self.current_item()
+            if it is None:
+                return
+            txt = self.ed_name.text().strip()
+            if txt == (it.shape_data.get("name") or ""):
+                return
+            it.shape_data["name"] = txt
+            it.update()
+            self.mark_dirty()
+
+        def set_mode(self, mode):
+            for m in ("select",) + CLASSES:
+                getattr(self, "act_" + m).setChecked(m == mode)
+            self.canvas.set_mode(mode)
+            self.refresh_info()
+
+        def refresh_info(self):
+            if not (self.pm and self.dbg):
+                self.statusBar().showMessage(
+                    "点「打开 JSON」载入识别结果（默认不改原文件）")
+                return
+            c = self.pm.counts()
+            src = ("底图 %d DPI" % self.dpi) if self.dpi > 0 else "底图 内嵌图"
+            self.setWindowTitle("LBD 标注工具 v0.2 — %s ｜ %s"
+                                % (os.path.basename(self.dbg.path), src))
+            self.lbl_info.setText(
+                "第 %d 页 / 共 %d 页\n坐标尺寸 %d × %d\n底图：%s\n"
+                "标签表：%s\nNode %d　Tracker %d　Box %d%s"
+                % (self.page, len(self.dbg.page_numbers()), self.pm.width,
+                   self.pm.height, self._img_note or "（载入中）",
+                   (os.path.basename(self.xlsx) if self.xlsx else "（没选，补编号要用）"),
+                   c["Node"], c["Tracker"], c.get("Box", 0),
+                   "\n\n● 已修改，记得保存" if self.pm.dirty else ""))
+            self.statusBar().showMessage(
+                "模式：%s　拖框内=移动，拖白点=改大小，方向键=微调(Shift 加速)，"
+                "Delete=删除，Ctrl+Z=撤销，中键拖动=平移，滚轮=缩放，A/D=翻页"
+                % MODE_TEXT.get(self.canvas.mode, self.canvas.mode))
+
+        def keyPressEvent(self, ev):
+            k = ev.key()
+            ctrl = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            if ctrl and k == Qt.Key.Key_C:
+                if not ev.isAutoRepeat():
+                    self.on_copy()
+                return
+            if ctrl and k == Qt.Key.Key_V:
+                # 过滤键盘自动重复：不然按住 Ctrl+V 一秒钟就会贴出几十份框
+                if not ev.isAutoRepeat():
+                    self.on_paste()
+                return
+            if k == Qt.Key.Key_Escape:
+                self.on_escape()
+                return
+            if k == Qt.Key.Key_Delete:
+                self.on_delete()
+                return
+            if k in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
+                it = self.current_item()
+                if it is not None:
+                    step = 10 if ev.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+                    dx = {Qt.Key.Key_Left: -step, Qt.Key.Key_Right: step}.get(k, 0)
+                    dy = {Qt.Key.Key_Up: -step, Qt.Key.Key_Down: step}.get(k, 0)
+                    self.begin_change()
+                    b = it.scene_box()
+                    it.setPos(b[0] + dx, b[1] + dy)
+                    it.sync_shape()
+                    self.end_change()
+                    self.on_selection()
+                    return
+            if k == Qt.Key.Key_A:
+                self.goto_offset(-1)
+                return
+            if k == Qt.Key.Key_D:
+                self.goto_offset(1)
+                return
+            super().keyPressEvent(ev)
+
+        def on_escape(self):
+            """ESC：画到一半就丢掉当前这一笔；否则从画框模式退回选择模式。"""
+            if self.canvas.cancel_draw():
+                self.statusBar().showMessage("已取消这一笔", 3000)
+                return
+            if self.canvas.mode != "select":
+                self.set_mode("select")
+                self.statusBar().showMessage("已退出画框模式", 3000)
+
+        def on_reload_page(self, quiet=False):
+            """把当前页恢复成「上次打开/保存时」的样子 —— 画乱了/粘多了的出口。"""
+            if not self.pm:
+                return
+            if not quiet and QMessageBox.question(
+                    self, "重载本页",
+                    "把第 %d 页恢复成上次打开 / 保存时的样子？\n\n"
+                    "这一页上后来画的、改的、粘的都会丢掉，别的页不受影响。"
+                    % self.page) != QMessageBox.StandardButton.Yes:
+                return
+            self.begin_change()
+            self.pm.load()
+            self.pm.dirty = True
+            self._rebuild_items()
+            self.end_change()
+            self.refresh_info()
+            self.on_selection()
+            self.statusBar().showMessage(
+                "第 %d 页已恢复（Ctrl+Z 可以撤销这次恢复）" % self.page, 6000)
+
+        def on_copy(self):
+            sel = [i for i in self.scene.selectedItems() if isinstance(i, BoxItem)]
+            if not sel:
+                self.statusBar().showMessage("先选中要复制的框（可以框选多个）", 4000)
+                return
+            self.clip = [copy.deepcopy(it.shape_data) for it in sel]
+            for s in self.clip:
+                # 复制出来的是"新框"：不能再认原来那条编号记录，否则回写时两个框抢一条记录
+                s["ocr_index"] = None
+            self._paste_n = 0
+            self.statusBar().showMessage(
+                "已复制 %d 个框；切到目标页按 Ctrl+V 粘贴（每贴一次自动错开）" % len(self.clip), 6000)
+
+        def on_paste(self):
+            if not self.pm:
+                return
+            if not self.clip:
+                self.statusBar().showMessage("剪贴板里还没有框：先选中再按 Ctrl+C", 4000)
+                return
+            self._paste_n += 1
+            clip = self.clip
+            # 偏移量按"这一组框的包围盒"算：贴出来正好排在旁边，而不是原位叠着。
+            # （之前固定错开 24 像素，页面有上千像素宽时肉眼几乎看不出偏移，
+            #   看着就是一堆框挤在一起。）
+            gx1 = min(s["bbox"][0] for s in clip)
+            gy1 = min(s["bbox"][1] for s in clip)
+            gx2 = max(s["bbox"][2] for s in clip)
+            gy2 = max(s["bbox"][3] for s in clip)
+            gap = 12.0
+            # 错开量按"这一组较短边的 15%（不小于 24px）"算，再乘粘贴次数。
+            # 以前按整组包围盒错开，细长的一组会被甩到很远的地方。
+            dx = max(24.0, 0.15 * (gx2 - gx1)) * self._paste_n
+            dy = max(24.0, 0.15 * (gy2 - gy1)) * self._paste_n
+            W, H = float(self.pm.width), float(self.pm.height)
+            # 整组不越界：越界就把整组挪回来，组内相对位置不变（不会挤在页面边上）
+            if gx2 + dx > W:
+                dx -= (gx2 + dx - W)
+            if gy2 + dy > H:
+                dy -= (gy2 + dy - H)
+            if gx1 + dx < 0:
+                dx = -gx1
+            if gy1 + dy < 0:
+                dy = -gy1
+            self.begin_change()
+            self.scene.clearSelection()
+            made = 0
+            for s in clip:
+                b = s["bbox"]
+                ns = copy.deepcopy(s)
+                ns["bbox"] = [b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy]
+                ns["ocr_index"] = None
+                self.pm.shapes.append(ns)
+                it = BoxItem(ns)
+                self.scene.addItem(it)
+                self.items.append(it)
+                it.setSelected(True)
+                made += 1
+            self.end_change()
+            self.on_selection()
+            self.statusBar().showMessage(
+                "已粘贴 %d 个框（整组错开 %.0f×%.0f 像素，排在旁边不重叠；"
+                "再按 Ctrl+V 再贴一份）" % (made, dx, dy), 6000)
+
+        def on_undo(self):
+            if not self.undo:
+                self.statusBar().showMessage("没有可撤销的操作（Ctrl+Y 可以重做）", 3000)
+                return
+            page, snap = self.undo.pop()
+            self.redo.append((self.page, [(i, dict(s)) for i, s in enumerate(self.pm.shapes)]))
+            self._restore(page, snap)
+            self.statusBar().showMessage("已撤销；想还原按 Ctrl+Y", 4000)
+
+        def on_redo(self):
+            if not self.redo:
+                self.statusBar().showMessage("没有可重做的操作", 3000)
+                return
+            page, snap = self.redo.pop()
+            self.undo.append((self.page, [(i, dict(s)) for i, s in enumerate(self.pm.shapes)]))
+            self._restore(page, snap)
+            self.statusBar().showMessage("已重做", 3000)
+
+        def _restore(self, page, snap):
+            """把某一页恢复成快照的样子（撤销/重做共用）。"""
+            if page != self.page:
+                self.goto_page(page)
+            self.pm.shapes = [dict(s) for _i, s in snap]
+            self._rebuild_items()
+            self.pm.dirty = True
+            self.refresh_info()
+            self.on_selection()
+
+        # ---------------- 标签表 / 自动补编号
+        def sync_shapes(self):
+            """把界面上框的位置写回数据。
+
+            拖动框之后必须调一次 —— 这个 PySide6 版本的 QGraphicsItem::itemChange
+            收不到 "位置变了" 事件，靠它同步的话拖动永远不会写回 bbox，
+            保存出来还是老坐标（就是"移动支架位置保存不生效"那个 bug）。
+            """
+            if not self.pm:
+                return
+            for it in self.items:
+                it.sync_shape()
+            it = self.current_item()
+            if it is not None:
+                b = it.scene_box()
+                self.lbl_bbox.setText("%.0f, %.0f → %.0f, %.0f"
+                                      % (b[0], b[1], b[2], b[3]))
+
+        def on_name_px(self, _i=None):
+            px, selonly = self.cmb_name.currentData() or (11, True)
+            BoxItem.name_px = float(px)
+            BoxItem.name_sel_only = bool(selonly)
+            for it in self.items:
+                it.update()
+            s = load_settings()
+            s["name_mode"] = self.cmb_name.currentIndex()
+            save_settings(s)
+
+        def on_lock_window(self, on):
+            try:
+                if on:
+                    # 锁的是"画布区"：画布固定住，整个窗口仍然可以拉大拉小
+                    self.canvas.setFixedSize(self.canvas.size())
+                else:
+                    self.canvas.setMinimumSize(320, 240)
+                    self.canvas.setMaximumSize(16777215, 16777215)
+                    self.setMaximumSize(16777215, 16777215)
+                    self.setMinimumSize(1180, 740)
+            except Exception:
+                pass
+            s = load_settings()
+            s["win_locked"] = bool(on)
+            save_settings(s)
+            self.statusBar().showMessage(
+                "窗口大小已锁定（再点一下「锁定窗口大小」解锁）" if on
+                else "窗口大小已解锁（现在可以自由拉动）", 4000)
+
+        def closeEvent(self, ev):
+            try:
+                s = load_settings()
+                s["win_w"], s["win_h"] = int(self.width()), int(self.height())
+                s["name_mode"] = self.cmb_name.currentIndex()
+                save_settings(s)
+            except Exception:
+                pass
+            super().closeEvent(ev)
+
+        def on_pick_xlsx(self):
+            base = (self.xlsx if (self.xlsx and os.path.exists(self.xlsx))
+                    else os.path.expanduser("~"))
+            p, _ = QFileDialog.getOpenFileName(self, "选择 LBD 标签表", base,
+                                               "Excel (*.xlsx)")
+            if not p:
+                return
+            self.xlsx = p
+            self._sheet_cache = None
+            s = load_settings()
+            s["xlsx"] = p
+            save_settings(s)
+            self.refresh_info()
+            self.statusBar().showMessage("标签表：%s" % p, 6000)
+
+        def _sheet_rows(self):
+            """(分表名列表, 取某分表 LBD 行的函数)；读不到返回 (None, None)。"""
+            return self._sheets_and_rows()
+
+        def _page_order(self):
+            """要处理的页顺序（升序）：识别结果 JSON = 有识别记录的图纸页；
+            直接标 PDF（BlankDoc）= 本会话里已经画了框的页。"""
+            pages = []
+            if hasattr(self.dbg, "_elements"):
+                try:
+                    pages = list(drawing_pages(self.dbg))
+                except Exception:
+                    pages = []
+            for pg in self.dbg.page_numbers():
+                pm = self.pm if pg == self.page else self.edited.get(pg)
+                if pm is not None and any(s.get("label") == "Node" for s in pm.shapes):
+                    pages.append(pg)
+            return sorted(set(pages))
+
+        def _sheets_and_rows(self):
+            if not self.xlsx or not os.path.exists(self.xlsx):
+                return None, None
+            if self._sheet_cache is None or self._sheet_cache[0] != self.xlsx:
+                self._sheet_cache = (self.xlsx, xlsx_sheet_names(self.xlsx), {})
+            _p, sheets, cache = self._sheet_cache
+
+            def rows_of(name):
+                if name not in cache:
+                    try:
+                        cache[name] = xlsx_lbd_rows(self.xlsx, name)
+                    except Exception:
+                        cache[name] = []
+                return cache[name]
+
+            return sheets, rows_of
+
+        def on_autofill(self, whole=True):
+            """按「已框好的 LBD 区域 + 框内文字」补 LBD 名字，整册跑时逐页报进度。"""
+            try:
+                self._autofill_impl(whole)
+            except Exception:
+                import traceback
+                QMessageBox.critical(self, "补编号出错（把这段发我）",
+                                     traceback.format_exc())
+
+        def _autofill_impl(self, whole=True):
+            from PySide6.QtWidgets import QProgressDialog
+            if not self.pm or not self.dbg:
+                self.statusBar().showMessage("先打开一份 JSON（或 PDF）再补编号", 5000)
+                return
+            # 本页先看一眼有没有可补的框：没有就直说，别让人以为"点了没反应"
+            if not whole:
+                n_node = sum(1 for s in self.pm.shapes if s.get("label") == "Node")
+                if n_node == 0:
+                    QMessageBox.information(
+                        self, "本页没有 Node 框",
+                        "第 %d 页上 Node 框 0 个（这页不是图纸页，或者框还没画）。\n\n"
+                        "补编号只对有 Node 框（LBD 区域）的图纸页有用；"
+                        "也可以直接用「补全编号(整册)」。" % self.page)
+                    return
+                self.statusBar().showMessage("正在补第 %d 页（Node %d 个）…" % (self.page, n_node))
+                QApplication.processEvents()
+            sheets, rows_of = self._sheet_rows()
+            if not sheets:
+                QMessageBox.information(self, "缺标签表",
+                                        "先点工具栏「选标签表…」选上 LBD 标签表(xlsx)。")
+                return
+            if not self.pdf or not os.path.exists(self.pdf):
+                QMessageBox.information(
+                    self, "缺 PDF",
+                    "框内取文字要读 PDF 文字层，请先「选 PDF…」指定这份 JSON 对应的 PDF。")
+                return
+            # 直接标 PDF（没 JSON）时 dbg 是 BlankDoc：它没有"识别记录"，
+            # 只能按"本会话里有框的页"来排；识别结果 JSON 就按 debug_page_map 那套。
+            blank = not hasattr(self.dbg, "_elements")
+            order = self._page_order()
+            if self.page not in order:
+                order = sorted(set(order) | {self.page})
+            todo = order if whole else [self.page]
+            force = False
+            try:
+                force = bool(self.chk_force.isChecked())
+                s = load_settings()
+                s["force"] = force
+                save_settings(s)
+            except Exception:
+                force = False
+            try:
+                ptext = PdfText(self.pdf)
+            except Exception as e:
+                QMessageBox.warning(self, "读不了 PDF", "打开 PDF 失败：%s" % e)
+                return
+            prog = QProgressDialog("正在按框内文字补编号…", "取消", 0, len(todo), self)
+            prog.setWindowTitle("补全 LBD 编号")
+            prog.setMinimumDuration(0)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            lines, n_ok, n_auto, n_miss, n_skip = [], 0, 0, 0, 0
+            check = []          # 要人核的：位置可能错的（紫）+ 按顺序推的（黄）
+            try:
+                for k, pg in enumerate(todo):
+                    prog.setValue(k)
+                    prog.setLabelText("第 %d 页（%d/%d）…" % (pg, k + 1, len(todo)))
+                    QApplication.processEvents()
+                    if prog.wasCanceled():
+                        break
+                    pm = self.pm if pg == self.page else (self.edited.get(pg)
+                                                          or PageModel(self.dbg, pg))
+                    if force:
+                        # 重算：把 Node 上已有的名字清掉（识别给的号不对时用这个）
+                        for sh in pm.shapes:
+                            if sh.get("label") == "Node":
+                                sh["name"] = ""
+                                sh["_auto"] = False
+                                sh["_miss"] = False
+                                sh["_check"] = False
+                    items = ptext.items(pg)
+                    hit, _cnt = page_sheet_by_text(items, sheets)
+                    idx = order.index(pg) if pg in order else -1
+                    by_order = sheets[idx] if 0 <= idx < len(sheets) else ""
+                    # 直接标 PDF 时没有"图纸顺序"可依，就用页面上印的分表名；
+                    # 识别结果 JSON 还是按"第几页 = 第几个分表"（和主程序一致）。
+                    sheet = (hit or by_order) if blank else by_order
+                    num_set = {n for n, _l in (rows_of(sheet) if sheet else [])}
+                    st = autofill_shapes(pm.shapes, items, sheet, num_set,
+                                         pm.width, pm.height)
+                    pm.dirty = True
+                    self.edited[pg] = pm
+                    if pg == self.page:
+                        self._rebuild_items()
+                    n_ok += st["filled"]
+                    n_auto += st["auto"]
+                    n_miss += st["missed"]
+                    n_skip += st["kept"]
+                    note = ""
+                    if hit and sheet and _clean_key(hit) != _clean_key(sheet):
+                        note = "；⚠页面文字里印的是 %s（按顺序推的是 %s）" % (hit, sheet)
+                    details = ""
+                    if st["auto"]:
+                        details += "，其中按标签表顺序推 %d（黄色）" % st["auto"]
+                    if st["missed"]:
+                        details += "，没取到 %d（红色）" % st["missed"]
+                    lines.append("第 %s 页 %s：补上 %d 个%s%s"
+                                 % (pg, sheet or "（推不出分表）", st["filled"],
+                                    details, note))
+                    for nm, x, y in (st.get("sus_list") or []):
+                        check.append("第 %s 页 %s —— 同一排的号不连续，位置可能错"
+                                     "（图上大约 x=%d y=%d）" % (pg, nm or "（空）", x, y))
+                    for nm in (st.get("auto_list") or []):
+                        check.append("第 %s 页 %s —— 图上没找到编号，按标签表顺序推的"
+                                     % (pg, nm or "（空）"))
+            finally:
+                prog.close()
+                self.refresh_info()
+                self.on_selection()
+            head = ("框内文字取到 %d 个；按标签表顺序补 %d 个（黄色，请核一下）；"
+                    "没取到 %d 个（红色，手填）；已有名字跳过 %d 个。\n"
+                    "要你核的一共 %d 个（下面列出来；紫=号跳号、黄=按顺序推的）\n\n"
+                    % (n_ok, n_auto, n_miss, n_skip, len(check)))
+            if not whole:
+                n_node = sum(1 for s in self.pm.shapes if s.get("label") == "Node")
+                head = ("第 %d 页（Node 框 %d 个）\n" % (self.page, n_node)) + head
+                if n_node and not (n_ok or n_auto or n_miss) and n_skip == n_node:
+                    head = ("第 %d 页：%d 个框全都有名字了，我默认不动它们。\n"
+                            "如果这些名字是错的，勾上工具栏的「重算(覆盖已有名字)」再点一次。\n\n"
+                            % (self.page, n_node)) + head
+            body = "\n".join(lines[:60])
+            if len(lines) > 60:
+                body += "\n…（共 %d 页，完整清单见状态栏）" % len(lines)
+            if check:
+                body += "\n\n【需要核对的】\n" + "\n".join(check[:60])
+                if len(check) > 60:
+                    body += "\n…（还有 %d 个，见 --autofill 的日志）" % (len(check) - 60)
+            try:
+                self.statusBar().showMessage(
+                    "补编号完成：框内 %d / 推 %d / 缺 %d" % (n_ok, n_auto, n_miss), 0)
+            except Exception:
+                pass
+            QMessageBox.information(self, "补全 LBD 编号", head + body)
+
+        def on_export_dataset(self):
+            """导出 YOLO 训练集：images/ + labels/ + classes.txt + data.yaml。"""
+            from PySide6.QtWidgets import QProgressDialog
+            if not (self.dbg and self.pdf and os.path.exists(self.pdf)):
+                QMessageBox.information(self, "缺 PDF",
+                                        "导出数据集要用 PDF 渲染图片，请先「选 PDF…」。")
+                return
+            base = os.path.join(os.path.dirname(self.dbg.path), "yolo_dataset")
+            out = QFileDialog.getExistingDirectory(self, "选数据集输出目录", base)
+            if not out:
+                return
+            img_dir = os.path.join(out, "images")
+            lab_dir = os.path.join(out, "labels")
+            os.makedirs(img_dir, exist_ok=True)
+            os.makedirs(lab_dir, exist_ok=True)
+            names = list(CLASSES)
+            with open(os.path.join(out, "classes.txt"), "w", encoding="utf-8") as f:
+                f.write("\n".join(names) + "\n")
+            with open(os.path.join(out, "data.yaml"), "w", encoding="utf-8") as f:
+                f.write("path: %s\ntrain: images\nval: images\nnames:\n"
+                        % out.replace("\\", "/"))
+                for i, n in enumerate(names):
+                    f.write("  %d: %s\n" % (i, n))
+            pages = drawing_pages(self.dbg) or [self.page]
+            dpi = self.dpi if self.dpi > 0 else 250
+            prog = QProgressDialog("正在导出 YOLO 数据集…", "取消", 0, len(pages), self)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            prog.setMinimumDuration(0)
+            n_img = n_box = 0
+            try:
+                for k, pg in enumerate(pages):
+                    prog.setValue(k)
+                    prog.setLabelText("第 %d 页（%d/%d）…" % (pg, k + 1, len(pages)))
+                    QApplication.processEvents()
+                    if prog.wasCanceled():
+                        break
+                    src = self.renderer.render(self.pdf, pg, dpi)
+                    dst = os.path.join(img_dir, "p%04d.png" % pg)
+                    shutil.copyfile(src, dst)
+                    pm = self.pm if pg == self.page else (self.edited.get(pg)
+                                                          or PageModel(self.dbg, pg))
+                    W = float(pm.width) or 1.0
+                    H = float(pm.height) or 1.0
+                    lines = []
+                    for s in pm.shapes:
+                        b = s["bbox"]
+                        cls = names.index(s["label"]) if s["label"] in names else 0
+                        lines.append("%d %.6f %.6f %.6f %.6f"
+                                     % (cls, (b[0] + b[2]) / 2 / W, (b[1] + b[3]) / 2 / H,
+                                        (b[2] - b[0]) / W, (b[3] - b[1]) / H))
+                        n_box += 1
+                    with open(os.path.join(lab_dir, "p%04d.txt" % pg), "w",
+                              encoding="utf-8") as f:
+                        f.write("\n".join(lines) + "\n")
+                    n_img += 1
+            finally:
+                prog.close()
+            QMessageBox.information(
+                self, "数据集导出完成",
+                "目录：%s\n\n图片 %d 张、标注框 %d 个，类别顺序：%s\n\n"
+                "训练（在装了 ultralytics 的 Python 环境里）：\n"
+                "yolo train data=%s/data.yaml model=yolov8n.pt imgsz=2560\n"
+                % (out, n_img, n_box, " / ".join(names),
+                   out.replace("\\", "/")))
+
+        def on_train_panel(self):
+            """训练环境面板：探测 Python / 检测 ultralytics / 一键装（日志实时显示）。"""
+            from PySide6.QtWidgets import (QDialog, QPlainTextEdit, QVBoxLayout, QHBoxLayout,
+                                           QPushButton, QLabel, QComboBox)
+            import subprocess
+            import threading
+            dlg = QDialog(self)
+            dlg.setWindowTitle("训练环境（先装环境，下一步接一键训练）")
+            dlg.resize(780, 500)
+            v = QVBoxLayout(dlg)
+            h = QHBoxLayout()
+            h.addWidget(QLabel("Python 解释器："))
+            cmb = QComboBox()
+            for p in find_pythons():
+                cmb.addItem(p)
+            if cmb.count() == 0:
+                cmb.addItem("（没找到 Python，点右边「浏览…」）")
+            if self.settings.get("python"):
+                cmb.addItem(str(self.settings["python"]))
+                cmb.setCurrentText(str(self.settings["python"]))
+            h.addWidget(cmb, 1)
+            b_br = QPushButton("浏览…")
+            h.addWidget(b_br)
+            v.addLayout(h)
+            lbl = QLabel("Python 3.14 装不上 torch —— 请选 3.11 / 3.12。"
+                         "这台机器是 GT 1030(2GB)+老驱动，只能跑 CPU 版。")
+            lbl.setWordWrap(True)
+            v.addWidget(lbl)
+            log = QPlainTextEdit()
+            log.setReadOnly(True)
+            v.addWidget(log, 1)
+            hb = QHBoxLayout()
+            b1 = QPushButton("检测环境")
+            b2 = QPushButton("一键装环境(CPU)")
+            b3 = QPushButton("关闭")
+            hb.addWidget(b1)
+            hb.addWidget(b2)
+            hb.addStretch(1)
+            hb.addWidget(b3)
+            v.addLayout(hb)
+
+            def cur_py():
+                t = cmb.currentText().strip()
+                return t if (t and os.path.exists(t)) else None
+
+            def run(args, tag):
+                log.appendPlainText("$ " + " ".join(args))
+
+                def work():
+                    try:
+                        pr = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                              stderr=subprocess.STDOUT, text=True,
+                                              encoding="utf-8", errors="replace",
+                                              creationflags=_NO_WINDOW)
+                        for line in pr.stdout:
+                            log.appendPlainText(line.rstrip())
+                        pr.wait()
+                        log.appendPlainText("[%s] 结束，退出码 %s" % (tag, pr.returncode))
+                    except Exception as e:
+                        log.appendPlainText("[%s] 出错：%s" % (tag, e))
+                threading.Thread(target=work, daemon=True).start()
+
+            def do_check():
+                p = cur_py()
+                if not p:
+                    lbl.setText("先选一个有效的 python.exe（「浏览…」）")
+                    return
+                self.settings["python"] = p
+                save_settings(self.settings)
+                lbl.setText("检测中…（看下面日志）")
+                run([p, "-c", "import sys;print('PY',sys.version.split()[0]);"
+                              "import ultralytics;print('UL',ultralytics.__version__)"], "检测")
+
+            def do_install():
+                p = cur_py()
+                if not p:
+                    lbl.setText("先选一个有效的 python.exe（「浏览…」）")
+                    return
+                self.settings["python"] = p
+                save_settings(self.settings)
+                lbl.setText("正在装 ultralytics（CPU 版 torch，几分钟）")
+                run([p, "-m", "pip", "install", "-U", "ultralytics"], "安装")
+
+            def do_browse():
+                p, _f = QFileDialog.getOpenFileName(dlg, "选 python.exe", "C:\\",
+                                                    "python.exe (python.exe)")
+                if p:
+                    cmb.addItem(p)
+                    cmb.setCurrentText(p)
+
+            b1.clicked.connect(do_check)
+            b2.clicked.connect(do_install)
+            b3.clicked.connect(dlg.accept)
+            b_br.clicked.connect(do_browse)
+            dlg.exec()
+
+        def on_check_update(self):
+            """检查标注工具自己的更新（读 Release 里的附件，不自动替换）。"""
+            # 联网行为会被杀软当木马（未签名 + 打包 + 联网是最敏感的三种特征），
+            # 所以这里只给手动下载的提示，不再自己去连 GitHub。
+            QMessageBox.information(
+                self, "在线更新",
+                "内置的联网检查更新已关闭（避免被杀软误报）。\n\n"
+                "更新方式：打开仓库的 Release 页面，下载名字里带 LBD 的那个包，"
+                "覆盖旧的 exe 即可。")
+            return
+            import json as _json
+            import urllib.request
+            repo = str(self.settings.get("update_repo") or UPDATE_REPO)
+            tok = str(self.settings.get("update_token") or "").strip()
+            req = urllib.request.Request(
+                "https://api.github.com/repos/%s/releases/latest" % repo,
+                headers={"User-Agent": "LBD-Annotator/%s" % ANNOTATOR_VERSION})
+            if tok:
+                req.add_header("Authorization", "token %s" % tok)
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    info = _json.loads(r.read().decode("utf-8"))
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "检查更新失败",
+                    "拉不到 Release：%s\n\n如果仓库是私有的，要么把它设成公开，"
+                    "要么在 annotator_settings.json 里加 update_token（只读 token）。" % e)
+                return
+            assets = info.get("assets") or []
+            mine = [a for a in assets if "LBD" in (a.get("name") or "").upper()]
+            txt = ["当前版本：%s   远端最新：%s（%s）"
+                   % (ANNOTATOR_VERSION, info.get("tag_name") or "?",
+                      info.get("published_at") or "")]
+            for a in assets:
+                txt.append("· %s  %.1f MB" % (a.get("name"), (a.get("size") or 0) / 1048576.0))
+            if mine:
+                txt.append("\n标注工具的包：%s\n下载地址：%s"
+                           % (mine[0].get("name"), mine[0].get("browser_download_url")))
+                txt.append("（自动替换要另配一个替换用的启动器，先给你下载地址）")
+            else:
+                txt.append("\n远端没有名字带 LBD 的附件 —— 把 LBD标注工具.exe 传到 Release 才能在线更新。")
+            QMessageBox.information(self, "检查更新", "\n".join(txt))
+
+        def on_rack_grade(self):
+            """Tracker（支架）按长边长度分档：短的 2 串、长的 3 串（可改）→ 写进 raw.strings。
+
+            分档用的是**整册所有页画过的支架**（不是只看当前页），
+            这样每一页的"长/短"用的是同一套门槛，跨页也不会忽长忽短。
+            """
+            from PySide6.QtWidgets import QInputDialog
+            if not self.dbg:
+                return
+            pages = self._page_order() or [self.page]
+            pms = {}
+            for pg in pages:
+                pms[pg] = (self.pm if pg == self.page
+                           else (self.edited.get(pg) or PageModel(self.dbg, pg)))
+            racks = [s for pm in pms.values() for s in pm.shapes
+                     if s.get("label") == "Tracker"]
+            if not racks:
+                QMessageBox.information(self, "没有支架框", "整册里都没有 Tracker（支架）框。")
+                return
+            longs = sorted(max(s["bbox"][2] - s["bbox"][0], s["bbox"][3] - s["bbox"][1])
+                           for s in racks)
+            # 按"长度差 ≤10%"聚类：差在 10% 以内的算同一类（不再等分位硬切）
+            groups = []
+            for L in longs:
+                if groups:
+                    m = sum(groups[-1]) / len(groups[-1])
+                    if abs(L - m) <= RACK_LEN_TOL * m:
+                        groups[-1].append(L)
+                        continue
+                groups.append([L])
+            k0 = len(groups)
+            txt, ok = QInputDialog.getText(
+                self, "支架串数分档",
+                "整册 %d 个支架框，按「长度差 ≤%d%% 算同一类」分成 %d 类。\n"
+                "按「短 → 长」填每类的串数（逗号分开）："
+                % (len(racks), int(RACK_LEN_TOL * 100), k0),
+                text=",".join(str(2 + i) for i in range(k0)))
+            if not ok or not txt.strip():
+                return
+            levels = sorted(int(x) for x in re.split(r"[^0-9]+", txt) if x.strip())
+            if not levels:
+                QMessageBox.warning(self, "填错了", "按 2,3 这种写法填。")
+                return
+            k = len(levels)
+            if k == k0:
+                means = [sum(g) / len(g) for g in groups]
+                cuts = [(means[i] + means[i + 1]) / 2.0 for i in range(k - 1)]
+            else:
+                # 你填的档数和自动分出来的类数不一致 -> 退回等分位切
+                cuts = [longs[min(len(longs) - 1, int(len(longs) * i / k))]
+                        for i in range(1, k)]
+            counts = {lv: 0 for lv in levels}
+            self.begin_change()
+            for pg, pm in pms.items():
+                hit = False
+                for s in pm.shapes:
+                    if s.get("label") != "Tracker":
+                        continue
+                    L = max(s["bbox"][2] - s["bbox"][0], s["bbox"][3] - s["bbox"][1])
+                    gi = 0
+                    for c in cuts:
+                        if L > c:
+                            gi += 1
+                    lv = levels[min(gi, k - 1)]
+                    raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+                    raw["strings"] = lv
+                    s["raw"] = raw
+                    s["name"] = "%d串" % lv
+                    counts[lv] = counts.get(lv, 0) + 1
+                    hit = True
+                if hit:
+                    pm.dirty = True
+                    self.edited[pg] = pm
+            self.end_change()
+            self.mark_dirty()
+            for it in self.items:
+                it.update()
+            QMessageBox.information(
+                self, "支架分档完成",
+                "整册 %d 个支架框（%d 页），按长度分成 %d 档：\n%s\n\n"
+                "已写进 JSON（raw.strings），框上也标了串数。\n"
+                "（主程序要拿这个值来定类型，还需要我加 3 行读取代码）"
+                % (len(racks), len(pages), k,
+                   "\n".join("%d串：%d 个" % (lv, counts[lv]) for lv in levels)))
+
+        def on_export_check(self):
+            """导出核对表 CSV：每页每个 Node 框一行（现有名字 / 框内候选 / 建议）。"""
+            import csv
+            from PySide6.QtWidgets import QProgressDialog
+            if not self.pm or not self.dbg:
+                self.statusBar().showMessage("先打开一份 JSON 再导出核对表", 5000)
+                return
+            sheets, rows_of = self._sheet_rows()
+            if not sheets:
+                QMessageBox.information(self, "缺标签表",
+                                        "先点工具栏「选标签表…」选上 LBD 标签表(xlsx)。")
+                return
+            if not self.pdf or not os.path.exists(self.pdf):
+                QMessageBox.information(self, "缺 PDF",
+                                        "读框内文字要 PDF，请先「选 PDF…」指定这份 JSON 的 PDF。")
+                return
+            base = os.path.splitext(os.path.basename(self.dbg.path))[0] + "_核对表.csv"
+            path, _ = QFileDialog.getSaveFileName(self, "导出核对表", base, "CSV (*.csv)")
+            if not path:
+                return
+            blank = not hasattr(self.dbg, "_elements")
+            order = self._page_order()
+            if self.page not in order:
+                order = sorted(set(order) | {self.page})
+            try:
+                ptext = PdfText(self.pdf)
+            except Exception as e:
+                QMessageBox.warning(self, "读不了 PDF", "打开 PDF 失败：%s" % e)
+                return
+            prog = QProgressDialog("正在生成核对表…", "取消", 0, len(order), self)
+            prog.setWindowTitle("导出核对表")
+            prog.setMinimumDuration(0)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            rows = []
+            try:
+                for k, pg in enumerate(order):
+                    prog.setValue(k)
+                    prog.setLabelText("第 %d 页（%d/%d）…" % (pg, k + 1, len(order)))
+                    QApplication.processEvents()
+                    if prog.wasCanceled():
+                        break
+                    pm = self.pm if pg == self.page else (self.edited.get(pg)
+                                                          or PageModel(self.dbg, pg))
+                    items = ptext.items(pg)
+                    hit, _cnt = page_sheet_by_text(items, sheets)
+                    idx = order.index(pg)
+                    by_order = sheets[idx] if idx < len(sheets) else ""
+                    sheet = (hit or by_order) if blank else by_order
+                    num_set = {n for n, _l in (rows_of(sheet) if sheet else [])}
+                    rr, _dry = check_rows(pm.shapes, items, sheet, num_set,
+                                          pm.width, pm.height)
+                    for r in rr:
+                        r["page"] = pg
+                        r["sheet"] = sheet
+                        rows.append(r)
+            finally:
+                prog.close()
+            cols = ["page", "sheet", "ix", "cx", "cy", "now", "cand", "sug", "src"]
+            head = {"page": "页号", "sheet": "分表", "ix": "框序号", "cx": "中心X",
+                    "cy": "中心Y", "now": "现有名字", "cand": "框内候选(号@距离px)",
+                    "sug": "建议名字", "src": "建议来源"}
+            try:
+                with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=cols)
+                    w.writerow(head)
+                    for r in rows:
+                        w.writerow({c: r.get(c, "") for c in cols})
+            except Exception as e:
+                QMessageBox.warning(self, "写不了文件", "%s" % e)
+                return
+            n_diff = sum(1 for r in rows if (r.get("now") or "") != (r.get("sug") or ""))
+            n_cand = sum(1 for r in rows if r.get("cand"))
+            QMessageBox.information(
+                self, "核对表已导出",
+                "写好了：\n%s\n\n共 %d 行（%d 个框）；框内找到候选的 %d 个；"
+                "现有名字和建议不一致的 %d 个。\n\n"
+                "在 Excel 里看：cand 列是这个框里找到的文字（号@距离），"
+                "sug 是按现在规则算的建议名，src=框内 就是真从框里取到的。"
+                % (path, len(rows), len(rows), n_cand, n_diff))
+
+        # ---------------- 保存
+        def do_save(self, dest, quiet=False):
+            if not self.dbg:
+                return 0
+            self._stash_dirty()
+            mod = {p: pm.result() for p, pm in self.edited.items()}
+            pages = sorted(mod)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self.dbg.save(dest, mod)
+                self.dbg = DebugJson(dest)
+            finally:
+                QApplication.restoreOverrideCursor()
+            self.edited.clear()
+            self.undo.clear()
+            self.cmb_page.blockSignals(True)
+            self.cmb_page.clear()
+            for n in self.dbg.page_numbers():
+                self.cmb_page.addItem(str(n), n)
+            self.cmb_page.blockSignals(False)
+            self.setWindowTitle("LBD 标注工具 v0.2 — %s" % os.path.basename(dest))
+            keep = self.page if self.page in self.dbg.pages else self.dbg.page_numbers()[0]
+            self.pm = None
+            self.goto_page(keep)
+            if not quiet:
+                QMessageBox.information(
+                    self, "已保存",
+                    "写好了：\n%s\n\n写入的页：%s\n（没改过的页和段落是逐字节照搬的）"
+                    % (dest, "、".join(str(p) for p in pages) if pages else "（没有改动）"))
+            return len(mod)
+
+        def on_save_as(self):
+            if not self.dbg:
+                return
+            base = os.path.splitext(self.dbg.path)[0] + "_annotated.json"
+            p, _ = QFileDialog.getSaveFileName(self, "另存标注结果", base,
+                                               "JSON (*.json)")
+            if p:
+                self.do_save(p)
+
+        def on_save_over(self):
+            if not self.dbg:
+                return
+            src = self.dbg.path
+            if QMessageBox.question(
+                    self, "覆盖原文件",
+                    "直接覆盖：\n%s\n\n（不留备份文件，覆盖后原内容就没了）\n继续吗？" % src
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self.do_save(src)
+            self.statusBar().showMessage("已覆盖原文件：%s" % src, 8000)
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    win = Win(path)
+    win.show()
+    if memtest:
+        print("READY dpi=%s 页=%s 框=%d 底图=%s"
+              % (win.dpi, win.page, len(win.items), win._img_note), flush=True)
+        time.sleep(float(memtest))
+        return 0
+    if roundtrip:
+        # 复现「一页画完 -> 翻下一页 -> 再翻回来」：看框会不会串页、底图会不会花
+        pgs = win.dbg.page_numbers()
+        p0 = pgs[0]
+        print("起始页 %d，共 %d 页，当前 %d 个框" % (p0, len(pgs), len(win.items)), flush=True)
+        win.goto_page(p0)
+        n0 = len(win.items)
+        win.add_shape("Node", [100, 100, 400, 900])
+        b0 = list(win.items[-1].shape_data["bbox"])
+        img0 = win._pixmap.copy(0, 0, 100, 100).toImage().bits().tobytes()
+        print("第 %d 页画好一个 Node，框数 %d" % (p0, len(win.items)), flush=True)
+        win.goto_offset(1)
+        p1 = win.page
+        n1 = len(win.items)
+        print("翻到第 %d 页，框数 %d" % (p1, n1), flush=True)
+        win.add_shape("Tracker", [200, 200, 600, 300])
+        img1 = win._pixmap.copy(0, 0, 100, 100).toImage().bits().tobytes()
+        print("第 %d 页画好一个 Tracker，框数 %d" % (p1, len(win.items)), flush=True)
+        win.goto_page(p0)
+        print("第 %d 页 %d -> %d 个框；第 %d 页 %d -> %d 个框"
+              % (p0, n0, len(win.items), p1, n1, len(win.items)))
+        print("   回到第 %d 页后框数 = 原来+1: %s" % (p0, len(win.items) == n0 + 1))
+        back = [x for x in win.items if x.shape_data["bbox"] == b0]
+        print("   画的框还在原位: %s" % bool(back))
+        img0b = win._pixmap.copy(0, 0, 100, 100).toImage().bits().tobytes()
+        print("   第 %d 页底图与最初一致: %s" % (p0, img0b == img0))
+        print("   两页底图本来就不同: %s" % (img0 != img1))
+        win.goto_page(p1)
+        print("   第 %d 页那个框还在: %s" % (p1, len(win.items) == n1 + 1))
+        # 全量对比：这一页每个框的坐标，翻页往返前后必须完全一致
+        def snap_all():
+            return sorted(tuple(round(v, 1) for v in it.shape_data["bbox"])
+                          for it in win.items)
+
+        win.goto_page(p1)
+        s_before = snap_all()
+        win.goto_page(p0)
+        win.goto_page(p1)
+        s_after = snap_all()
+        print("第 %d 页全部 %d 个框逐个对比: %s"
+              % (p1, len(s_before), "完全一致" if s_before == s_after else "有变化！"))
+        if s_before != s_after:
+            for a, b in list(zip(s_before, s_after))[:8]:
+                if a != b:
+                    print("     变了: %s -> %s" % (a, b))
+        return 0
+    if smoke:
+        if not path:
+            print("smoke：没给 JSON 路径")
+            return 2
+        win.load_file(path)
+        print("载入 OK：共 %d 页，第 %d 页 %d 个框"
+              % (len(win.dbg.page_numbers()), win.page, len(win.items)))
+        print("内存：载入后 %.0f MB（%s）"
+              % (rss_mb(), win._img_note or "底图来源见下"))
+        first = win.page
+        win.add_shape("Node", [120, 120, 420, 900])
+        it = win.current_item()
+        it.shape_data["name"] = "SMOKE-LBD-001"
+        it.update()
+        win.on_selection()
+        print("画框 OK：本页 %d 个框，选中类别 %s"
+              % (len(win.items), it.shape_data["label"]))
+        win.goto_offset(1)
+        print("翻页 OK：第 %d 页 %d 个框" % (win.page, len(win.items)))
+        win.goto_page(first)
+        for i in list(win.items):
+            if i.shape_data.get("name") == "SMOKE-LBD-001":
+                win.scene.clearSelection()
+                i.setSelected(True)
+        win.on_delete()
+        print("删除 OK：本页剩 %d 个框" % len(win.items))
+        from PySide6.QtCore import QPointF
+        from PySide6.QtTest import QTest
+        from PySide6.QtCore import Qt as _Qt
+        print("控制点计算检查:", Canvas.apply_handle([0, 0, 100, 100], 7, 50, 50),
+              Canvas.apply_handle([0, 0, 100, 100], 0, -20, -20))
+        win.scene.clearSelection()
+        it0 = win.items[0]
+        it0.setSelected(True)
+        win.on_selection()
+        before = it0.scene_box()
+        hx, hy = Canvas.handle_points(before)[7]
+        p0 = win.canvas.mapFromScene(QPointF(hx, hy))
+        p1 = win.canvas.mapFromScene(QPointF(hx + 60, hy + 40))
+        QTest.mousePress(win.canvas.viewport(), _Qt.MouseButton.LeftButton,
+                         _Qt.KeyboardModifier.NoModifier, p0)
+        QTest.mouseMove(win.canvas.viewport(), p1)
+        QTest.mouseRelease(win.canvas.viewport(), _Qt.MouseButton.LeftButton,
+                           _Qt.KeyboardModifier.NoModifier, p1)
+        after = it0.scene_box()
+        print("拉边改大小：%s -> %s"
+              % (["%.0f" % v for v in before], ["%.0f" % v for v in after]))
+        grew = after[2] > before[2] and after[3] > before[3]
+        print("拉右下角变大:", grew)
+        # 点在框内部：会走 Qt 的命中测试（就是刚才报 shape() 错的那条路径）
+        win.scene.clearSelection()
+        it1 = win.items[1]
+        b = it1.scene_box()
+        mid = win.canvas.mapFromScene(QPointF((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0))
+        QTest.mousePress(win.canvas.viewport(), _Qt.MouseButton.LeftButton,
+                         _Qt.KeyboardModifier.NoModifier, mid)
+        QTest.mouseRelease(win.canvas.viewport(), _Qt.MouseButton.LeftButton,
+                           _Qt.KeyboardModifier.NoModifier, mid)
+        print("点框内部 OK：选中 %d 个框" % len(win.canvas.scene().selectedItems()))
+        dest = os.path.join(app_dir(), "smoke_out.json")
+        n = win.do_save(dest, quiet=True)
+        print("另存 OK：%s（写了 %d 页）" % (dest, n))
+        # 删框同步验证：删掉 3 个 Tracker + 1 个 Node，另存后重新读一遍，看是不是真少了
+        win.goto_page(first)
+        base = PageModel(DebugJson(path), first).counts()
+        before = len(win.items)
+        victims = [it for it in win.items if it.shape_data["label"] == "Tracker"][:3]
+        victims += [it for it in win.items if it.shape_data["label"] == "Node"][:1]
+        win.scene.clearSelection()
+        for v in victims:
+            v.setSelected(True)
+        print("   诊断：选中 %d 个；删除前 dirty=%s shapes=%d edited=%d pending=%s"
+              % (len(win.scene.selectedItems()), win.pm.dirty, len(win.pm.shapes),
+                 len(win.edited), win._pending is not None))
+        it_dbg = win.scene.selectedItems()[0]
+        print("   诊断：item.shape_data 是 pm.shapes 里的对象？ %s；in 判定？ %s；类型 %s"
+              % (any(it_dbg.shape_data is s for s in win.pm.shapes),
+                 it_dbg.shape_data in win.pm.shapes,
+                 type(it_dbg.shape_data).__name__))
+        win.on_delete()
+        print("   诊断：删除后 dirty=%s shapes=%d" % (win.pm.dirty, len(win.pm.shapes)))
+        after = len(win.items)
+        dest2 = os.path.join(app_dir(), "smoke_del.json")
+        win.do_save(dest2, quiet=True)
+        print("   诊断：保存后 edited=%d" % len(win.edited))
+        c2 = PageModel(DebugJson(dest2), first).counts()
+        print("删框同步：界面 %d -> %d，另存后重新读 Node %d / Tracker %d"
+              % (before, after, c2["Node"], c2["Tracker"]))
+        ok_del = (c2["Node"] == base["Node"] - 1 and c2["Tracker"] == base["Tracker"] - 3)
+        print("   期望 Node %d / Tracker %d -> %s"
+              % (base["Node"] - 1, base["Tracker"] - 3, "通过" if ok_del else "不一致！"))
+        # ESC：画到一半取消；再按回到选择模式
+        from PySide6.QtCore import QRectF
+        win.set_mode("Tracker")
+        win.canvas._origin = QPointF(500, 500)
+        win.canvas._rubber = win.canvas.scene().addRect(QRectF(500, 500, 100, 100))
+        nb = len(win.items)
+        win.on_escape()
+        e1 = (win.canvas._rubber is None and len(win.items) == nb)
+        win.on_escape()
+        e2 = (win.canvas.mode == "select")
+        print("ESC：画到一半取消 %s；再按回到选择模式 %s" % (e1, e2))
+        # 复制粘贴：选中两个框 -> 复制 -> 粘贴两次，看数量与错开量
+        win.scene.clearSelection()
+        for it in win.items[:2]:
+            it.setSelected(True)
+        win.on_copy()
+        n_before = len(win.items)
+        win.on_paste()
+        n_mid = len(win.items)
+        win.on_paste()
+        n_after = len(win.items)
+        pasted = win.scene.selectedItems()
+        print("复制粘贴：选中 2 个 -> 复制 -> 粘贴两次 %d -> %d -> %d（每次 +2）"
+              % (n_before, n_mid, n_after))
+        print("   粘贴后选中 %d 个，新增框的 ocr_index 都是 None: %s"
+              % (len(pasted), all(p.shape_data.get("ocr_index") is None for p in pasted)))
+        orig_boxes = {tuple(round(v, 1) for v in it.shape_data["bbox"])
+                      for it in win.items[:n_before]}
+        new_boxes = [tuple(round(v, 1) for v in p.shape_data["bbox"]) for p in pasted]
+        print("   粘贴的框和原框位置完全重合的个数: %d（应为 0，否则就是'挤在一起'）"
+              % sum(1 for b in new_boxes if b in orig_boxes))
+        # 跨页粘贴：复制 -> 翻到下一页 -> 粘贴
+        win.scene.clearSelection()
+        win.items[0].setSelected(True)
+        win.on_copy()
+        win.goto_offset(1)
+        n_page2 = len(win.items)
+        win.on_paste()
+        print("跨页粘贴：第 %d 页 %d -> %d 个框"
+              % (win.page, n_page2, len(win.items)))
+        # 撤销 / 重做
+        n0 = len(win.items)
+        win.on_undo()
+        n_undo = len(win.items)
+        win.on_redo()
+        n_redo = len(win.items)
+        win.on_undo()
+        n_undo2 = len(win.items)
+        print("撤销/重做：%d ->(撤销) %d ->(重做) %d ->(再撤销) %d  重做栈 %d"
+              % (n0, n_undo, n_redo, n_undo2, len(win.redo)))
+        print("   期望 粘贴前/撤销后一致、重做后回到粘贴后: %s"
+              % ("通过" if (n_redo == n0 and n_undo == n_page2 and n_undo2 == n_page2) else "不一致！"))
+        # 翻页往返：框的坐标和底图像素都不能变
+        win.goto_page(first)
+        it_chk = win.items[0]
+        shape_ref = it_chk.shape_data
+        box_before = list(shape_ref["bbox"])
+        pm_before = win.pm
+        pix_before = win._pixmap.copy(0, 0, 120, 120).toImage().bits().tobytes()
+        win.goto_offset(1)
+        win.goto_page(first)
+        same_model = (win.pm is pm_before)
+        in_list = any(s is shape_ref for s in win.pm.shapes)
+        box_after = list(shape_ref["bbox"])
+        pix_after = win._pixmap.copy(0, 0, 120, 120).toImage().bits().tobytes()
+        print("翻页往返：同一个页面模型 %s；框对象还在 %s" % (same_model, in_list))
+        print("   坐标 %s -> %s  %s" % (box_before, box_after,
+                                        "一致" if box_after == box_before else "变了！"))
+        print("   底图像素 %s" % ("一致" if pix_after == pix_before else "变了！"))
+        return 0
+    return app.exec()
+
+
+def fix_std_streams():
+    """打包成不带控制台的 exe 后 sys.stdout/stderr 是 None，print 会直接抛异常。"""
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            try:
+                setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+            except Exception:
+                pass
+
+
+def last_json():
+    """上次打开过的那份识别结果（存在设置文件里，双击 exe 接着用）。"""
+    p = str(load_settings().get("json") or "")
+    return p if p and os.path.exists(p) else ""
+
+
+def autofill_run(json_path, pdf_path, xlsx_path, out_path=None, only_page=None,
+                 force=False, csv_path=None):
+    """无界面跑一遍「框内取文字补 LBD 编号」，逐页打印结果；给了 out 就另存一份。
+
+    跟界面上「补全编号」用的是同一套函数，方便先拿真实文件核对。
+    """
+    dbg = DebugJson(json_path)
+    sheets = xlsx_sheet_names(xlsx_path)
+    if not sheets:
+        print("标签表里读不到分表名：%s" % xlsx_path)
+        return 2
+    cache = {}
+
+    def rows_of(nm):
+        if nm not in cache:
+            try:
+                cache[nm] = xlsx_lbd_rows(xlsx_path, nm)
+            except Exception as e:
+                print("  读分表 %s 失败：%s" % (nm, e))
+                cache[nm] = []
+        return cache[nm]
+
+    try:
+        ptext = PdfText(pdf_path)
+    except Exception as e:
+        print("打不开 PDF：%s" % e)
+        return 2
+    order = drawing_pages(dbg)
+    pages = [only_page] if only_page else order
+    print("JSON %s：%d 页；标签表分表 %d 个；PDF %d 页"
+          % (os.path.basename(json_path), len(order), len(sheets), ptext.count()))
+    mod = {}
+    tot = {"filled": 0, "auto": 0, "missed": 0, "kept": 0}
+    check_all = []
+    for k, pg in enumerate(pages):
+        idx = order.index(pg) if pg in order else -1
+        sheet = sheets[idx] if 0 <= idx < len(sheets) else ""
+        num_set = {n for n, _l in (rows_of(sheet) if sheet else [])}
+        pm = PageModel(dbg, pg)
+        now_map = {i: (s.get("name") or "")
+                   for i, s in enumerate(pm.shapes) if s.get("label") == "Node"}
+        if force:
+            for s in pm.shapes:
+                if s.get("label") == "Node":
+                    s["name"] = ""
+                    s["_auto"] = False
+                    s["_miss"] = False
+                    s["_check"] = False
+        items = ptext.items(pg)
+        hit, _cnt = page_sheet_by_text(items, sheets)
+        st = autofill_shapes(pm.shapes, items, sheet, num_set, pm.width, pm.height)
+        if csv_path:
+            rr, _dry = check_rows(pm.shapes, items, sheet, num_set, pm.width, pm.height)
+            for r in rr:
+                r["page"] = pg
+                r["sheet"] = sheet
+                r["now"] = now_map.get(r["ix"], "")
+                check_all.append(r)
+        for key in tot:
+            tot[key] += st.get(key, 0)
+        note = ""
+        if hit and sheet and _clean_key(hit) != _clean_key(sheet):
+            note = "  [警告] 页面文字印的是 %s" % hit
+        print("[%2d/%2d] 第 %s 页 分表=%-10s 号码表=%-3d 出名字 %d 个"
+              "（框内 %d / 推 %d / 缺 %d）%s"
+              % (k + 1, len(pages), pg, sheet or "?", len(num_set),
+                 st["filled"] + st["auto"], st["filled"], st["auto"],
+                 st["missed"], note))
+        for s in pm.shapes:
+            if s.get("label") == "Node":
+                flag = "红" if s.get("_miss") else ("紫" if s.get("_check")
+                                                   else ("黄" if s.get("_auto") else "绿"))
+                print("        %s %s" % (flag, (s.get("name") or "（空）")))
+        for nm, x, y in (st.get("sus_list") or []):
+            print("        [要核] %s 同一排号不连续（x=%d y=%d）" % (nm or "（空）", x, y))
+        for nm in (st.get("auto_list") or []):
+            print("        [要核] %s 图上没编号，按标签表顺序推的" % (nm or "（空）"))
+        mod[pg] = pm.result()
+    print("合计：框内取到 %d，按标签表推 %d，没取到 %d，已有名字跳过 %d"
+          % (tot["filled"], tot["auto"], tot["missed"], tot["kept"]))
+    if out_path:
+        dbg.save(out_path, mod)
+        print("已另存：%s" % out_path)
+    if csv_path:
+        import csv
+        cols = ["page", "sheet", "ix", "cx", "cy", "now", "cand", "sug", "src"]
+        head = {"page": "页号", "sheet": "分表", "ix": "框序号", "cx": "中心X",
+                "cy": "中心Y", "now": "现有名字", "cand": "框内候选(号@距离px)",
+                "sug": "建议名字", "src": "建议来源"}
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writerow(head)
+            for r in check_all:
+                w.writerow({c: r.get(c, "") for c in cols})
+        n_cand = sum(1 for r in check_all if r.get("cand"))
+        n_diff = sum(1 for r in check_all if (r.get("now") or "") != (r.get("sug") or ""))
+        print("核对表已写：%s（%d 行；框内有候选 %d；现有≠建议 %d）"
+              % (csv_path, len(check_all), n_cand, n_diff))
+    return 0
+
+
+def main():
+    fix_std_streams()
+    ap = argparse.ArgumentParser(description="LBD 标注工具 v0.2")
+    ap.add_argument("json", nargs="?", default=None,
+                    help="识别结果 debug JSON（不填就打开对话框）")
+    ap.add_argument("--selftest", action="store_true", help="无界面自检")
+    ap.add_argument("--smoke", action="store_true", help="无显示界面自检（画框/翻页/另存）")
+    ap.add_argument("--memtest", action="store_true",
+                    help="只载入并显示第一页，然后挂着（外部采样内存用）")
+    ap.add_argument("--roundtrip", action="store_true",
+                    help="复现「画完翻页再翻回来」，检查框和底图有没有乱")
+    ap.add_argument("--autofill", action="store_true",
+                    help="无界面按框内文字补 LBD 编号（配 --pdf/--xlsx/--out 用）")
+    ap.add_argument("--pdf", default=None, help="配套 PDF（框内取文字用）")
+    ap.add_argument("--xlsx", default=None, help="LBD 标签表(xlsx)")
+    ap.add_argument("--page", type=int, default=None, help="--autofill 时只跑这一页")
+    ap.add_argument("--force", action="store_true",
+                    help="--autofill 时把已有的 Node 名字也重算一遍")
+    ap.add_argument("--csv", default=None,
+                    help="--autofill 时同时导出核对表 CSV（现有/框内候选/建议）")
+    ap.add_argument("--hold", type=float, default=20.0, help="--memtest 挂多久（秒）")
+    ap.add_argument("--out", default=None, help="自检时的输出文件")
+    a = ap.parse_args()
+    if a.autofill:
+        src = a.json or DEFAULT_JSON
+        pdf = a.pdf or str(load_settings().get("pdf") or "")
+        xl = a.xlsx or str(load_settings().get("xlsx") or "")
+        if not (src and os.path.exists(src) and pdf and os.path.exists(pdf)
+                and xl and os.path.exists(xl)):
+            print("--autofill 需要：JSON 路径 + --pdf + --xlsx（都要存在）")
+            return 2
+        return autofill_run(src, pdf, xl, a.out, a.page, a.force, a.csv)
+    if a.selftest:
+        src = a.json or DEFAULT_JSON
+        if not os.path.exists(src):
+            print("找不到文件：%s" % src)
+            return 2
+        return selftest(src, a.out)
+    if a.smoke:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        return run_gui(a.json or DEFAULT_JSON, smoke=True)
+    if a.memtest:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        return run_gui(a.json or DEFAULT_JSON, memtest=a.hold)
+    if a.roundtrip:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        return run_gui(a.json or DEFAULT_JSON, roundtrip=True)
+    if a.json and not os.path.exists(a.json):
+        print("找不到文件：%s" % a.json)
+        return 2
+    src = a.json
+    if not src:
+        # 双击 exe：先接着打开上次那份，其次看作者本机那份，都没有就弹选择框
+        src = last_json() or (DEFAULT_JSON if os.path.exists(DEFAULT_JSON) else None)
+        if src:
+            print("打开上次的识别结果：%s" % src)
+    return run_gui(src)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

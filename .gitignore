@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.exe
+*.zip
+*.spec
+build/
+build_exe/
+dist/
+render_cache/
+annotator_settings.json
+*.log
