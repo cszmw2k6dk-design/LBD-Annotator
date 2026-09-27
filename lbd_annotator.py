@@ -294,13 +294,19 @@ def qimage_to_gray(qimg):
 #   2) 同编号：两个模型框的文字编号一样 -> 留置信度高的
 #   3) 高重叠：两个模型框同类别重叠 >= DUP_IOU -> 留面积小的（通常更贴）
 #   4) 形状离谱：Tracker 应当又细又高，宽/高 > TRACKER_AR 的直接删
-# 为什么是 0.5 而不是 0.9：同一个物体被两次识别画出来，重叠本来就到不了 0.9。
-# 实测（1920 vs 1600 两次推理）：72.5% 落在 0.9~1.0，24.9% 落在 0.8~0.9，
-# 2.5% 更低 —— 门槛设 0.9 会漏掉近三成重复框（用户反馈的"一个位置两个标注"）。
-# 反过来，误伤风险有数据兜底：标注里同类别互相重叠 >0.5 的只有 34 对 / 62693 个框（0.05%）。
-KEEP_MANUAL_IOU = 0.5
-DUP_IOU = 0.5
+# 门槛为什么取 0.3：先看两条实测
+#   1) 同一个物体被两次识别画出来，重叠分布很散：0.9~1.0 占 72.5%，0.8~0.9 占
+#      24.9% —— 门槛设 0.9 会漏掉近三成重复框（"一个位置两个标注"）。
+#   2) 现有 76752 个标注框里，同类框互相重叠的分布是：IoU<0.2 有 1287 对（相邻的），
+#      IoU 0.2~0.7 **一对都没有**，IoU>0.7 有 47 对（真重复）。
+# 也就是说 0.2~0.7 这一段是空的，门槛取 0.3 既抓得到"重叠一半面积"的重复框
+# （那种 IoU 其实只有 0.33），又不会碰到任何正常相邻的框。
+KEEP_MANUAL_IOU = 0.3
+DUP_IOU = 0.3
 TRACKER_AR = 0.1
+# 同类别的两个框，如果一个有 90% 以上落在另一个里面，也算重复（"套着"的那种）。
+# 依据：现有 76752 个标注框里，同类嵌套的对数是 0 —— 所以这条不会误伤。
+CONTAIN_RATIO = 0.9
 
 
 def _bbox_iou(a, b):
@@ -316,6 +322,19 @@ def _bbox_iou(a, b):
 
 def _bbox_area(b):
     return max(0.0, abs(b[2] - b[0])) * max(0.0, abs(b[3] - b[1]))
+
+
+def _is_duplicate_pair(a, b):
+    """两个同类框算不算"画重了"：重叠够大，或者一个几乎完全套在另一个里面。"""
+    if _bbox_iou(a, b) >= DUP_IOU:
+        return True
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if inter <= 0:
+        return False
+    smaller = min(_bbox_area(a), _bbox_area(b))
+    return smaller > 0 and inter / smaller >= CONTAIN_RATIO
 
 
 def _is_model_shape(s):
@@ -347,14 +366,23 @@ def _has_read_name(s):
     return bool((s.get("name") or "").strip()) and not s.get("_auto")
 
 
-def clean_shapes(shapes, keep_manual=True, use_number=True, use_shape=True):
-    """清理多余的框。返回 (保留的框列表, 统计)。只删模型框。"""
+def clean_shapes(shapes, keep_manual=True, use_number=True, use_shape=True,
+                 clean_manual=False):
+    """清理多余的框。返回 (保留的框列表, 统计)。
+
+    默认只删模型画的框（人工框不动）。clean_manual=True 时多做一遍：
+    同类别的**人工框**之间如果互相重叠 >= DUP_IOU，也只留一个
+    （优先留框里真读到过编号的，其次留置信度高的，最后留大的）。
+    """
     stats = {"total": len(shapes), "manual": 0, "kept_manual": 0, "by_manual": 0,
-             "by_number": 0, "by_overlap": 0, "by_shape": 0, "removed": 0, "kept": 0}
+             "by_number": 0, "by_overlap": 0, "by_shape": 0, "manual_dup": 0,
+             "removed": 0, "kept": 0}
     manual = [s for s in shapes if not _is_model_shape(s)]
     models = [s for s in shapes if _is_model_shape(s)]
     stats["manual"] = len(manual)
-    if not models:
+    # 注意：这里不能在 clean_manual=True 时提前返回 —— 否则"整页都是手工框"
+    # 的情况（没跑过识别、只想清理旧标注）就永远走不到第 5 步。
+    if not models and not clean_manual:
         stats["kept"] = len(shapes)
         return list(shapes), stats
 
@@ -413,7 +441,7 @@ def clean_shapes(shapes, keep_manual=True, use_number=True, use_shape=True):
             b = alive[j]
             if id(b) in dropped or a.get("label") != b.get("label"):
                 continue
-            if _bbox_iou(a["bbox"], b["bbox"]) >= DUP_IOU:
+            if _is_duplicate_pair(a["bbox"], b["bbox"]):
                 # 留置信度高的（同一物体两次识别，置信度高的那次通常更靠谱），
                 # 置信度一样再留面积小的（一般更贴）。
                 key_a = (float(a.get("confidence") or 0.0), -_bbox_area(a["bbox"]))
@@ -424,6 +452,32 @@ def clean_shapes(shapes, keep_manual=True, use_number=True, use_shape=True):
                 else:
                     dropped.add(id(a))
                     stats["by_overlap"] += 1
+                    break
+
+    # 5) 人工框之间的重复（默认不做，要调用方明确要求）
+    if clean_manual:
+        rest = [s for s in shapes if id(s) not in dropped and s.get("bbox")]
+        for i in range(len(rest)):
+            a = rest[i]
+            if id(a) in dropped:
+                continue
+            for j in range(i + 1, len(rest)):
+                b = rest[j]
+                if id(b) in dropped or a.get("label") != b.get("label"):
+                    continue
+                if not _is_duplicate_pair(a["bbox"], b["bbox"]):
+                    continue
+                # 留哪个：框里真读到过编号 > 置信度高 > 面积大
+                key_a = (bool(_has_read_name(a)), float(a.get("confidence") or 0.0),
+                         _bbox_area(a["bbox"]))
+                key_b = (bool(_has_read_name(b)), float(b.get("confidence") or 0.0),
+                         _bbox_area(b["bbox"]))
+                if key_a >= key_b:
+                    dropped.add(id(b))
+                    stats["manual_dup"] += 1
+                else:
+                    dropped.add(id(a))
+                    stats["manual_dup"] += 1
                     break
 
     out = [s for s in shapes if id(s) not in dropped]
@@ -2802,8 +2856,18 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             """清掉多余的框（只删模型画的，人工框不动）。"""
             if not self.pm:
                 return None
+            ans = QMessageBox.question(
+                self, "清理多余框",
+                "手工框之间的重复要不要一起清？\n\n"
+                "· 是 —— 同类别的框互相重叠 50% 以上就只留一个\n"
+                "        （优先留框里真读到过 LBD 编号的，其次置信度高的）\n"
+                "· 否 —— 只清模型画的框，手工框一律不动\n\n"
+                "两个选项都能用 Ctrl+Z 撤销。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            clean_manual = (ans == QMessageBox.StandardButton.Yes)
             self.begin_change()
-            kept, st = clean_shapes(self.pm.shapes)
+            kept, st = clean_shapes(self.pm.shapes, clean_manual=clean_manual)
             if st["removed"]:
                 self.pm.shapes = kept
                 self._rebuild_items()
@@ -2816,12 +2880,16 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     "删掉 %d 个多余框：\n"
                     "  已经有手工框了 %d 个\n"
                     "  同一个编号重复 %d 个\n"
-                    "  互相重叠 ≥90%% %d 个\n"
+                    "  模型框互相重叠 %d 个\n"
+                    "  手工框互相重叠 %d 个%s\n"
                     "  形状离谱（Tracker 又宽又扁）%d 个\n\n"
-                    "现有 %d 个框（其中手工框 %d 个，一个都没动）。\n"
+                    "现有 %d 个框（其中手工框 %d 个）%s。\n"
                     "可用 Ctrl+Z 撤销。"
                     % (st["removed"], st["by_manual"], st["by_number"],
-                       st["by_overlap"], st["by_shape"], st["kept"], st["kept_manual"]))
+                       st["by_overlap"], st["manual_dup"],
+                       "" if clean_manual else "（这次没清手工框）",
+                       st["by_shape"], st["kept"], st["kept_manual"],
+                       "，手工框一个没动" if not clean_manual else ""))
             return st
 
         def on_delete(self):
@@ -3535,11 +3603,22 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                                       or PageModel(self.dbg, pg))
                 try:
                     from PySide6.QtGui import QImage as _QI
-                    iw = _QI(img_path).width() or pm.width
+                    _q = _QI(img_path)
+                    iw, ih = _q.width(), _q.height()
                 except Exception:
-                    iw = pm.width
-                sx = float(pm.width) / float(iw or pm.width)
-                sy = sx
+                    iw, ih = pm.width, pm.height
+                iw = iw or pm.width
+                ih = ih or pm.height
+                sx = float(pm.width) / float(iw)
+                # 纵向必须单独算：以前图省事让 sy = sx，只要渲染图和页面的宽高比
+                # 差一点点（换渲染器、吃了 CropBox、DPI 取整），纵向就会累积成
+                # "整体往下/往上偏"，越靠下越明显。宽高比一致时两者本来就相等。
+                sy = float(pm.height) / float(ih)
+                if abs(sx - sy) > 0.002:
+                    em.msg.emit("    ⚠ 底图和页面比例不一致：宽 ×%.4f / 高 ×%.4f"
+                                "（底图 %d×%d，页面 %d×%d）—— 框会纵向偏移，"
+                                "多半是渲染器和做标注时用的不是同一个"
+                                % (sx, sy, iw, ih, pm.width, pm.height))
                 if not boxes:
                     em.msg.emit("第 %s 页：没检出框" % pg)
                     return

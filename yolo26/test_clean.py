@@ -83,6 +83,16 @@ def main() -> int:
         mk("Node", (2, 2, 102, 302), source="manual"),
     ], 2)
 
+    # 7b) 明确要求清手工框时 -> 同类重叠的只留一个，且优先留有编号的
+    kept, st = ann.clean_shapes([
+        mk("Node", (0, 0, 100, 300), source="manual", name=""),
+        mk("Node", (2, 2, 102, 302), source="manual", name="INV1-LBD-07"),
+    ], clean_manual=True)
+    good = len(kept) == 1 and kept[0].get("name") == "INV1-LBD-07"
+    print(f"[{'OK ' if good else 'FAIL'}] 清手工框重复(留编号那个): 剩 {len(kept)} "
+          f"保留={kept[0].get('name')!r}  手工重复计数={st['manual_dup']}")
+    ok &= good
+
     # 8) 模型框和一个"没名字"的手工框重叠 -> 模型框删
     ok &= run("对齐无编号人工框", [
         mk("Tracker", (0, 0, 8, 300), source="manual"),
