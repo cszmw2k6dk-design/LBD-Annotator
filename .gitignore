@@ -9,3 +9,27 @@ dist/
 render_cache/
 annotator_settings.json
 *.log
+
+# yolo26 训练工程：数据集/虚拟环境/权重/日志都很大，别提交进仓库
+yolo26/.venv/
+yolo26/dataset/
+yolo26/runs/
+yolo26/models/
+yolo26/preview/
+yolo26/mplcfg/
+yolo26/Ultralytics/
+yolo26/ultralytics_cfg/
+yolo26/*.pt
+yolo26/*.part
+
+# 客户图纸/标注数据：绝不入库（补标建议里是原图 + 标注，2.3 GB）
+yolo26/补标建议/
+yolo26/补标结果/
+
+# 备份目录和打包临时目录（含 exe、poppler 等二进制）
+backup/
+build_tmp/
+
+# 系统生成的缩略图缓存
+Thumbs.db
+desktop.ini

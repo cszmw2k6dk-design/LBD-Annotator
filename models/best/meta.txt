@@ -1,0 +1,4 @@
+imgsz=2560
+classes=Node,Tracker
+run=yolo26n_2560_ft25
+exported=2026-09-27 20:47

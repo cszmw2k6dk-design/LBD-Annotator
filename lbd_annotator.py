@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -132,6 +133,324 @@ def find_poppler(exe):
         if os.path.exists(cand):
             return cand
     return shutil.which(exe) or ""
+
+
+# ------------------------------------------------------- AI 识别的输入图
+# 喂 YOLO 之前先把渲染图平滑缩到这个尺寸（长边）。别直接喂原始大图：
+# ultralytics 内部是用 cv2 的一步线性插值缩到 imgsz 的（INTER_LINEAR，只采 2x2 邻域），
+# 9000x6000 缩到 1920 是 4.7 倍，Tracker 那种只有 20 多像素宽的细线会被"跳过"，
+# 实测 Tracker 召回从 0.68 掉到 0.44、整体 F1 从 0.835 掉到 0.655。
+# 训练集就是按 2560 预处理的，喂同样尺寸，工具里的精度才和验证指标对得上。
+MODEL_INPUT_SIDE = 2560
+
+
+# ------------------------------------------------------- 边缘吸附
+# 模型给的是"大概位置"，框的边常常差半个到一两个像素。CAD 图是纯线条、
+# 元素的边界都是实打实的墨线，所以可以在预测边的附近找那条最黑的线，
+# 把边吸过去；再对峰值做加权重心，拿到亚像素位置。
+# 阈值 need_contrast 用来兜底：附近没有明显墨线（空洞、误检）就原样不动。
+#
+# ⚠ 暂未接入识别流程。实测（40 张高清验证图）：Tracker 的标注本来就已经贴在
+#   图纸边界上（中位差 0.1 px），吸了没收益；Node 的标注没按几何边界画
+#   （中位差 1.3 px，只有 15.7% 在 1 px 内），吸过去反而把框拽偏
+#   （平均 IoU 0.937→0.814）。留着是准备做"标注规范化"用的，别直接接到推理后。
+SNAP_RATIO = 0.25          # 搜索半径 = 框宽/高的这个比例
+SNAP_MIN_R = 2.0           # 但至少 ±2 像素
+SNAP_MAX_R = 30.0          # 最多 ±30 像素（别吸到隔壁去）
+SNAP_MIN_CONTRAST = 8.0    # 峰值要比窗口背景黑这么多才算一条线
+
+
+def _snap_edge(prof, pos, radius, need_contrast=SNAP_MIN_CONTRAST):
+    """把 pos 吸到 prof 上附近最黑的那条线，返回亚像素位置；找不到就原样返回。"""
+    import numpy as np
+    n = prof.shape[0]
+    lo = max(0, int(np.floor(pos - radius)))
+    hi = min(n - 1, int(np.ceil(pos + radius)))
+    if hi - lo < 2:
+        return float(pos)
+    seg = prof[lo:hi + 1].astype(np.float32)
+    i = int(np.argmax(seg))
+    peak = float(seg[i])
+    base = float(np.percentile(seg, 50))
+    if peak - base < need_contrast:
+        return float(pos)
+    a, b = max(0, i - 1), min(len(seg) - 1, i + 1)
+    wgt = np.clip(seg[a:b + 1] - base, 0, None)
+    if wgt.sum() <= 0:
+        return float(pos)
+    idx = np.arange(a, b + 1)
+    return float(lo + (wgt * idx).sum() / wgt.sum())
+
+
+def _snap_edge_step(prof, pos, radius, need=6.0, w=3):
+    """在 prof 上找最明显的"亮度台阶"（一侧亮、一侧暗）——填充块的边界是台阶，不是黑线。"""
+    import numpy as np
+    n = prof.shape[0]
+    lo = max(0, int(np.floor(pos - radius)))
+    hi = min(n - 1, int(np.ceil(pos + radius)))
+    if hi - lo < 2 * w + 1:
+        return float(pos)
+    p = prof.astype(np.float32)
+    vals = []
+    for i in range(lo, hi + 1):
+        a = p[max(0, i - w):i]
+        b = p[i:i + w]
+        if a.size == 0 or b.size == 0:
+            vals.append(0.0)
+            continue
+        vals.append(abs(float(b.mean()) - float(a.mean())))
+    vals = np.asarray(vals, dtype=np.float32)
+    j = int(np.argmax(vals))
+    if float(vals[j]) < need:
+        return float(pos)
+    a, b = max(0, j - 1), min(len(vals) - 1, j + 1)
+    wgt = np.clip(vals[a:b + 1], 0, None)
+    if wgt.sum() <= 0:
+        return float(pos)
+    k = np.arange(a, b + 1)
+    return float(lo + (wgt * k).sum() / wgt.sum())
+
+
+def _snap_edge_grad(prof, pos, radius, need=4.0):
+    """用一阶差分找最强边界（对细线和台阶都敏感）。"""
+    import numpy as np
+    n = prof.shape[0]
+    lo = max(1, int(np.floor(pos - radius)))
+    hi = min(n - 1, int(np.ceil(pos + radius)))
+    if hi - lo < 2:
+        return float(pos)
+    p = prof.astype(np.float32)
+    g = np.abs(np.diff(p[lo - 1:hi + 1]))
+    j = int(np.argmax(g))
+    if float(g[j]) < need:
+        return float(pos)
+    a, b = max(0, j - 1), min(len(g) - 1, j + 1)
+    wgt = np.clip(g[a:b + 1], 0, None)
+    if wgt.sum() <= 0:
+        return float(pos)
+    k = np.arange(a, b + 1)
+    return float(lo - 1 + (wgt * k).sum() / wgt.sum() + 0.5)
+
+
+def snap_boxes_to_ink(gray, boxes, mode="step"):
+    """把每个框的四条边吸到图纸墨线上。
+
+    gray: (H, W) uint8 灰度图（越暗越像线），坐标系要和 boxes 一致
+    boxes: [(类, x1, y1, x2, y2), ...]
+    返回同样格式的新列表；吸附后不合法（宽或高 <=1）的就保持原样。
+    """
+    import numpy as np
+    if gray is None or getattr(gray, "size", 0) == 0 or not boxes:
+        return boxes
+    edge_fn = {"peak": _snap_edge, "step": _snap_edge_step, "grad": _snap_edge_grad}[mode]
+    H, W = int(gray.shape[0]), int(gray.shape[1])
+    if H < 4 or W < 4:
+        return boxes
+    dark = 255.0 - np.asarray(gray, dtype=np.float32)
+    out = []
+    for item in boxes:
+        cls, x1, y1, x2, y2 = item[0], *[float(v) for v in item[1:5]]
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
+        rx = min(max(SNAP_MIN_R, SNAP_RATIO * w), SNAP_MAX_R)
+        ry = min(max(SNAP_MIN_R, SNAP_RATIO * h), SNAP_MAX_R)
+        ya = int(max(0, min(H - 1, y1)))
+        yb = int(max(ya + 1, min(H, y2)))
+        xa = int(max(0, min(W - 1, x1)))
+        xb = int(max(xa + 1, min(W, x2)))
+        colprof = dark[ya:yb, :].mean(axis=0)     # 每列有多黑
+        rowprof = dark[:, xa:xb].mean(axis=1)     # 每行有多黑
+        nx1 = edge_fn(colprof, x1, rx)
+        nx2 = edge_fn(colprof, x2, rx)
+        ny1 = edge_fn(rowprof, y1, ry)
+        ny2 = edge_fn(rowprof, y2, ry)
+        if nx2 - nx1 >= 1.0 and ny2 - ny1 >= 1.0:
+            out.append((cls, nx1, ny1, nx2, ny2, *item[5:]))
+        else:
+            out.append(tuple(item))
+    return out
+
+
+def qimage_to_gray(qimg):
+    """QImage -> (H, W) uint8 灰度数组（给 snap_boxes_to_ink 用）。"""
+    import numpy as np
+    from PySide6.QtGui import QImage
+    if qimg.isNull():
+        return None
+    if qimg.format() != QImage.Format.Format_Grayscale8:
+        qimg = qimg.convertToFormat(QImage.Format.Format_Grayscale8)
+    w, h = qimg.width(), qimg.height()
+    bpl = qimg.bytesPerLine()
+    buf = np.frombuffer(qimg.constBits(), dtype=np.uint8)
+    if buf.size < bpl * h:
+        return None
+    return np.ascontiguousarray(buf[:bpl * h].reshape(h, bpl)[:, :w])
+
+
+# ------------------------------------------------------- 清理多余/重复框
+# 只删"模型画的框"（source == "model"），人工框默认一律不动。
+# 四层判据，前面命中就不再往下判：
+#   1) 人工优先：和人工框同类别重叠 >= KEEP_MANUAL_IOU 的模型框 -> 删
+#   2) 同编号：两个模型框的文字编号一样 -> 留置信度高的
+#   3) 高重叠：两个模型框同类别重叠 >= DUP_IOU -> 留面积小的（通常更贴）
+#   4) 形状离谱：Tracker 应当又细又高，宽/高 > TRACKER_AR 的直接删
+# 为什么是 0.5 而不是 0.9：同一个物体被两次识别画出来，重叠本来就到不了 0.9。
+# 实测（1920 vs 1600 两次推理）：72.5% 落在 0.9~1.0，24.9% 落在 0.8~0.9，
+# 2.5% 更低 —— 门槛设 0.9 会漏掉近三成重复框（用户反馈的"一个位置两个标注"）。
+# 反过来，误伤风险有数据兜底：标注里同类别互相重叠 >0.5 的只有 34 对 / 62693 个框（0.05%）。
+KEEP_MANUAL_IOU = 0.5
+DUP_IOU = 0.5
+TRACKER_AR = 0.1
+
+
+def _bbox_iou(a, b):
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, x2 - x1), max(0.0, y2 - y1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    ua = ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+    return inter / ua if ua > 0 else 0.0
+
+
+def _bbox_area(b):
+    return max(0.0, abs(b[2] - b[0])) * max(0.0, abs(b[3] - b[1]))
+
+
+def _is_model_shape(s):
+    return (s.get("source") or "") == "model"
+
+
+def model_meta(model_path):
+    """读模型旁边的 meta.txt（导出模型时写的）：imgsz / classes / 来源。
+
+    有了它，"模型是 2560 训的、工具里 imgsz 还写着 1920"这种错就不会再犯。
+    """
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(str(model_path))), "meta.txt")
+        if not os.path.exists(p):
+            return {}
+        out = {}
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k.strip():
+                    out[k.strip().lower()] = v.strip()
+        return out
+    except Exception:
+        return {}
+
+
+def _has_read_name(s):
+    """框里真的读到过编号文字（排除"按标签表位置补的号"——那个是猜的）。"""
+    return bool((s.get("name") or "").strip()) and not s.get("_auto")
+
+
+def clean_shapes(shapes, keep_manual=True, use_number=True, use_shape=True):
+    """清理多余的框。返回 (保留的框列表, 统计)。只删模型框。"""
+    stats = {"total": len(shapes), "manual": 0, "kept_manual": 0, "by_manual": 0,
+             "by_number": 0, "by_overlap": 0, "by_shape": 0, "removed": 0, "kept": 0}
+    manual = [s for s in shapes if not _is_model_shape(s)]
+    models = [s for s in shapes if _is_model_shape(s)]
+    stats["manual"] = len(manual)
+    if not models:
+        stats["kept"] = len(shapes)
+        return list(shapes), stats
+
+    dropped = set()
+
+    # 1) 人工优先
+    if keep_manual:
+        for m in models:
+            mb = m.get("bbox")
+            if not mb:
+                continue
+            for h in manual:
+                hb = h.get("bbox")
+                if hb and h.get("label") == m.get("label") and _bbox_iou(mb, hb) >= KEEP_MANUAL_IOU:
+                    dropped.add(id(m))
+                    stats["by_manual"] += 1
+                    break
+
+    # 4) 形状离谱（先做，免得带进后面的配对）
+    if use_shape:
+        for m in models:
+            if id(m) in dropped or m.get("label") != "Tracker":
+                continue
+            b = m.get("bbox")
+            if not b:
+                continue
+            w, h = abs(b[2] - b[0]), abs(b[3] - b[1])
+            if h > 0 and w / h > TRACKER_AR:
+                dropped.add(id(m))
+                stats["by_shape"] += 1
+
+    # 2) 同编号
+    if use_number:
+        groups = {}
+        for m in models:
+            if id(m) in dropped or not _has_read_name(m):
+                continue
+            key = ((m.get("name") or "").strip().lower(), m.get("label"))
+            groups.setdefault(key, []).append(m)
+        for g in groups.values():
+            if len(g) < 2:
+                continue
+            g.sort(key=lambda s: (-float(s.get("confidence") or 0.0),
+                                  _bbox_area(s.get("bbox") or [0, 0, 0, 0])))
+            for extra in g[1:]:
+                dropped.add(id(extra))
+                stats["by_number"] += 1
+
+    # 3) 高重叠
+    alive = [m for m in models if id(m) not in dropped and m.get("bbox")]
+    for i in range(len(alive)):
+        a = alive[i]
+        if id(a) in dropped:
+            continue
+        for j in range(i + 1, len(alive)):
+            b = alive[j]
+            if id(b) in dropped or a.get("label") != b.get("label"):
+                continue
+            if _bbox_iou(a["bbox"], b["bbox"]) >= DUP_IOU:
+                # 留置信度高的（同一物体两次识别，置信度高的那次通常更靠谱），
+                # 置信度一样再留面积小的（一般更贴）。
+                key_a = (float(a.get("confidence") or 0.0), -_bbox_area(a["bbox"]))
+                key_b = (float(b.get("confidence") or 0.0), -_bbox_area(b["bbox"]))
+                if key_a >= key_b:
+                    dropped.add(id(b))
+                    stats["by_overlap"] += 1
+                else:
+                    dropped.add(id(a))
+                    stats["by_overlap"] += 1
+                    break
+
+    out = [s for s in shapes if id(s) not in dropped]
+    stats["removed"] = len(shapes) - len(out)
+    stats["kept"] = len(out)
+    stats["kept_manual"] = len(manual)
+    return out, stats
+
+
+def model_input_image(path, max_side=MODEL_INPUT_SIDE):
+    """把渲染图按训练时的做法平滑缩到 max_side 长边；本来就够小就原样返回。"""
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QImage
+        im = QImage(path)
+        if im.isNull():
+            return path
+        long_side = max(im.width(), im.height())
+        if long_side <= max_side:
+            return path
+        sc = float(max_side) / float(long_side)
+        small = im.scaled(max(1, round(im.width() * sc)), max(1, round(im.height() * sc)),
+                          Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        out = os.path.join(tempfile.gettempdir(), "lbd_predict_input.png")
+        return out if small.save(out, "PNG") else path
+    except Exception:
+        return path
 
 
 def pdf_page_sizes(pdf):
@@ -2002,6 +2321,12 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                          "结果写进 JSON 的 raw.strings")
             a.triggered.connect(self.on_rack_grade)
             tb2.addAction(a)
+            a = QAction("清理多余框", self)
+            a.setToolTip("删掉多余的框：已经有手工框的地方、同一个编号重复的、"
+                         "互相重叠 90% 以上的、形状离谱的 Tracker。\n"
+                         "只删模型画的框，手工框一个都不动；可用 Ctrl+Z 撤销")
+            a.triggered.connect(self.on_clean_shapes)
+            tb2.addAction(a)
             a = QAction("重载本页", self)
             a.setToolTip("把当前页恢复成上次打开/保存时的样子（画乱了的出口；可用 Ctrl+Z 撤销）")
             a.triggered.connect(self.on_reload_page)
@@ -2472,6 +2797,32 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.end_change()
             if label == "Node":
                 self.statusBar().showMessage("新加的 Node 请填 LBD 名字", 6000)
+
+        def on_clean_shapes(self, quiet=False):
+            """清掉多余的框（只删模型画的，人工框不动）。"""
+            if not self.pm:
+                return None
+            self.begin_change()
+            kept, st = clean_shapes(self.pm.shapes)
+            if st["removed"]:
+                self.pm.shapes = kept
+                self._rebuild_items()
+            self.end_change()
+            if st["removed"]:
+                self.statusBar().showMessage("清理多余框：删了 %d 个" % st["removed"], 8000)
+            if not quiet:
+                QMessageBox.information(
+                    self, "清理多余框",
+                    "删掉 %d 个多余框：\n"
+                    "  已经有手工框了 %d 个\n"
+                    "  同一个编号重复 %d 个\n"
+                    "  互相重叠 ≥90%% %d 个\n"
+                    "  形状离谱（Tracker 又宽又扁）%d 个\n\n"
+                    "现有 %d 个框（其中手工框 %d 个，一个都没动）。\n"
+                    "可用 Ctrl+Z 撤销。"
+                    % (st["removed"], st["by_manual"], st["by_number"],
+                       st["by_overlap"], st["by_shape"], st["kept"], st["kept_manual"]))
+            return st
 
         def on_delete(self):
             if not self.pm:
@@ -3061,7 +3412,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
 
         def _ai_detect_impl(self, whole=False):
             from PySide6.QtWidgets import (QDialog, QPlainTextEdit, QVBoxLayout, QHBoxLayout,
-                                           QPushButton, QLabel, QComboBox, QLineEdit)
+                                           QPushButton, QLabel, QComboBox, QLineEdit,
+                                           QCheckBox)
             from PySide6.QtCore import QObject as _QO, Signal as _SIG
             import subprocess
             import tempfile
@@ -3091,9 +3443,19 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             ed_c.setMaximumWidth(60)
             h2.addWidget(ed_c)
             h2.addWidget(QLabel("imgsz"))
-            ed_i = QLineEdit("1280")
+            ed_i = QLineEdit("2560")          # 和训练用的尺寸一致，别改小
             ed_i.setMaximumWidth(70)
             h2.addWidget(ed_i)
+            # 模型旁边有 meta.txt 就按它填，省得记错（选模型时还会再刷一次）
+            _m0 = model_meta(ed_m.text().strip())
+            if _m0.get("imgsz"):
+                ed_i.setText(_m0["imgsz"])
+                ed_i.setToolTip("这个值是从模型旁边的 meta.txt 读出来的，别乱改")
+            chk_clean = QCheckBox("识别后清理多余框")
+            chk_clean.setChecked(True)
+            chk_clean.setToolTip("删掉：已经有手工框的地方、同一个编号重复的、互相重叠 90% 以上的、"
+                                 "形状离谱的 Tracker。只删模型画的框，手工框不动。")
+            h2.addWidget(chk_clean)
             h2.addWidget(QLabel("范围"))
             cmb_scope = QComboBox()
             cmb_scope.addItems(["本页", "整册"])
@@ -3188,11 +3550,18 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                       "source": "model", "raw": {"conf": cf},
                                       "ocr_index": None,
                                       "bbox": [x1 * sx, y1 * sy, x2 * sx, y2 * sy]})
+                n_clean = 0
+                if chk_clean.isChecked():
+                    kept, st = clean_shapes(pm.shapes)
+                    n_clean = st["removed"]
+                    if n_clean:
+                        pm.shapes = kept
                 pm.dirty = True
                 self.edited[pg] = pm
                 if pg == self.page:
                     self._rebuild_items()
-                em.msg.emit("第 %s 页：加进来 %d 个框" % (pg, len(boxes)))
+                em.msg.emit("第 %s 页：加进来 %d 个框%s"
+                            % (pg, len(boxes), "，清理掉 %d 个多余的" % n_clean if n_clean else ""))
 
             em.res.connect(_apply)
 
@@ -3205,13 +3574,16 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     pages = sorted(self.dbg.page_numbers())
                 model = ed_m.text().strip()
                 conf = ed_c.text().strip() or "0.25"
-                imgsz = ed_i.text().strip() or "1280"
+                imgsz = ed_i.text().strip() or "1920"
                 em.msg.emit("开始：%d 页，模型 %s" % (len(pages), os.path.basename(model)))
                 for n, pg in enumerate(pages):
                     em.msg.emit("[%d/%d] 第 %s 页 …" % (n + 1, len(pages), pg))
                     try:
                         img = self.renderer.render(self.pdf, pg, dpi)
-                        pr = subprocess.run([pyp, script, model, img, conf, imgsz],
+                        # 先平滑缩到训练时的尺寸再喂模型：直接喂大图会让细线在
+                        # ultralytics 内部的 cv2 降采样里丢掉（见 model_input_image）
+                        img_in = model_input_image(img)
+                        pr = subprocess.run([pyp, script, model, img_in, conf, imgsz],
                                             capture_output=True, text=True, encoding="utf-8",
                                             errors="replace", timeout=3600,
                                             creationflags=_NO_WINDOW)
@@ -3221,7 +3593,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                 js = line[2:]
                         if not js:
                             em.msg.emit("    没拿到结果：" + ((pr.stderr or "").strip()[-300:]))
-                        em.res.emit(pg, img, js)
+                        em.res.emit(pg, img_in, js)
                     except Exception as e:
                         em.msg.emit("    第 %s 页出错：%s" % (pg, e))
                 em.msg.emit("识别结束")
@@ -3239,6 +3611,14 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                                     "模型 (*.pt *.onnx)")
                 if f:
                     ed_m.setText(f)
+                    _m = model_meta(f)
+                    if _m.get("imgsz"):
+                        ed_i.setText(_m["imgsz"])
+                        log.appendPlainText("按模型旁边的 meta.txt 把 imgsz 设成 %s"
+                                            % _m["imgsz"])
+                    else:
+                        log.appendPlainText("提示：这个模型旁边没有 meta.txt，"
+                                            "imgsz 要自己填对（和训练时一致）")
 
             b_m.clicked.connect(do_pick_model)
             b_run.clicked.connect(do_run)
