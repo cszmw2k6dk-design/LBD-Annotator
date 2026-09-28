@@ -43,7 +43,7 @@ SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
-ANNOTATOR_VERSION = "0.5"                       # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.6"                       # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -55,7 +55,83 @@ def _build_stamp():
 
 BUILD_STAMP = _build_stamp()
 RACK_LEN_TOL = 0.10                             # 支架长度差 ≤10% 算同一类
-UPDATE_REPO = "cszmw2k6dk-design/CAD-MAP"      # 在线更新读这个仓库的 Release
+UPDATE_REPO = "cszmw2k6dk-design/LBD-Annotator"   # 在线更新读这个仓库的 Release
+
+
+def parse_version(tag):
+    """'v0.6' / 'v0.5.1' -> (0, 6) / (0, 5, 1)；认不出来返回 ()。"""
+    nums = re.findall(r"\d+", str(tag or ""))
+    return tuple(int(n) for n in nums[:3]) if nums else ()
+
+
+def fetch_latest_release(repo, token="", timeout=20):
+    """查 GitHub 的 latest release，返回 (info, 错误文本)。不写任何文件。"""
+    import json as _json
+    import urllib.request
+    req = urllib.request.Request(
+        "https://api.github.com/repos/%s/releases/latest" % repo,
+        headers={"User-Agent": "LBD-Annotator/%s" % ANNOTATOR_VERSION,
+                 "Accept": "application/vnd.github+json"})
+    tok = (token or "").strip()
+    if tok:
+        req.add_header("Authorization", "Bearer %s" % tok)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return _json.loads(r.read().decode("utf-8")), ""
+    except Exception as e:                     # noqa: BLE001
+        return None, "%s" % e
+
+
+def windows_git_credential(host="github.com"):
+    """读本机 git 存在 Windows 凭据管理器里的 GitHub 凭据（当前用户，读不到就返回空串）。
+
+    仓库是私有的，匿名读 API 会被 GitHub 回 404；而能 clone 这个仓库的机器上，
+    git 早就存好凭据了，直接借用它，省得再让人去申请 token。
+    """
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class CREDENTIAL(ctypes.Structure):
+            _fields_ = [("Flags", wintypes.DWORD), ("Type", wintypes.DWORD),
+                        ("TargetName", wintypes.LPWSTR), ("Comment", wintypes.LPWSTR),
+                        ("LastWritten", wintypes.FILETIME),
+                        ("CredentialBlobSize", wintypes.DWORD),
+                        ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+                        ("Persist", wintypes.DWORD), ("AttributeCount", wintypes.DWORD),
+                        ("Attributes", ctypes.c_void_p),
+                        ("TargetAlias", wintypes.LPWSTR), ("UserName", wintypes.LPWSTR)]
+
+        adv = ctypes.windll.advapi32
+        ptr = ctypes.POINTER(CREDENTIAL)()
+        target = "git:https://%s" % host
+        if not adv.CredReadW(ctypes.c_wchar_p(target), 1, 0, ctypes.byref(ptr)):
+            return ""
+        try:
+            cred = ptr.contents
+            blob = ctypes.wstring_at(
+                ctypes.cast(cred.CredentialBlob, ctypes.c_wchar_p),
+                max(0, cred.CredentialBlobSize // 2))
+        finally:
+            adv.CredFree(ptr)
+        m = re.search(r"password=([^\s;]+)", blob)
+        return m.group(1) if m else blob.strip("\x00 \r\n\t")
+    except Exception:                          # noqa: BLE001
+        return ""
+
+
+def update_token(settings=None):
+    """在线更新用的 GitHub token：设置里 > 环境变量 > 本机 git 凭据。"""
+    tok = ""
+    if settings:
+        tok = str(settings.get("update_token") or "").strip()
+    if not tok:
+        tok = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    if not tok:
+        tok = windows_git_credential()
+    return tok
 
 
 def find_pythons():
@@ -4314,47 +4390,216 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             dlg.exec()
 
         def on_check_update(self):
-            """检查标注工具自己的更新（读 Release 里的附件，不自动替换）。"""
-            # 联网行为会被杀软当木马（未签名 + 打包 + 联网是最敏感的三种特征），
-            # 所以这里只给手动下载的提示，不再自己去连 GitHub。
-            QMessageBox.information(
-                self, "在线更新",
-                "内置的联网检查更新已关闭（避免被杀软误报）。\n\n"
-                "更新方式：打开仓库的 Release 页面，下载名字里带 LBD 的那个包，"
-                "覆盖旧的 exe 即可。")
-            return
-            import json as _json
-            import urllib.request
+            """联网查 Release：有新版本就给下载/打开网页的入口。
+
+            只读 GitHub 的公开 API，不写任何文件（下载是你点了才做）。
+            """
             repo = str(self.settings.get("update_repo") or UPDATE_REPO)
-            tok = str(self.settings.get("update_token") or "").strip()
-            req = urllib.request.Request(
-                "https://api.github.com/repos/%s/releases/latest" % repo,
-                headers={"User-Agent": "LBD-Annotator/%s" % ANNOTATOR_VERSION})
-            if tok:
-                req.add_header("Authorization", "token %s" % tok)
-            try:
-                with urllib.request.urlopen(req, timeout=20) as r:
-                    info = _json.loads(r.read().decode("utf-8"))
-            except Exception as e:
+            tok = update_token(self.settings)
+            self.statusBar().showMessage("正在检查更新（%s）…" % repo, 0)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+            from PySide6.QtCore import QObject as _QO2, Signal as _SIG2
+
+            class _Sig(_QO2):
+                done = _SIG2(object)
+
+            sig = _Sig()
+
+            def worker():
+                sig.done.emit(fetch_latest_release(repo, tok))
+
+            def back(res):
+                QApplication.restoreOverrideCursor()
+                self.statusBar().showMessage("", 0)
+                info, err = res if isinstance(res, tuple) else (None, "未知错误")
+                self._show_update_result(info, err, repo)
+
+            sig.done.connect(back)
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _show_update_result(self, info, err, repo):
+            page = "https://github.com/%s/releases/latest" % repo
+            if err or not info:
                 QMessageBox.warning(
                     self, "检查更新失败",
-                    "拉不到 Release：%s\n\n如果仓库是私有的，要么把它设成公开，"
-                    "要么在 annotator_settings.json 里加 update_token（只读 token）。" % e)
+                    "连不上 GitHub，或者这个私有仓库不认当前凭据：\n%s\n\n"
+                    "· 能正常 clone 这个仓库的机器上，会直接用本机 git 存好的凭据，"
+                    "一般不用管；\n"
+                    "· 也可以在本工具的 annotator_settings.json 里加 "
+                    "\"update_token\"（只读 token）；\n"
+                    "· 或者手动打开 Release 页下载，覆盖旧的 exe：\n%s\n\n"
+                    "如果是公司网络挡了 github.com，换手机热点试一下也行。" % (err, page))
                 return
+            tag = (info.get("tag_name") or "").strip()
+            cur, new = parse_version(ANNOTATOR_VERSION), parse_version(tag)
             assets = info.get("assets") or []
-            mine = [a for a in assets if "LBD" in (a.get("name") or "").upper()]
-            txt = ["当前版本：%s   远端最新：%s（%s）"
-                   % (ANNOTATOR_VERSION, info.get("tag_name") or "?",
-                      info.get("published_at") or "")]
-            for a in assets:
-                txt.append("· %s  %.1f MB" % (a.get("name"), (a.get("size") or 0) / 1048576.0))
-            if mine:
-                txt.append("\n标注工具的包：%s\n下载地址：%s"
-                           % (mine[0].get("name"), mine[0].get("browser_download_url")))
-                txt.append("（自动替换要另配一个替换用的启动器，先给你下载地址）")
-            else:
-                txt.append("\n远端没有名字带 LBD 的附件 —— 把 LBD标注工具.exe 传到 Release 才能在线更新。")
-            QMessageBox.information(self, "检查更新", "\n".join(txt))
+            exe = [a for a in assets if (a.get("name") or "").lower().endswith(".exe")]
+            if not exe:
+                exe = [a for a in assets if "lbd" in (a.get("name") or "").lower()]
+            date = (info.get("published_at") or "")[:10]
+            if new and cur and new > cur:
+                lines = ["当前版本：v%s      最新版本：%s（%s）" % (ANNOTATOR_VERSION, tag, date)]
+                if exe:
+                    lines.append("安装包：%s（%.1f MB）"
+                                 % (exe[0].get("name"),
+                                    (exe[0].get("size") or 0) / 1048576.0))
+                note = (info.get("body") or "").strip()
+                if note:
+                    lines.append("")
+                    lines.append(note[:900] + ("…" if len(note) > 900 else ""))
+                box = QMessageBox(self)
+                box.setWindowTitle("发现新版本 %s" % tag)
+                box.setIcon(QMessageBox.Icon.Information)
+                head = ("发现新版本：%s（%s）\n当前版本：v%s\n"
+                        % (tag, date, ANNOTATOR_VERSION))
+                if exe:
+                    head += "安装包：%s（%.1f MB）\n" % (
+                        exe[0].get("name"), (exe[0].get("size") or 0) / 1048576.0)
+                head += "\n点「下载到程序目录」会存一份新 exe 到程序旁边（不自动覆盖）；\n" \
+                        "点「打开下载页」就是浏览器里手动下。"
+                box.setText(head)
+                note = (info.get("body") or "").strip()
+                if note:
+                    box.setDetailedText(note)
+                b_dl = box.addButton("下载到程序目录", QMessageBox.ButtonRole.AcceptRole)
+                b_web = box.addButton("打开下载页", QMessageBox.ButtonRole.ActionRole)
+                box.addButton("以后再说", QMessageBox.ButtonRole.RejectRole)
+                box.exec()
+                hit = box.clickedButton()
+                if hit is b_web or (hit is None and not exe):
+                    self._open_url(page)
+                elif hit is b_dl:
+                    self._download_update(exe[0] if exe else None, tag, page)
+                return
+            if new and cur and new < cur:
+                QMessageBox.information(
+                    self, "检查更新",
+                    "当前 v%s 比 Release 里最新的 %s 还新（本地开发版）。" % (ANNOTATOR_VERSION, tag))
+                return
+            QMessageBox.information(
+                self, "已是最新版本",
+                "当前 v%s 就是最新版本（远端 %s，%s）。" % (ANNOTATOR_VERSION, tag, date))
+
+        def _open_url(self, url):
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:                       # noqa: BLE001
+                QMessageBox.information(self, "下载地址", url)
+
+        def _download_update(self, asset, tag, page):
+            """把新版本 exe 下载到程序目录（不自动覆盖正在运行的自己）。"""
+            import urllib.request
+            import urllib.parse
+            from PySide6.QtWidgets import QProgressDialog
+
+            class StripAuthRedirect(urllib.request.HTTPRedirectHandler):
+                """跨域名跳转（GitHub → S3 签名地址）时摘掉 Authorization，否则下载被拒。"""
+
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    new = super().redirect_request(req, fp, code, msg, headers, newurl)
+                    try:
+                        if new is not None and (
+                                urllib.parse.urlsplit(newurl).netloc
+                                != urllib.parse.urlsplit(req.full_url).netloc):
+                            new.headers.pop("Authorization", None)
+                            new.unredirected_hdrs.pop("Authorization", None)
+                    except Exception:               # noqa: BLE001
+                        pass
+                    return new
+            url = (asset or {}).get("browser_download_url") or ""
+            if not url:
+                self._open_url(page)
+                return
+            total = int((asset or {}).get("size") or 0)
+            name = "LBD标注工具_%s.exe" % (tag or "new")
+            dest = os.path.join(app_dir(), name)
+            if not os.access(app_dir(), os.W_OK):
+                dest = os.path.join(os.path.expanduser("~"), "Downloads", name)
+            prog = QProgressDialog("正在下载 %s …" % name, "取消", 0, 100, self)
+            prog.setWindowTitle("下载更新")
+            prog.setMinimumDuration(0)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            cancel = threading.Event()
+            prog.canceled.connect(cancel.set)
+
+            from PySide6.QtCore import QObject as _QO3, Signal as _SIG3
+
+            class _Sig(_QO3):
+                step = _SIG3(int, int)      # 已下载, 总量
+                done = _SIG3(str, str)      # 保存路径, 错误
+
+            sig = _Sig()
+
+            def progress(got, all_bytes):
+                if all_bytes > 0:
+                    prog.setValue(min(100, int(got * 100 / all_bytes)))
+                else:
+                    prog.setLabelText("已下载 %.1f MB…" % (got / 1048576.0))
+
+            def finished(path, err):
+                prog.close()
+                if err:
+                    QMessageBox.warning(self, "下载失败", "%s\n\n也可以手动下载：\n%s" % (err, page))
+                    return
+                QMessageBox.information(
+                    self, "下载完成",
+                    "新版本已下载到：\n%s\n\n"
+                    "关掉本工具后，把它改名成 LBD标注工具.exe（覆盖旧的）就是新版本了。\n"
+                    "（正在运行的 exe 没法自己覆盖自己，所以留这一步手动操作）" % path)
+                try:
+                    subprocess.Popen('explorer /select,"%s"' % path)
+                except Exception:                   # noqa: BLE001
+                    pass
+
+            sig.step.connect(progress)
+            sig.done.connect(finished)
+
+            def worker():
+                tmp = dest + ".part"
+                got = 0
+                try:
+                    # 私有仓库的附件：走 assets API + Accept: octet-stream（带 token），
+                    # GitHub 会 302 到签名地址；公开仓库走普通下载地址也一样能用。
+                    tok = update_token(self.settings)
+                    api_url = (asset or {}).get("url") or ""
+                    ua = "LBD-Annotator/%s" % ANNOTATOR_VERSION
+                    if tok and api_url:
+                        req = urllib.request.Request(
+                            api_url, headers={"User-Agent": ua,
+                                              "Accept": "application/octet-stream",
+                                              "Authorization": "Bearer %s" % tok})
+                    else:
+                        req = urllib.request.Request(url, headers={"User-Agent": ua})
+                    opener = urllib.request.build_opener(StripAuthRedirect)
+                    with opener.open(req, timeout=30) as r:
+                        if not total:
+                            total_hint = int(r.headers.get("Content-Length") or 0)
+                        else:
+                            total_hint = total
+                        with open(tmp, "wb") as f:
+                            while True:
+                                if cancel.is_set():
+                                    raise RuntimeError("已取消")
+                                chunk = r.read(262144)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                                got += len(chunk)
+                                if got % 1048576 < 262144:
+                                    sig.step.emit(got, total_hint)
+                    os.replace(tmp, dest)
+                    sig.done.emit(dest, "")
+                except Exception as e:              # noqa: BLE001
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except Exception:               # noqa: BLE001
+                        pass
+                    sig.done.emit("", "%s" % e)
+
+            threading.Thread(target=worker, daemon=True).start()
 
         def on_rack_grade(self):
             """Tracker（支架）按长边长度分档：短的 2 串、长的 3 串（可改）→ 写进 raw.strings。
@@ -4857,6 +5102,15 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                  tot["pages"], n_after_undo,
                  "通过" if (n_after_clean < n_before_clean
                             and n_after_undo == n_before_clean) else "不一致！"))
+
+        # 在线更新：版本比较 + 仓库地址（不联网，纯逻辑）
+        ok_ver = (parse_version("v0.6") > parse_version("v0.5")
+                  and parse_version("v0.10") > parse_version("v0.9")
+                  and parse_version("v1.0") > parse_version("v0.10")
+                  and parse_version(ANNOTATOR_VERSION) == parse_version("v" + ANNOTATOR_VERSION))
+        ok_repo = UPDATE_REPO.endswith("/LBD-Annotator")
+        print("在线更新：版本比较 %s；检查的仓库 %s %s"
+              % (ok_ver, UPDATE_REPO, "通过" if ok_repo else "写错了！"))
         return 0
     return app.exec()
 
