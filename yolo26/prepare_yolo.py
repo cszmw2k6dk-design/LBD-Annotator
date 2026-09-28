@@ -306,9 +306,11 @@ def main() -> int:
         n_box += len(lines)
 
     (out / "classes.txt").write_text("\n".join(names) + "\n", encoding="utf-8")
+    # 注意：这里必须写绝对路径。ultralytics 会把相对的 path 解析成它自己的
+    # datasets_dir（默认 C:\Users\<用户>\Desktop\datasets），然后就报 images not found。
     (out / "data.yaml").write_text(
         "path: %s\ntrain: images/train\nval: images/val\nnames:\n%s\n" % (
-            out.as_posix(), "\n".join(f"  {i}: {n}" for i, n in enumerate(names))),
+            out.resolve().as_posix(), "\n".join(f"  {i}: {n}" for i, n in enumerate(names))),
         encoding="utf-8")
     print(f"[6/6] 完成: {out}  图片 {len(results)} 张，框 {n_box} 个")
     return 0
