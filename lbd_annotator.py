@@ -43,7 +43,7 @@ SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
-ANNOTATOR_VERSION = "0.11"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.12"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -2057,6 +2057,30 @@ def selftest(src, out=None):
     good = bool(r.get("ok")) and ok_name and ok_lbd and ok_str
     print("自检:", "通过" if good else "失败")
     return 0 if good else 1
+
+
+def _kmeans_cuts(values, k, iters=80):
+    """把一堆长度分成 k 档，返回 k-1 个切点（切在长度间隙大的地方）。
+
+    支架分档用：不能用"等分位"硬切 —— 那样长度几乎一样的支架，只要一个落在切线
+    左边、一个落在右边，就会被分到两类（用户看到的就是"明明一样长却分了两种"）。
+    这里做一维 k-means，切点落在两类中心之间，长度接近的必然是同一类。
+    """
+    vals = sorted(float(v) for v in values)
+    n = len(vals)
+    if k <= 1 or n <= k:
+        return []
+    cent = [vals[min(n - 1, int(n * (i + 0.5) / k))] for i in range(k)]
+    for _ in range(iters):
+        groups = [[] for _ in range(k)]
+        for v in vals:
+            groups[min(range(k), key=lambda i: abs(v - cent[i]))].append(v)
+        new = [sum(g) / len(g) if g else cent[i] for i, g in enumerate(groups)]
+        if new == cent:
+            break
+        cent = new
+    cent = sorted(cent)
+    return [(cent[i] + cent[i + 1]) / 2.0 for i in range(k - 1)]
 
 
 def _as_pages(entry):
@@ -4820,7 +4844,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             txt, ok = QInputDialog.getText(
                 self, "支架串数分档",
                 "整册 %d 个支架框，按「长度差 ≤%d%% 算同一类」分成 %d 类。\n"
-                "按「短 → 长」填每类的串数（逗号分开）："
+                "按「短 → 长」填每类的串数（逗号分开）。\n"
+                "档数跟上面的类数一致最准（长度差不多的支架保证在同一档）；\n"
+                "填的档数不一样时，会按长度重新聚成你填的档数，不会切在长度接近的地方："
                 % (len(racks), int(RACK_LEN_TOL * 100), k0),
                 text=",".join(str(2 + i) for i in range(k0)))
             if not ok or not txt.strip():
@@ -4834,10 +4860,24 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 means = [sum(g) / len(g) for g in groups]
                 cuts = [(means[i] + means[i + 1]) / 2.0 for i in range(k - 1)]
             else:
-                # 你填的档数和自动分出来的类数不一致 -> 退回等分位切
-                cuts = [longs[min(len(longs) - 1, int(len(longs) * i / k))]
-                        for i in range(1, k)]
+                # 你填的档数和"长度差 ≤10% 算一类"自动分出来的类数不一致。
+                # 绝不能退回等分位硬切 —— 那会把长度几乎一样的支架分到两类里
+                #（用户反馈"明明一样长却分成两种"就是这个）。先问清楚：
+                if QMessageBox.question(
+                        self, "档数对不上",
+                        "按「长度差 ≤%d%% 算同一类」自动分出来是 %d 类，"
+                        "你填了 %d 个串数。\n\n"
+                        "· 是 —— 按长度重新聚成 %d 档（切在长度间隙最大的地方，"
+                        "不会把长度接近的切开）\n"
+                        "· 否 —— 取消，什么都不改；推荐再点一次「支架按长度分档」，"
+                        "按默认的 %d 个串数填，那样分档严格等于长度聚类的结果"
+                        % (int(RACK_LEN_TOL * 100), k0, k, k, k0),
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                    return
+                cuts = _kmeans_cuts(longs, k)
             counts = {lv: 0 for lv in levels}
+            spans = {lv: [None, None] for lv in levels}
             self.begin_change()
             for pg, pm in pms.items():
                 hit = False
@@ -4855,6 +4895,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     s["raw"] = raw
                     s["name"] = "%d串" % lv
                     counts[lv] = counts.get(lv, 0) + 1
+                    sp = spans[lv]
+                    sp[0] = L if sp[0] is None else min(sp[0], L)
+                    sp[1] = L if sp[1] is None else max(sp[1], L)
                     hit = True
                 if hit:
                     pm.dirty = True
@@ -4865,11 +4908,18 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 it.update()
             QMessageBox.information(
                 self, "支架分档完成",
-                "整册 %d 个支架框（%d 页），按长度分成 %d 档：\n%s\n\n"
+                "整册 %d 个支架框（%d 页），按长度分成 %d 档"
+                "（自动按「长度差 ≤%d%% 算一类」分出来 %d 类%s）：\n%s\n\n"
                 "已写进 JSON（raw.strings），框上也标了串数。\n"
                 "（主程序要拿这个值来定类型，还需要我加 3 行读取代码）"
-                % (len(racks), len(pages), k,
-                   "\n".join("%d串：%d 个" % (lv, counts[lv]) for lv in levels)))
+                % (len(racks), len(pages), k, int(RACK_LEN_TOL * 100), k0,
+                   "" if k == k0 else "，你填的档数不一样，已按长度重新聚档",
+                   "\n".join(
+                       "%d串：%d 个%s" % (
+                           lv, counts[lv],
+                           "（长度 %.0f~%.0f）" % (spans[lv][0], spans[lv][1])
+                           if counts[lv] else "")
+                       for lv in levels)))
 
         def on_export_check(self):
             """导出核对表 CSV：每页每个 Node 框一行（现有名字 / 框内候选 / 建议）。"""
