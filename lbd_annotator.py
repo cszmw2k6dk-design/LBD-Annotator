@@ -43,7 +43,7 @@ SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
-ANNOTATOR_VERSION = "0.7"                       # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.8"                       # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -3239,34 +3239,62 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     return None
             return self.clean_pages([self.page], clean_manual, quiet=quiet)
 
+        def _progress(self, total, title, verb):
+            """建一个带取消按钮的进度框，返回 (prog, step 回调, 取消状态 dict)。
+
+            重要：不能在 prog.close() 之后读 wasCanceled() —— close() 自己就会把它置真，
+            那样每回都会被当成"用户取消"（v0.7 里整册清理扫完却什么都不删，就是这个坑）。
+            取消状态只在 setValue 之前、循环中间读。
+            """
+            from PySide6.QtWidgets import QProgressDialog
+            prog = QProgressDialog("%s…" % title, "取消", 0, total, self)
+            prog.setWindowTitle(title)
+            prog.setMinimumDuration(0)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            state = {"cancel": False}
+
+            def step(k, all_n, pg):
+                if prog.wasCanceled():
+                    state["cancel"] = True
+                    return False
+                prog.setValue(k)
+                prog.setLabelText("%s第 %d 页（%d/%d）…" % (verb, pg, k + 1, all_n))
+                QApplication.processEvents()
+                return not prog.wasCanceled()
+
+            return prog, step, state
+
+        def scan_clean_progress(self, pages):
+            """带进度条扫一遍整册，返回 (只清模型框的统计, 连手工框的统计, 是否被取消)。"""
+            prog, step, state = self._progress(len(pages), "清理多余框（整册）", "扫描")
+            try:
+                sa, sb = self.scan_clean(pages, on_step=step)
+            finally:
+                prog.close()
+            return sa, sb, state["cancel"]
+
+        def clean_pages_progress(self, pages, clean_manual):
+            """带进度条清整册，返回 (统计, 每页明细, 是否被取消)。"""
+            prog, step, state = self._progress(len(pages), "清理多余框（整册）", "清理")
+            try:
+                tot, lines = self.clean_pages(pages, clean_manual,
+                                              quiet=True, on_step=step)
+            finally:
+                prog.close()
+            return tot, lines, state["cancel"]
+
         def on_clean_shapes_all(self, quiet=False, clean_manual=None):
             """整册清理：先扫描汇报能删多少，确认后逐页清，最后给"保存/跳转"。
 
             clean_manual 给了就跳过所有弹窗（自检用），quiet=True 只跳过最后的结果框。
             """
-            from PySide6.QtWidgets import QProgressDialog
             if not (self.pm and self.dbg):
                 return None
             pages = self.dbg.page_numbers()
-            scan = {"removed": 0, "pages": 0, "first": None, "cur": 0, "locked": 0}
             if clean_manual is None:
-                prog = QProgressDialog("正在扫描整册多余框…", "取消", 0, len(pages), self)
-                prog.setWindowTitle("清理多余框（整册）")
-                prog.setMinimumDuration(0)
-                prog.setWindowModality(Qt.WindowModality.WindowModal)
-
-                def scan_step(k, total, pg):
-                    prog.setValue(k)
-                    prog.setLabelText("扫描第 %d 页（%d/%d）…" % (pg, k + 1, total))
-                    QApplication.processEvents()
-                    return not prog.wasCanceled()
-
-                try:
-                    sa, sb = self.scan_clean(pages, on_step=scan_step)
-                finally:
-                    prog.close()
-                if prog.wasCanceled():
-                    self.statusBar().showMessage("已取消扫描，什么都没改", 4000)
+                sa, sb, canceled = self.scan_clean_progress(pages)
+                if canceled:
+                    self.statusBar().showMessage("已取消扫描，什么都没改", 5000)
                     return None
                 if not sa["removed"] and not sb["removed"]:
                     QMessageBox.information(
@@ -3300,23 +3328,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     self.statusBar().showMessage("已取消，什么都没改", 4000)
                     return None
 
-            prog2 = QProgressDialog("正在清理整册多余框…", "取消", 0, len(pages), self)
-            prog2.setWindowTitle("清理多余框（整册）")
-            prog2.setMinimumDuration(0)
-            prog2.setWindowModality(Qt.WindowModality.WindowModal)
-
-            def step(k, total, pg):
-                prog2.setValue(k)
-                prog2.setLabelText("清理第 %d 页（%d/%d）…" % (pg, k + 1, total))
-                QApplication.processEvents()
-                return not prog2.wasCanceled()
-
-            try:
-                tot, lines = self.clean_pages(pages, clean_manual,
-                                              quiet=True, on_step=step)
-            finally:
-                prog2.close()
-            if prog2.wasCanceled():
+            tot, lines, canceled = self.clean_pages_progress(pages, clean_manual)
+            if canceled:
                 self.statusBar().showMessage("整册清理被取消（已清的部分还可以 Ctrl+Z 撤销）", 6000)
             if not quiet:
                 self._show_clean_result(tot, lines, clean_manual, len(pages))
@@ -5239,6 +5252,15 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             tot_one, _l1 = win.on_clean_shapes(quiet=True, clean_manual=False)
             ok_one = bool(tot_one) and "removed" in tot_one
             print("点按钮路径：清理多余框(本页) %s" % ("通过" if ok_one else "出错！"))
+            # 进度条那条路：没人点取消时，取消标记必须是 False
+            # （v0.7 就是因为 close() 之后再读 wasCanceled()，扫完被判成"已取消"，什么都不删）
+            sa2, sb2, c2 = win.scan_clean_progress(win.dbg.page_numbers())
+            print("进度条扫描：取消标记 %s（应为 False）；只清模型可删 %d / 连手工可删 %d  %s"
+                  % (c2, sa2["removed"], sb2["removed"],
+                     "通过" if not c2 else "又被当成取消了！"))
+            tot_p, _lp, c3 = win.clean_pages_progress(win.dbg.page_numbers(), False)
+            print("进度条清理：取消标记 %s（应为 False），删了 %d 个  %s"
+                  % (c3, tot_p["removed"], "通过" if not c3 else "又被当成取消了！"))
         except Exception as e:                       # noqa: BLE001
             print("点按钮路径：出错！%s: %s" % (type(e).__name__, e))
         return 0
