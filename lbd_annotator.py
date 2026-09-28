@@ -43,7 +43,7 @@ SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
-ANNOTATOR_VERSION = "0.9"                       # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.10"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -4517,14 +4517,55 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             只读公开 API，不写任何文件（下载是你点了才做）。
             """
             from PySide6.QtWidgets import QProgressDialog
+            from PySide6.QtCore import QTimer
             repo = str(self.settings.get("update_repo") or UPDATE_REPO)
+            page = "https://github.com/%s/releases/latest" % repo
             prog = QProgressDialog("正在检查更新（%s）…" % repo, "取消", 0, 0, self)
             prog.setWindowTitle("检查更新")
             prog.setMinimumDuration(0)
             prog.setWindowModality(Qt.WindowModality.WindowModal)
-            cancel = threading.Event()
-            prog.canceled.connect(cancel.set)      # 后台线程里不能读 wasCanceled()
             self.statusBar().showMessage("正在检查更新（%s）…" % repo, 0)
+            st = {"cancel": False, "done": False}
+            t0 = time.time()
+
+            # 每秒把"已等几秒"写进忙等框：卡住时至少看得出在等什么
+            tick = QTimer(self)
+            tick.setInterval(1000)
+            tick.timeout.connect(
+                lambda: prog.setLabelText("正在检查更新（%s）…\n已等 %.0f 秒"
+                                          % (repo, time.time() - t0)))
+            tick.start()
+
+            def stop_busy():
+                tick.stop()
+                prog.close()
+
+            def on_cancel():
+                # 取消要真的把框关掉：以前只设了个标记，框会一直挂在屏幕上
+                if st["done"] or st["cancel"]:
+                    return
+                st["cancel"] = True
+                stop_busy()
+                self.statusBar().showMessage("已取消检查更新", 3000)
+
+            prog.canceled.connect(on_cancel)
+
+            def on_timeout():
+                # 硬超时：不管卡在 DNS、代理还是凭据，最多等 15 秒就给结论
+                if st["done"] or st["cancel"]:
+                    return
+                st["cancel"] = True
+                stop_busy()
+                QMessageBox.warning(
+                    self, "检查更新超时",
+                    "等了 %d 秒还没拿到 GitHub 的回复，先不查了。\n\n"
+                    "多半是网络（DNS / 代理 / 防火墙）挡了 api.github.com。\n"
+                    "可以手动打开 Release 页下载新版本：\n%s" % (int(time.time() - t0), page))
+
+            hard = QTimer(self)
+            hard.setSingleShot(True)
+            hard.timeout.connect(on_timeout)
+            hard.start(15000)
 
             from PySide6.QtCore import QObject as _QO2, Signal as _SIG2
 
@@ -4532,7 +4573,6 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 done = _SIG2(object)
 
             sig = _Sig()
-            t0 = time.time()
 
             def worker():
                 try:
@@ -4543,11 +4583,12 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 sig.done.emit((info, err))
 
             def back(res):
-                prog.close()
+                if st["done"] or st["cancel"]:
+                    return                                 # 已经取消/超时了，结果丢掉
+                st["done"] = True
+                hard.stop()
+                stop_busy()
                 self.statusBar().showMessage("", 0)
-                if cancel.is_set():
-                    self.statusBar().showMessage("已取消检查更新", 3000)
-                    return
                 info, err = res if isinstance(res, tuple) else (None, "未知错误")
                 self._show_update_result(info, err, repo, time.time() - t0)
 
