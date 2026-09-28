@@ -5,7 +5,8 @@ CAD-MAP 项目配套的标注小工具：在 PDF 图纸上框 LBD 区域 / 支�
 
 ## 运行
 
-- **用现成的 exe**：到本仓库 Release 页下载 `LBD标注工具.exe`（单文件，双击即可）
+- **用现成的 exe**：到本仓库 Release 页下载 `LBD.exe`（就是 LBD标注工具，单文件、双击即可。
+  GitHub 会把中文资产名简化成 `LBD.exe`，从 v0.4 起一直是这个名字）
 - **源码直跑**：双击 `run_annotator.bat`（需要 Python 3.10+，并装好 PySide6 / pypdf）
 
 ## 主要功能
