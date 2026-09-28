@@ -43,7 +43,7 @@ SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
-ANNOTATOR_VERSION = "0.12"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.13"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -68,22 +68,59 @@ def parse_version(tag):
     return tuple(int(n) for n in nums[:3]) if nums else ()
 
 
-def fetch_latest_release(repo, token="", timeout=20):
-    """查 GitHub 的 latest release，返回 (info, 错误文本)。不写任何文件。"""
+def fetch_json_curl(url, token="", timeout=12):
+    """用系统自带的 curl.exe 取 JSON。
+
+    为什么要这个：打包成 exe 之后，防火墙/杀软经常把"未签名 exe 的外连"静默丢掉，
+    urllib 会一直等到超时；而 curl.exe 是系统程序，一般放行。
+    token 通过 stdin 传（--config -），不出现在命令行里。
+    """
+    import shutil as _sh
+    import subprocess as _sp
+    exe = _sh.which("curl") or _sh.which("curl.exe")
+    if not exe:
+        return None, "系统里没有 curl.exe"
+    cfg = ('header = "User-Agent: LBD-Annotator/%s"\n'
+           'header = "Accept: application/vnd.github+json"\n' % ANNOTATOR_VERSION)
+    if (token or "").strip():
+        cfg += 'header = "Authorization: Bearer %s"\n' % token.strip()
+    cfg += 'url = "%s"\n' % url
+    try:
+        p = _sp.run([exe, "-sS", "-L", "--max-time", str(int(timeout)), "--config", "-"],
+                    input=cfg.encode("utf-8"), capture_output=True,
+                    timeout=timeout + 8, creationflags=_NO_WINDOW)
+        if p.returncode == 0 and p.stdout.strip():
+            return json.loads(p.stdout.decode("utf-8", "replace")), ""
+        return None, "curl 退出码 %s：%s" % (
+            p.returncode, (p.stderr.decode("utf-8", "replace") or "").strip()[:200])
+    except Exception as e:                     # noqa: BLE001
+        return None, "curl 调用失败：%s" % e
+
+
+def fetch_latest_release(repo, token="", timeout=10):
+    """查 GitHub 的 latest release，返回 (info, 错误文本)。不写任何文件。
+
+    先自己发请求；被防火墙/杀软拦掉（打包成 exe 后常见）就退回系统 curl.exe 再试一次。
+    """
     import json as _json
     import urllib.request
+    url = "https://api.github.com/repos/%s/releases/latest" % repo
     req = urllib.request.Request(
-        "https://api.github.com/repos/%s/releases/latest" % repo,
-        headers={"User-Agent": "LBD-Annotator/%s" % ANNOTATOR_VERSION,
-                 "Accept": "application/vnd.github+json"})
+        url, headers={"User-Agent": "LBD-Annotator/%s" % ANNOTATOR_VERSION,
+                      "Accept": "application/vnd.github+json"})
     tok = (token or "").strip()
     if tok:
         req.add_header("Authorization", "Bearer %s" % tok)
+    err1 = ""
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return _json.loads(r.read().decode("utf-8")), ""
     except Exception as e:                     # noqa: BLE001
-        return None, "%s" % e
+        err1 = "%s" % e
+    info, err2 = fetch_json_curl(url, tok, timeout)
+    if info is not None:
+        return info, ""
+    return None, "%s（再试 curl.exe 也不行：%s）" % (err1, err2)
 
 
 def windows_git_credential(host="github.com"):
@@ -4584,11 +4621,22 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     return
                 st["cancel"] = True
                 stop_busy()
-                QMessageBox.warning(
-                    self, "检查更新超时",
-                    "等了 %d 秒还没拿到 GitHub 的回复，先不查了。\n\n"
-                    "多半是网络（DNS / 代理 / 防火墙）挡了 api.github.com。\n"
-                    "可以手动打开 Release 页下载新版本：\n%s" % (int(time.time() - t0), page))
+                b = QMessageBox(self)
+                b.setWindowTitle("检查更新超时")
+                b.setIcon(QMessageBox.Icon.Warning)
+                b.setText("等了 %d 秒还没拿到 GitHub 的回复，先不查了。"
+                          % int(time.time() - t0))
+                b.setInformativeText(
+                    "多半是防火墙/杀毒软件拦了本工具的外连（打包成 exe 很常见）。\n"
+                    "工具已经试过自己发请求和系统 curl.exe 两条路，都被拦。\n"
+                    "点下面的按钮用浏览器打开下载页，那里能直接下新版本。")
+                b.setDetailedText("下载页：%s" % page)
+                b_open = b.addButton("用浏览器打开下载页",
+                                     QMessageBox.ButtonRole.AcceptRole)
+                b.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+                b.exec()
+                if b.clickedButton() is b_open:
+                    self._open_url(page)
 
             hard = QTimer(self)
             hard.setSingleShot(True)
@@ -4626,16 +4674,23 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         def _show_update_result(self, info, err, repo, elapsed=0.0):
             page = "https://github.com/%s/releases/latest" % repo
             if err or not info:
-                QMessageBox.warning(
-                    self, "检查更新失败",
-                    "等了 %.0f 秒没拿到结果：\n%s\n\n"
+                b = QMessageBox(self)
+                b.setWindowTitle("检查更新失败")
+                b.setIcon(QMessageBox.Icon.Warning)
+                b.setText("等了 %.0f 秒没拿到结果。" % elapsed)
+                b.setInformativeText(
                     "· 能正常 clone 这个仓库的机器上，会直接用本机 git 存好的凭据，"
                     "一般不用管；\n"
                     "· 也可以在本工具的 annotator_settings.json 里加 "
                     "\"update_token\"（只读 token）；\n"
-                    "· 或者手动打开 Release 页下载，覆盖旧的 exe：\n%s\n\n"
-                    "如果是公司网络挡了 github.com，换手机热点试一下也行。"
-                    % (elapsed, err, page))
+                    "· 或者点下面的按钮用浏览器打开下载页，手动下新版本覆盖旧的 exe。")
+                b.setDetailedText("错误：%s\n\n下载页：%s" % (err, page))
+                b_open = b.addButton("用浏览器打开下载页",
+                                     QMessageBox.ButtonRole.AcceptRole)
+                b.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+                b.exec()
+                if b.clickedButton() is b_open:
+                    self._open_url(page)
                 return
             tag = (info.get("tag_name") or "").strip()
             cur, new = parse_version(ANNOTATOR_VERSION), parse_version(tag)
@@ -4774,30 +4829,67 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     tok = update_token(self.settings)
                     api_url = (asset or {}).get("url") or ""
                     ua = "LBD-Annotator/%s" % ANNOTATOR_VERSION
-                    if tok and api_url:
-                        req = urllib.request.Request(
-                            api_url, headers={"User-Agent": ua,
-                                              "Accept": "application/octet-stream",
-                                              "Authorization": "Bearer %s" % tok})
-                    else:
-                        req = urllib.request.Request(url, headers={"User-Agent": ua})
-                    opener = urllib.request.build_opener(StripAuthRedirect)
-                    with opener.open(req, timeout=30) as r:
-                        if not total:
-                            total_hint = int(r.headers.get("Content-Length") or 0)
+                    use_api = bool(tok and api_url)
+                    try:
+                        if use_api:
+                            req = urllib.request.Request(
+                                api_url, headers={"User-Agent": ua,
+                                                  "Accept": "application/octet-stream",
+                                                  "Authorization": "Bearer %s" % tok})
                         else:
-                            total_hint = total
-                        with open(tmp, "wb") as f:
-                            while True:
-                                if cancel.is_set():
-                                    raise RuntimeError("已取消")
-                                chunk = r.read(262144)
-                                if not chunk:
-                                    break
-                                f.write(chunk)
-                                got += len(chunk)
-                                if got % 1048576 < 262144:
-                                    sig.step.emit(got, total_hint)
+                            req = urllib.request.Request(url, headers={"User-Agent": ua})
+                        opener = urllib.request.build_opener(StripAuthRedirect)
+                        with opener.open(req, timeout=30) as r:
+                            if not total:
+                                total_hint = int(r.headers.get("Content-Length") or 0)
+                            else:
+                                total_hint = total
+                            with open(tmp, "wb") as f:
+                                while True:
+                                    if cancel.is_set():
+                                        raise RuntimeError("已取消")
+                                    chunk = r.read(262144)
+                                    if not chunk:
+                                        break
+                                    f.write(chunk)
+                                    got += len(chunk)
+                                    if got % 1048576 < 262144:
+                                        sig.step.emit(got, total_hint)
+                    except Exception as e1:          # noqa: BLE001
+                        # 打包成 exe 后自己的外连常被防火墙/杀软拦掉，退回系统 curl.exe
+                        sig.step.emit(got, total or 0)
+                        import shutil as _sh
+                        import subprocess as _sp
+                        exe = _sh.which("curl") or _sh.which("curl.exe")
+                        if not exe:
+                            raise RuntimeError("%s（系统里也没有 curl.exe 可退）" % e1)
+                        cfg = ('header = "User-Agent: %s"\n'
+                               'header = "Accept: application/octet-stream"\n' % ua)
+                        if use_api:
+                            cfg = ('header = "User-Agent: %s"\n'
+                                   'header = "Accept: application/octet-stream"\n'
+                                   'header = "Authorization: Bearer %s"\n' % (ua, tok))
+                        cfg += ('location\nfail\n'
+                                'output = "%s"\n'
+                                'url = "%s"\n' % (tmp, api_url if use_api else url))
+                        pr = _sp.Popen([exe, "-sS", "--config", "-"],
+                                       stdin=_sp.PIPE, stdout=_sp.PIPE,
+                                       stderr=_sp.STDOUT, creationflags=_NO_WINDOW)
+                        pr.stdin.write(cfg.encode("utf-8"))
+                        pr.stdin.close()
+                        while pr.poll() is None:       # 边下边报进度
+                            if cancel.is_set():
+                                pr.kill()
+                                raise RuntimeError("已取消")
+                            try:
+                                got = os.path.getsize(tmp)
+                            except OSError:
+                                pass
+                            sig.step.emit(got, total or 0)
+                            time.sleep(0.5)
+                        if pr.returncode != 0:
+                            msg = (pr.stdout.read() or b"").decode("utf-8", "replace").strip()
+                            raise RuntimeError("curl 下载失败（%s）：%s" % (pr.returncode, msg[:200]))
                     os.replace(tmp, dest)
                     sig.done.emit(dest, "")
                 except Exception as e:              # noqa: BLE001
