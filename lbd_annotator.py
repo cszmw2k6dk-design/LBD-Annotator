@@ -43,7 +43,7 @@ SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
-ANNOTATOR_VERSION = "0.10"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.11"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -54,6 +54,10 @@ def _build_stamp():
 
 
 BUILD_STAMP = _build_stamp()
+# 自检（--smoke / --memtest / --roundtrip）模式：设置文件和渲染缓存都放临时目录。
+# 以前自检会读写用户真正的 %LOCALAPPDATA%\LBD标注工具\annotator_settings.json，
+# 把「上次打开」覆盖成自检用的假图纸 —— 下次开工具就弹出那张 "LBD SMOKE PAGE" 假图。
+TEST_MODE = False
 RACK_LEN_TOL = 0.10                             # 支架长度差 ≤10% 算同一类
 UPDATE_REPO = "cszmw2k6dk-design/LBD-Annotator"   # 在线更新读这个仓库的 Release
 
@@ -818,7 +822,14 @@ def settings_path():
 
 
 def work_dir():
-    """放设置 / 渲染缓存的地方（不动程序目录）。"""
+    """放设置 / 渲染缓存的地方（不动程序目录）。自检模式走临时目录，绝不碰用户的。"""
+    if TEST_MODE:
+        d = os.path.join(tempfile.gettempdir(), "LBD标注工具_selftest")
+        try:
+            os.makedirs(d, exist_ok=True)
+            return d
+        except Exception:               # noqa: BLE001
+            pass
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
     if base:
         d = os.path.join(base, "LBD标注工具")
@@ -2487,7 +2498,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.clip = []                 # 复制/粘贴框用的内部剪贴板
             self._paste_n = 0
             self.settings = load_settings()
-            self.pdf = self.settings.get("pdf") or ""
+            # 不读"上次的 PDF"：路径不落盘，每次都是干净开局（要 PDF 自己点「选 PDF…」）
+            self.pdf = ""
             self.dpi = int(self.settings.get("dpi") or 0)
             self.xlsx = self.settings.get("xlsx") or ""
             self._sheet_cache = None
@@ -2808,8 +2820,6 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 return
             self.dbg = doc
             self.pdf = p
-            self.settings["pdf"] = p
-            save_settings(self.settings)
             self.update_pdf_button()
             self.edited.clear()
             self.undo.clear()
@@ -2835,9 +2845,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 return
             QApplication.restoreOverrideCursor()
             self.undo.clear()
-            # 记住这份 JSON：打包成 exe 后双击就能接着打开上次那份
-            self.settings["json"] = os.path.abspath(path)
-            save_settings(self.settings)
+            # 不再记住这份 JSON：路径不落盘，下次双击就是空白画布
+            # （要接着上次那份，自己点「打开 JSON」再选一次）
             pgs = self.dbg.page_numbers()
             if not pgs:
                 raw = getattr(self.dbg, "raw", b"") or b""
@@ -2871,8 +2880,6 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             if not self.pdf:
                 self.pdf = guess_pdf(path)
             if self.pdf:
-                self.settings["pdf"] = self.pdf
-                save_settings(self.settings)
                 self.update_pdf_button()
             self.cmb_page.blockSignals(True)
             self.cmb_page.clear()
@@ -3007,17 +3014,14 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             if not p:
                 return
             self.pdf = p
-            self.settings["pdf"] = p
             if self.dpi <= 0:
                 # 底图还停在内嵌图的话，换 PDF 看不出任何变化，直接切到 250 DPI
                 self.dpi = 250
-                self.settings["dpi"] = 250
                 i = self.cmb_dpi.findData(250)
                 if i >= 0:
                     self.cmb_dpi.blockSignals(True)
                     self.cmb_dpi.setCurrentIndex(i)
                     self.cmb_dpi.blockSignals(False)
-            save_settings(self.settings)
             self.update_pdf_button()
             if self.dbg:
                 self.goto_page(self.page)
@@ -5469,6 +5473,8 @@ def main():
     ap.add_argument("--hold", type=float, default=20.0, help="--memtest 挂多久（秒）")
     ap.add_argument("--out", default=None, help="自检时的输出文件")
     a = ap.parse_args()
+    global TEST_MODE
+    TEST_MODE = bool(a.smoke or a.memtest or a.roundtrip)   # 自检不碰用户的设置/缓存
     if a.autofill:
         src = a.json or DEFAULT_JSON
         pdf = a.pdf or str(load_settings().get("pdf") or "")
@@ -5497,11 +5503,8 @@ def main():
         print("找不到文件：%s" % a.json)
         return 2
     src = a.json
-    if not src:
-        # 双击 exe：先接着打开上次那份，其次看作者本机那份，都没有就弹选择框
-        src = last_json() or (DEFAULT_JSON if os.path.exists(DEFAULT_JSON) else None)
-        if src:
-            print("打开上次的识别结果：%s" % src)
+    # 双击 exe 就是空白画布（黑底），不自动打开上次那份、也不记路径：
+    # 只有命令行显式给了文件，或者你自己点「打开 JSON」，才会载入东西。
     return run_gui(src)
 
 
