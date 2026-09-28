@@ -11,15 +11,19 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-ROOTS = [
-    r"C:\Users\szk\Desktop\batch_003",
-    r"C:\Users\szk\Desktop\batch_004",
-    r"C:\Users\szk\Desktop\batch_005",
-    r"C:\Users\szk\Desktop\batch_006",
-    r"C:\Users\szk\Desktop\batch_007",
-    r"C:\Users\szk\Desktop\A-F",
-    r"C:\Users\szk\Desktop\G-Mhalf",
+# 标注原件（X-AnyLabeling 的 png + json）在哪个目录，每台机器不一样：
+# 默认是本机这套，换机器不用改文件，设环境变量 LBD_ROOTS 就行（多个目录用 ; 分隔）。
+_DEFAULT_ROOTS = [
+    r"C:\Users\ZhaokeShi\Downloads\标注工作\标注支架\batch_001",
+    r"C:\Users\ZhaokeShi\Downloads\标注工作\标注支架\batch_002",
+    r"C:\Users\ZhaokeShi\Downloads\标注工作\标注支架\batch_003",
+    r"C:\Users\ZhaokeShi\Downloads\标注工作\标注支架\batch_004",
+    r"C:\Users\ZhaokeShi\Downloads\标注工作\标注支架\batch_005",
+    r"C:\Users\ZhaokeShi\Downloads\标注工作\标注支架\batch_006",
+    r"C:\Users\ZhaokeShi\Downloads\标注工作\标注支架\batch_007",
 ]
+ROOTS = ([p for p in os.environ["LBD_ROOTS"].split(os.pathsep) if p]
+         if os.environ.get("LBD_ROOTS") else _DEFAULT_ROOTS)
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 PAGE_RE = re.compile(r"_p0*\d+$", re.IGNORECASE)

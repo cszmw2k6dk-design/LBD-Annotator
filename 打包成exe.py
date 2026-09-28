@@ -13,12 +13,21 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 APP = os.path.join(HERE, "lbd_annotator.py")
-DIST = os.path.join(HERE, "dist")
+def _opt(flag, default):
+    """--out <dir> / --name <名字>：发布或并行打包时用，不改默认行为。"""
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return default
+
+
+DIST = os.path.abspath(_opt("--out", os.path.join(HERE, "dist")))
 WORK = os.path.join(HERE, "build_exe")
 NAME = "LBD标注工具"
 CONSOLE = "--console" in sys.argv          # 调试用：带控制台，错误能直接看到
 ONEDIR = "--onedir" in sys.argv            # 打成文件夹（onedir）而不是单文件
-NAME = NAME + ("_debug" if CONSOLE else "")
+NAME = _opt("--name", NAME) + ("_debug" if CONSOLE else "")
 EXE = os.path.join(DIST, NAME + ".exe")
 APPDIR = os.path.join(DIST, NAME)
 if ONEDIR:

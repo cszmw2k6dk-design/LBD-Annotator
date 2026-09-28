@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LBD 标注工具 v0.2（内嵌标注页原型）
+"""LBD 标注工具（内嵌标注页原型）
 
 直接读写 agent3-debug 识别结果 JSON：改框、改 LBD 名字，另存出一份完整 JSON 给下游程序用。
 
@@ -43,7 +43,7 @@ SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
-ANNOTATOR_VERSION = "0.3"                       # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.5"                       # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -479,6 +479,11 @@ def clean_shapes(shapes, keep_manual=True, use_number=True, use_shape=True,
                     dropped.add(id(a))
                     stats["manual_dup"] += 1
                     break
+
+    # 锁定的框一律保留：用户锁上就是明确说"别动它"，清理也不许删
+    for s in shapes:
+        if s.get("locked"):
+            dropped.discard(id(s))
 
     out = [s for s in shapes if id(s) not in dropped]
     stats["removed"] = len(shapes) - len(out)
@@ -1295,10 +1300,14 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
       4) 框里没有可用文字的，按标签表的号（还没被用掉的）按位置顺序补，标黄
       5) 连标签表的号都没有了 -> 标红，等人手填
     """
-    nodes = [(i, s) for i, s in enumerate(shapes) if s.get("label") == "Node"]
+    # 锁上的 Node 不参与补编号：不改它的名字，也不占标签表里的号
+    locked_n = sum(1 for s in shapes
+                   if s.get("label") == "Node" and s.get("locked"))
+    nodes = [(i, s) for i, s in enumerate(shapes)
+             if s.get("label") == "Node" and not s.get("locked")]
     tol = max(6.0, float(tol_ratio) * max(width, height))
     stat = {"total": len(nodes), "filled": 0, "auto": 0, "missed": 0,
-            "wrong_sheet": 0, "kept": 0}
+            "wrong_sheet": 0, "kept": 0, "locked": locked_n}
     if not nodes:
         return stat
 
@@ -1797,6 +1806,7 @@ class PageModel:
                 "source": det.get("source") or "manual",
                 "raw": det.get("raw") or {},
                 "ocr_index": ocr_index,
+                "locked": bool((det.get("raw") or {}).get("lbd_locked")),
             })
         for det in (self._orig_box.get("detections") or []):
             b = det.get("bbox") or {}
@@ -1811,6 +1821,7 @@ class PageModel:
                 "source": det.get("source") or "manual",
                 "raw": det.get("raw") or {},
                 "ocr_index": None,
+                "locked": bool((det.get("raw") or {}).get("lbd_locked")),
             })
 
     def counts(self):
@@ -1821,6 +1832,13 @@ class PageModel:
 
     def _det(self, s):
         cid = s.get("class_id")
+        # 锁定状态记在 raw 里：raw 是原样透传的字典，存进去重开还在，
+        # 也不用给下游 JSON 多塞一个新字段（下游只认 label/bbox 那几个）。
+        raw = dict(s.get("raw") or {})
+        if s.get("locked"):
+            raw["lbd_locked"] = True
+        else:
+            raw.pop("lbd_locked", None)
         return {
             "label": s["label"],
             "confidence": s.get("confidence"),
@@ -1828,7 +1846,7 @@ class PageModel:
             "bbox": {"x1": s["bbox"][0], "y1": s["bbox"][1],
                      "x2": s["bbox"][2], "y2": s["bbox"][3]},
             "source": s.get("source") or "manual",
-            "raw": s.get("raw") or {},
+            "raw": raw,
         }
 
     def tracker_data(self):
@@ -1954,6 +1972,13 @@ def selftest(src, out=None):
     return 0 if good else 1
 
 
+def _as_pages(entry):
+    """撤销栈里的一步：老写法是 (页号, 快照)，新写法是 [(页号, 快照), ...]（整册操作一步多页）。"""
+    if isinstance(entry, tuple):
+        return [entry]
+    return list(entry)
+
+
 def make_gui_classes():
     """延迟导入 Qt（自检模式不需要 Qt）。"""
     from PySide6.QtCore import QPointF, QRectF, Qt
@@ -1991,9 +2016,8 @@ def make_gui_classes():
                              shape["bbox"][3] - shape["bbox"][1])
             self.shape_data = shape          # 不能叫 self.shape：会盖掉 Qt 的虚函数 shape()
             self.setPos(shape["bbox"][0], shape["bbox"][1])
-            self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
-                          | QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
             self.setZValue(10)
+            self.apply_flags()
             self.apply_pen()
 
         def apply_pen(self):
@@ -2008,8 +2032,32 @@ def make_gui_classes():
             pen = QPen(c)
             pen.setCosmetic(True)
             pen.setWidthF(2.0)
+            alpha = 26
+            if self.is_locked():
+                # 锁上的框：虚线 + 更淡的底，一眼看得出"这个不能动"
+                pen.setStyle(Qt.PenStyle.DashLine)
+                pen.setWidthF(1.6)
+                alpha = 10
             self.setPen(pen)
-            self.setBrush(QBrush(QColor(c.red(), c.green(), c.blue(), 26)))
+            self.setBrush(QBrush(QColor(c.red(), c.green(), c.blue(), alpha)))
+
+        def is_locked(self):
+            return bool(self.shape_data.get("locked"))
+
+        def apply_flags(self):
+            """锁上 = 点不中、框选也框不到、更拖不动；解锁恢复。"""
+            flag = QGraphicsItem.GraphicsItemFlag
+            lock = self.is_locked()
+            self.setFlag(flag.ItemIsSelectable, not lock)
+            self.setFlag(flag.ItemIsMovable, not lock)
+            if lock and self.isSelected():
+                self.setSelected(False)
+
+        def set_locked(self, flag):
+            self.shape_data["locked"] = bool(flag)
+            self.apply_flags()
+            self.apply_pen()
+            self.update()
 
         def scene_box(self):
             r, p = self.rect(), self.pos()
@@ -2033,6 +2081,8 @@ def make_gui_classes():
             name = self.shape_data.get("name") or ""
             if name and sc > 0.02 and (not BoxItem.name_sel_only or self.isSelected()):
                 self._paint_name(painter, name, sc)
+            if self.is_locked():
+                self._paint_lock(painter, sc)
             if self.isSelected():
                 h = 9.0 / max(sc, 1e-6)
                 r = self.rect()
@@ -2046,6 +2096,27 @@ def make_gui_classes():
                 painter.setPen(pen)
                 for x, y in pts:
                     painter.drawRect(QRectF(x - h / 2, y - h / 2, h, h))
+
+        def _paint_lock(self, painter, sc):
+            """锁上的框：右上角画个小锁（屏幕上恒定大小，不随缩放变形）。
+
+            放右上角是为了不和框里那行名字（左对齐画的）打架。
+            """
+            r = self.rect()
+            if min(r.width(), r.height()) * sc < 9.0:
+                return
+            k = 1.0 / max(sc, 1e-6)
+            bw, bh = 8.0 * k, 6.5 * k
+            x, y = r.right() - bw - 3.0 * k, r.top() + 2.0 * k
+            painter.save()
+            pen = QPen(QColor(40, 40, 40))
+            pen.setCosmetic(True)
+            pen.setWidthF(1.4)
+            painter.setPen(pen)
+            painter.setBrush(QBrush(QColor(255, 245, 180, 235)))
+            painter.drawRect(QRectF(x, y + bh * 0.42, bw, bh * 0.58))
+            painter.drawArc(QRectF(x + bw * 0.12, y, bw * 0.76, bh * 0.9), 0, 180 * 16)
+            painter.restore()
 
         def _paint_name(self, painter, name, sc):
             """把 LBD 名字画在框里：屏幕上恒定小字号、永远不出自己的框，所以不会互相压。
@@ -2131,14 +2202,34 @@ def make_gui_classes():
             # 键盘统一交给主窗口处理（ESC/Delete/A/D…），避免两处各一套
             self.win.keyPressEvent(ev)
 
-        def wheelEvent(self, ev):
-            # 每次滚轮都重设锚点：fitInView / 100% 会把锚点变回视口中心，
-            # 不重设的话缩放就不是跟着十字光标走的
-            self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-            f = 1.18 if ev.angleDelta().y() > 0 else 1 / 1.18
+        def zoom_step(self, f, anchor=None):
+            """以 anchor（视口坐标；不给就用视口中心）为锚点缩放，返回是否真的缩放了。"""
             cur = self.transform().m11()
-            if 0.01 < cur * f < 40:
-                self.scale(f, f)
+            if not 0.01 < cur * f < 40:
+                return False
+            # 缩放的锚点自己算，别用 AnchorUnderMouse：Qt 那个「鼠标在哪儿」只在
+            # 基类的 mousePress/mouseMove 里更新，而画框（两点画法）、拖控制点、
+            # 中键平移这几条路径我们都提前 return 了、没把事件交给基类 —— Qt 记的
+            # 位置还停在旧的（甚至退回视图中心），于是「画 node/tracker 点了第一个
+            # 点之后，滚轮缩放不跟十字光标走」。
+            # 这里改成：缩放前后各算一次锚点下的场景坐标，差多少补多少。跟 Qt 记的
+            # 位置无关，画框中、拖框时、fitInView / 100% 之后都永远贴着锚点。
+            pos = anchor if anchor is not None else self.viewport().rect().center()
+            keep = self.transformationAnchor()
+            self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+            before = self.mapToScene(pos)
+            self.scale(f, f)
+            after = self.mapToScene(pos)
+            # 注意顺序：translate 会改视图变换，锚点还没恢复成 AnchorUnderMouse 时
+            # 调用，否则 Qt 会拿它记的（旧的）鼠标位置把视图再居中一次，白补。
+            self.translate(after.x() - before.x(), after.y() - before.y())
+            self.setTransformationAnchor(keep)
+            self.win.update_state_label()
+            return True
+
+        def wheelEvent(self, ev):
+            self.zoom_step(1.18 if ev.angleDelta().y() > 0 else 1 / 1.18,
+                           ev.position().toPoint())
 
         def mousePressEvent(self, ev):
             if ev.button() == Qt.MouseButton.MiddleButton:
@@ -2147,6 +2238,13 @@ def make_gui_classes():
                 self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
                 return
             if ev.button() == Qt.MouseButton.LeftButton and self.mode == "select":
+                # 锁上的框点不中（selectable=False），所以单独解锁得留个入口：
+                # Ctrl+点它 = 只解锁这一个。
+                if ev.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    hit = self.itemAt(ev.position().toPoint())
+                    if isinstance(hit, BoxItem) and hit.is_locked():
+                        self.win.unlock_item(hit)
+                        return
                 it = self.win.current_item()
                 if it is not None:
                     sp = self.mapToScene(ev.position().toPoint())
@@ -2299,7 +2397,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
     class Win(QMainWindow):
         def __init__(self, src=None):
             super().__init__()
-            self.setWindowTitle("LBD 标注工具 v0.2")
+            self.setWindowTitle("LBD 标注工具 v%s" % ANNOTATOR_VERSION)
             self.resize(1500, 950)
             self.dbg = None
             self.page = None
@@ -2353,13 +2451,44 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             act = QAction("打开 PDF（无 JSON，直接标注）", self)
             act.triggered.connect(self.on_open_pdf)
             tb.addAction(act)
+            tb.addSeparator()
             tb2.addSeparator()
+            mode_tip = {"select": ("选择：点/框选，拖框内=移动，拖白点=改大小", "1"),
+                        "Node": ("画 Node（阵列块）：点两个对角，或按住拖一个框", "2"),
+                        "Tracker": ("画 Tracker（支架/板列）：点两个对角，或按住拖一个框", "3"),
+                        "Box": ("画 Box（其它）：点两个对角，或按住拖一个框", "4")}
             for m in ("select",) + CLASSES:
                 a = QAction(MODE_TEXT[m], self)
                 a.setCheckable(True)
+                tip, key = mode_tip[m]
+                a.setToolTip("%s\n快捷键 %s；Esc 回到选择模式" % (tip, key))
                 a.triggered.connect(lambda _c=False, mm=m: self.set_mode(mm))
                 tb2.addAction(a)
                 setattr(self, "act_" + m, a)
+            tb2.addSeparator()
+            self.act_lockbox = QAction("锁定/解锁", self)
+            self.act_lockbox.setCheckable(True)
+            self.act_lockbox.setShortcut(QKeySequence("Ctrl+L"))
+            self.act_lockbox.setToolTip(
+                "把选中的框锁上：点不中、框选框不到、拖不动、Delete 也删不掉，\n"
+                "「清理多余框」和「补全编号」也不会碰它。（Ctrl+L）\n"
+                "锁定状态存进 JSON，下次打开还在；再点一次＝解锁。\n"
+                "单独解锁某一个：Ctrl+点那个框（或用「解锁本页」）。")
+            self.act_lockbox.triggered.connect(self.on_toggle_lock)
+            tb2.addAction(self.act_lockbox)
+            self.act_lock_nodes = QAction("锁定本页 Node", self)
+            self.act_lock_nodes.setCheckable(True)
+            self.act_lock_nodes.setShortcut(QKeySequence("Ctrl+Shift+L"))
+            self.act_lock_nodes.setToolTip(
+                "一键把本页所有 Node（阵列块）锁上：点不中、框选框不到、拖不动、\n"
+                "Delete 删不掉，「清理多余框」「补全编号」也不会碰它们。（Ctrl+Shift+L）\n"
+                "本页 Node 全锁着的时候，再点一次＝全部解锁。")
+            self.act_lock_nodes.triggered.connect(self.on_lock_page_nodes)
+            tb2.addAction(self.act_lock_nodes)
+            a = QAction("解锁本页", self)
+            a.setToolTip("把本页锁上的框一次全解锁（Node / Tracker / Box 全算）")
+            a.triggered.connect(self.on_unlock_page)
+            tb2.addAction(a)
             tb2.addSeparator()
             a = QAction("撤销", self)
             a.setShortcut(QKeySequence("Ctrl+Z"))
@@ -2378,8 +2507,14 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a = QAction("清理多余框", self)
             a.setToolTip("删掉多余的框：已经有手工框的地方、同一个编号重复的、"
                          "互相重叠 90% 以上的、形状离谱的 Tracker。\n"
-                         "只删模型画的框，手工框一个都不动；可用 Ctrl+Z 撤销")
+                         "只删模型画的框，手工框一个都不动；锁定的框也不动；"
+                         "可用 Ctrl+Z 撤销")
             a.triggered.connect(self.on_clean_shapes)
+            tb2.addAction(a)
+            a = QAction("清理多余框(整册)", self)
+            a.setToolTip("把整册所有页一起清一遍（同样的规则、同样不动锁定框和手工框）。\n"
+                         "整册算一步：Ctrl+Z 一次就能把所有页一起撤回。")
+            a.triggered.connect(self.on_clean_shapes_all)
             tb2.addAction(a)
             a = QAction("重载本页", self)
             a.setToolTip("把当前页恢复成上次打开/保存时的样子（画乱了的出口；可用 Ctrl+Z 撤销）")
@@ -2390,16 +2525,29 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a.triggered.connect(self.on_copy)
             tb.addAction(a)
             a = QAction("粘贴框", self)
-            a.setToolTip("粘贴刚复制的框（Ctrl+V），每贴一次自动错开一点")
+            a.setToolTip("粘贴刚复制的框（Ctrl+V）：原位盖一份，贴出来的框是选中的，直接拖到位置")
             a.triggered.connect(self.on_paste)
+            tb.addAction(a)
+            a = QAction("放大", self)
+            a.setShortcut(QKeySequence("Ctrl+="))
+            a.setToolTip("放大（Ctrl+= ，滚轮也可以）")
+            a.triggered.connect(lambda: self.zoom_by(1.18))
+            tb.addAction(a)
+            a = QAction("缩小", self)
+            a.setShortcut(QKeySequence("Ctrl+-"))
+            a.setToolTip("缩小（Ctrl+- ，滚轮也可以）")
+            a.triggered.connect(lambda: self.zoom_by(1 / 1.18))
             tb.addAction(a)
             a = QAction("适应窗口", self)
             a.setShortcut(QKeySequence("Ctrl+0"))
+            a.setToolTip("整页缩放到刚好铺满窗口（Ctrl+0）")
             a.triggered.connect(self.fit)
             tb.addAction(a)
             a = QAction("100%", self)
+            a.setToolTip("按原始像素 1:1 显示")
             a.triggered.connect(self.zoom_reset)
             tb.addAction(a)
+            tb.addSeparator()
             tb.addSeparator()
             a = QAction("另存为…", self)
             a.setShortcut(QKeySequence("Ctrl+S"))
@@ -2514,6 +2662,12 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             form.addRow("LBD 名字", self.ed_name)
             self.lbl_bbox = QLabel("-")
             form.addRow("位置", self.lbl_bbox)
+            self.chk_lock = QCheckBox("锁定这个框")
+            self.chk_lock.setToolTip(
+                "锁上以后这个框点不中、框选也框不到、拖不动、Delete 删不掉；\n"
+                "跟工具栏的「锁定/解锁」(Ctrl+L) 是同一件事。锁定状态会存进 JSON。")
+            self.chk_lock.toggled.connect(self.on_lock_check)
+            form.addRow("", self.chk_lock)
             sl.addLayout(form)
             self.btn_del = QPushButton("删除这个框（Delete）")
             self.btn_del.clicked.connect(self.on_delete)
@@ -2529,6 +2683,12 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.setCentralWidget(central)
 
             self.setStatusBar(QStatusBar())
+            # 右下角常驻一行：模式 / 页码 / 缩放 / 各类框数量 / 有没有改过
+            self.lbl_state = QLabel()
+            self.lbl_state.setMinimumWidth(420)
+            self.lbl_state.setAlignment(Qt.AlignmentFlag.AlignRight
+                                        | Qt.AlignmentFlag.AlignVCenter)
+            self.statusBar().addPermanentWidget(self.lbl_state)
             self.scene.selectionChanged.connect(self.on_selection)
             self.set_mode("select")
             self.on_name_px()
@@ -2583,8 +2743,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             for n in doc.page_numbers():
                 self.cmb_page.addItem(str(n), n)
             self.cmb_page.blockSignals(False)
-            self.setWindowTitle("LBD 标注工具 v0.2 — %s（直接标注，无识别结果）"
-                                % os.path.basename(p))
+            self.setWindowTitle("LBD 标注工具 v%s — %s（直接标注，无识别结果）"
+                                % (ANNOTATOR_VERSION, os.path.basename(p)))
             self.statusBar().showMessage("空白文档：%d 页，框从零开始画；保存会生成识别结果 JSON"
                                          % len(doc.page_numbers()), 8000)
             self.goto_page(doc.page_numbers()[0])
@@ -2643,7 +2803,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             for n in self.dbg.page_numbers():
                 self.cmb_page.addItem(str(n), n)
             self.cmb_page.blockSignals(False)
-            self.setWindowTitle("LBD 标注工具 v0.2 — %s" % os.path.basename(path))
+            self.setWindowTitle("LBD 标注工具 v%s — %s"
+                                % (ANNOTATOR_VERSION, os.path.basename(path)))
             # 有框的页优先：整册 JSON（每页都写了空记录的那份）本来会停在第 1 页，
             # 明明有图纸却是一片空白，得自己翻半天。
             drw = drawing_pages(self.dbg)
@@ -2810,9 +2971,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             if self.pm:
                 self.canvas.fitInView(self.scene.sceneRect(),
                                       Qt.AspectRatioMode.KeepAspectRatio)
+                self.update_state_label()
 
         def zoom_reset(self):
             self.canvas.resetTransform()
+            self.update_state_label()
 
         # ---------------- 改动
         def begin_change(self):
@@ -2824,7 +2987,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 return
             now = [(i, dict(s)) for i, s in enumerate(self.pm.shapes)]
             if now != self._pending:
-                self.undo.append((self.page, self._pending))
+                # 一步撤销 = 一页或多页的快照列表（整册清理那种一次多页的操作算一步）
+                self.undo.append([(self.page, self._pending)])
                 del self.undo[:-200]       # 只留最近 200 步，别无限涨（一步快照很小）
                 self.redo.clear()          # 有了新改动，"重做"就失效了（和常见编辑器一致）
                 self.mark_dirty()
@@ -2852,45 +3016,129 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             if label == "Node":
                 self.statusBar().showMessage("新加的 Node 请填 LBD 名字", 6000)
 
-        def on_clean_shapes(self, quiet=False):
-            """清掉多余的框（只删模型画的，人工框不动）。"""
-            if not self.pm:
-                return None
-            ans = QMessageBox.question(
-                self, "清理多余框",
-                "手工框之间的重复要不要一起清？\n\n"
+        def _ask_clean_manual(self, title, scope):
+            """问"手工框之间的重复要不要一起清"。返回 True/False，点取消返回 None。"""
+            box = QMessageBox(self)
+            box.setWindowTitle(title)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText("手工框之间的重复要不要一起清？\n范围：%s" % scope)
+            box.setInformativeText(
                 "· 是 —— 同类别的框互相重叠 50% 以上就只留一个\n"
                 "        （优先留框里真读到过 LBD 编号的，其次置信度高的）\n"
                 "· 否 —— 只清模型画的框，手工框一律不动\n\n"
-                "两个选项都能用 Ctrl+Z 撤销。",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            clean_manual = (ans == QMessageBox.StandardButton.Yes)
-            self.begin_change()
-            kept, st = clean_shapes(self.pm.shapes, clean_manual=clean_manual)
-            if st["removed"]:
-                self.pm.shapes = kept
-                self._rebuild_items()
-            self.end_change()
-            if st["removed"]:
-                self.statusBar().showMessage("清理多余框：删了 %d 个" % st["removed"], 8000)
+                "锁定的框一律保留，不会被清掉；这一步可以用 Ctrl+Z 撤销。")
+            yes = box.addButton("是（连手工框一起清）", QMessageBox.ButtonRole.YesRole)
+            no = box.addButton("否（只清模型框）", QMessageBox.ButtonRole.NoRole)
+            box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(no)
+            box.exec()
+            hit = box.clickedButton()
+            if hit is yes:
+                return True
+            if hit is no:
+                return False
+            return None
+
+        def clean_pages(self, pages, clean_manual=False, quiet=True, on_step=None):
+            """在指定页上清多余框（本页和整册都走这里）。
+
+            锁定的框一律保留（clean_shapes 里保证）。整册算"一步"，
+            Ctrl+Z 一次就能把所有页一起撤回。返回 (统计, 每页明细)。
+            """
+            undone, lines = [], []
+            tot = {"removed": 0, "by_manual": 0, "by_number": 0, "by_overlap": 0,
+                   "manual_dup": 0, "by_shape": 0, "kept": 0, "kept_manual": 0,
+                   "pages": 0}
+            for k, pg in enumerate(pages):
+                if on_step is not None and on_step(k, len(pages), pg) is False:
+                    break                      # 用户点了取消
+                pm = self._pm_of(pg)
+                if pm is None:
+                    continue
+                kept, st = clean_shapes(pm.shapes, clean_manual=clean_manual)
+                if not st["removed"]:
+                    continue
+                undone.append((pg, [(i, dict(s)) for i, s in enumerate(pm.shapes)]))
+                pm.shapes = kept
+                pm.dirty = True
+                self.edited[pg] = pm
+                for key in ("removed", "by_manual", "by_number", "by_overlap",
+                            "manual_dup", "by_shape", "kept", "kept_manual"):
+                    tot[key] += st.get(key, 0)
+                tot["pages"] += 1
+                lines.append("第 %s 页：删 %d" % (pg, st["removed"]))
+            if undone:
+                self.undo.append(undone)
+                del self.undo[:-200]
+                self.redo.clear()
+                if any(pg == self.page for pg, _s in undone):
+                    self._rebuild_items()
+                self.mark_dirty()
+                self.on_selection()
+            if tot["removed"]:
+                self.statusBar().showMessage(
+                    "清理多余框：%d 页共删了 %d 个" % (tot["pages"], tot["removed"]), 8000)
+            else:
+                self.statusBar().showMessage("清理多余框：没有多余框可清", 5000)
             if not quiet:
-                QMessageBox.information(
-                    self, "清理多余框",
-                    "删掉 %d 个多余框：\n"
-                    "  已经有手工框了 %d 个\n"
-                    "  同一个编号重复 %d 个\n"
-                    "  模型框互相重叠 %d 个\n"
-                    "  手工框互相重叠 %d 个%s\n"
-                    "  形状离谱（Tracker 又宽又扁）%d 个\n\n"
-                    "现有 %d 个框（其中手工框 %d 个）%s。\n"
-                    "可用 Ctrl+Z 撤销。"
-                    % (st["removed"], st["by_manual"], st["by_number"],
-                       st["by_overlap"], st["manual_dup"],
-                       "" if clean_manual else "（这次没清手工框）",
-                       st["by_shape"], st["kept"], st["kept_manual"],
-                       "，手工框一个没动" if not clean_manual else ""))
-            return st
+                self._show_clean_result(tot, lines, clean_manual, len(pages))
+            return tot, lines
+
+        def _show_clean_result(self, tot, lines, clean_manual, n_pages):
+            if not tot["removed"]:
+                QMessageBox.information(self, "清理多余框",
+                                        "这 %d 页里没有多余框可清。" % n_pages)
+                return
+            body = "\n".join(lines[:40])
+            if len(lines) > 40:
+                body += "\n…（共 %d 页有清理）" % len(lines)
+            QMessageBox.information(
+                self, "清理多余框",
+                "共删掉 %d 个多余框（%d 页）：\n"
+                "  已经有手工框了 %d 个\n"
+                "  同一个编号重复 %d 个\n"
+                "  模型框互相重叠 %d 个\n"
+                "  手工框互相重叠 %d 个%s\n"
+                "  形状离谱（Tracker 又宽又扁）%d 个\n\n"
+                "%s\n\n锁定的框一个没动。可用 Ctrl+Z 一次撤销这一步。"
+                % (tot["removed"], tot["pages"], tot["by_manual"], tot["by_number"],
+                   tot["by_overlap"], tot["manual_dup"],
+                   "" if clean_manual else "（这次没清手工框）",
+                   tot["by_shape"], body))
+
+        def on_clean_shapes(self, quiet=False):
+            """清掉当前页多余的框（只删模型画的，人工框不动）。"""
+            if not self.pm:
+                return None
+            clean_manual = self._ask_clean_manual("清理多余框", "第 %d 页" % self.page)
+            if clean_manual is None:
+                return None
+            return self.clean_pages([self.page], clean_manual, quiet=quiet)
+
+        def on_clean_shapes_all(self):
+            """整册清理：所有页跑一遍，整册算一步撤销。"""
+            if not (self.pm and self.dbg):
+                return None
+            pages = self.dbg.page_numbers()
+            clean_manual = self._ask_clean_manual(
+                "清理多余框（整册）", "整册 %d 页" % len(pages))
+            if clean_manual is None:
+                return None
+            prog = QProgressDialog("正在清理整册多余框…", "取消", 0, len(pages), self)
+            prog.setWindowTitle("清理多余框（整册）")
+            prog.setMinimumDuration(0)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+
+            def step(k, total, pg):
+                prog.setValue(k)
+                prog.setLabelText("第 %d 页（%d/%d）…" % (pg, k + 1, total))
+                QApplication.processEvents()
+                return not prog.wasCanceled()
+
+            try:
+                return self.clean_pages(pages, clean_manual, quiet=False, on_step=step)
+            finally:
+                prog.close()
 
         def on_delete(self):
             if not self.pm:
@@ -2900,6 +3148,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 return
             self.begin_change()
             for it in sel:
+                if it.is_locked():          # 锁上的框删不掉（正常也选不中，这里再兜一道）
+                    continue
                 if it.shape_data in self.pm.shapes:
                     self.pm.shapes.remove(it.shape_data)
                 if it in self.items:
@@ -2925,7 +3175,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             else:
                 self.ed_name.setEnabled(True)
                 self.cmb_label.setEnabled(True)
-                self.btn_del.setEnabled(True)
+                self.btn_del.setEnabled(not it.is_locked())
                 self.ed_name.setText(it.shape_data.get("name") or "")
                 i = self.cmb_label.findText(it.shape_data["label"])
                 if i >= 0:
@@ -2934,6 +3184,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 self.lbl_bbox.setText("%.0f, %.0f → %.0f, %.0f" % (b[0], b[1], b[2], b[3]))
             self.cmb_label.blockSignals(False)
             self.ed_name.blockSignals(False)
+            self.sync_lock_ui()
+            self.update_state_label()
 
         def on_label_changed(self, _i):
             it = self.current_item()
@@ -2965,10 +3217,146 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.canvas.set_mode(mode)
             self.refresh_info()
 
+        # ---------------- 缩放 / 状态栏
+        def zoom_by(self, f):
+            self.canvas.zoom_step(f)
+            self.update_state_label()
+
+        def update_state_label(self):
+            """状态栏右下角常驻信息（模式 / 页码 / 缩放 / 数量 / 改动）。"""
+            try:
+                if not (self.pm and self.dbg):
+                    self.lbl_state.setText("未载入图纸")
+                    return
+                c = self.pm.counts()
+                locked = sum(1 for s in self.pm.shapes if s.get("locked"))
+                self.lbl_state.setText(
+                    "%s ｜ 第 %d/%d 页 ｜ 缩放 %.0f%% ｜ Node %d · Tracker %d · Box %d%s%s"
+                    % (MODE_TEXT.get(self.canvas.mode, self.canvas.mode),
+                       self.page, len(self.dbg.page_numbers()),
+                       self.canvas.transform().m11() * 100.0,
+                       c["Node"], c["Tracker"], c.get("Box", 0),
+                       (" ｜ 锁定 %d" % locked) if locked else "",
+                       " ｜ ● 未保存" if self.pm.dirty else ""))
+            except Exception:
+                pass
+
+        # ---------------- 锁定框
+        def sync_lock_ui(self):
+            """按当前选中状态刷新「锁定/解锁」按钮和侧栏那个勾。"""
+            it = self.current_item()
+            lock = bool(it is not None and it.is_locked())
+            for w in (getattr(self, "act_lockbox", None), getattr(self, "chk_lock", None)):
+                if w is None:
+                    continue
+                w.blockSignals(True)
+                w.setChecked(lock)
+                w.setEnabled(it is not None)
+                w.blockSignals(False)
+
+        def on_toggle_lock(self, _checked=False):
+            """锁定/解锁选中的框：只要不是"全都锁着"，就一律锁上。"""
+            sel = [i for i in self.scene.selectedItems() if isinstance(i, BoxItem)]
+            if not sel:
+                self.statusBar().showMessage("先选中要锁定的框（可以框选多个）再按 Ctrl+L", 5000)
+                self.sync_lock_ui()
+                return
+            target = not all(i.is_locked() for i in sel)
+            self.begin_change()
+            for it in sel:
+                it.set_locked(target)
+            self.end_change()
+            self.scene.clearSelection()
+            self.on_selection()
+            self.statusBar().showMessage(
+                "已%s %d 个框%s"
+                % ("锁定" if target else "解锁", len(sel),
+                   "（锁上的框点不中、拖不动，清理多余框和补编号也不会碰它）"
+                   if target else ""), 6000)
+
+        def on_lock_check(self, checked):
+            it = self.current_item()
+            if it is None or it.is_locked() == bool(checked):
+                return
+            self.begin_change()
+            it.set_locked(checked)
+            self.end_change()
+            self.scene.clearSelection()
+            self.on_selection()
+            self.statusBar().showMessage(
+                "已锁定这个框（Ctrl+L 也能锁）" if checked else "已解锁这个框", 4000)
+
+        def on_unlock_page(self):
+            if not self.pm:
+                return
+            locked = [s for s in self.pm.shapes if s.get("locked")]
+            if not locked:
+                self.statusBar().showMessage("本页没有锁定的框", 3000)
+                return
+            self.begin_change()
+            for s in locked:
+                s["locked"] = False
+            self._rebuild_items()
+            self.end_change()
+            self.on_selection()
+            self.statusBar().showMessage("本页 %d 个框已解锁" % len(locked), 5000)
+
+        def unlock_item(self, it):
+            """只解锁一个框（锁上的框点不中，用 Ctrl+点 走这条路）。"""
+            self.begin_change()
+            it.set_locked(False)
+            self.end_change()
+            self.scene.clearSelection()
+            it.setSelected(True)
+            self.on_selection()
+            self.statusBar().showMessage("已解锁这个框（可以选了）", 4000)
+
+        # ---------------- 一键锁整页的 Node
+        def page_nodes(self):
+            if not self.pm:
+                return []
+            return [s for s in self.pm.shapes if s.get("label") == "Node"]
+
+        def sync_lock_nodes_action(self):
+            """本页 Node 全锁着时，按钮变成"解锁本页 Node"并保持按下。"""
+            act = getattr(self, "act_lock_nodes", None)
+            if act is None:
+                return
+            nodes = self.page_nodes()
+            all_lock = bool(nodes) and all(s.get("locked") for s in nodes)
+            act.blockSignals(True)
+            act.setChecked(all_lock)
+            act.setText("解锁本页 Node" if all_lock else "锁定本页 Node")
+            act.setEnabled(bool(nodes))
+            act.blockSignals(False)
+
+        def on_lock_page_nodes(self, _checked=False):
+            """一键锁定/解锁本页所有 Node（Tracker、Box 不动）。"""
+            nodes = self.page_nodes()
+            if not nodes:
+                self.statusBar().showMessage("本页没有 Node 框", 3000)
+                self.sync_lock_nodes_action()
+                return
+            target = not all(s.get("locked") for s in nodes)
+            changed = sum(1 for s in nodes if bool(s.get("locked")) != target)
+            self.begin_change()
+            for s in nodes:
+                s["locked"] = target
+            self._rebuild_items()
+            self.end_change()
+            self.on_selection()
+            self.sync_lock_nodes_action()
+            self.statusBar().showMessage(
+                ("本页 %d 个 Node 已锁定（点不中、拖不动、删不掉；"
+                 "Ctrl+Shift+L 再点一次＝全部解锁）" % len(nodes)) if target
+                else ("本页 %d 个 Node 已解锁（实际改了 %d 个；Tracker/Box 一直没动）"
+                      % (len(nodes), changed)), 8000)
+
         def refresh_info(self):
             if not (self.pm and self.dbg):
                 self.statusBar().showMessage(
                     "点「打开 JSON」载入识别结果（默认不改原文件）")
+                self.update_state_label()
                 return
             c = self.pm.counts()
             src = ("底图 %d DPI" % self.dpi) if self.dpi > 0 else "底图 内嵌图"
@@ -2987,6 +3375,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 "模式：%s　拖框内=移动，拖白点=改大小，方向键=微调(Shift 加速)，"
                 "Delete=删除，Ctrl+Z=撤销，中键拖动=平移，滚轮=缩放，A/D=翻页"
                 % MODE_TEXT.get(self.canvas.mode, self.canvas.mode))
+            self.update_state_label()
+            self.sync_lock_nodes_action()
 
         def keyPressEvent(self, ev):
             k = ev.key()
@@ -3024,6 +3414,12 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 return
             if k == Qt.Key.Key_D:
                 self.goto_offset(1)
+                return
+            # 1/2/3/4 切模式：只在画布上生效（写在 keyPressEvent 里，
+            # 用 QAction 的快捷键会被"名字"输入框抢走 —— 名字里全是数字）
+            if k in (Qt.Key.Key_1, Qt.Key.Key_2, Qt.Key.Key_3, Qt.Key.Key_4):
+                self.set_mode({Qt.Key.Key_1: "select", Qt.Key.Key_2: "Node",
+                               Qt.Key.Key_3: "Tracker", Qt.Key.Key_4: "Box"}[k])
                 return
             super().keyPressEvent(ev)
 
@@ -3067,7 +3463,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 s["ocr_index"] = None
             self._paste_n = 0
             self.statusBar().showMessage(
-                "已复制 %d 个框；切到目标页按 Ctrl+V 粘贴（每贴一次自动错开）" % len(self.clip), 6000)
+                "已复制 %d 个框；切到目标页按 Ctrl+V 原位贴一份" % len(self.clip), 6000)
 
         def on_paste(self):
             if not self.pm:
@@ -3077,36 +3473,15 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 return
             self._paste_n += 1
             clip = self.clip
-            # 偏移量按"这一组框的包围盒"算：贴出来正好排在旁边，而不是原位叠着。
-            # （之前固定错开 24 像素，页面有上千像素宽时肉眼几乎看不出偏移，
-            #   看着就是一堆框挤在一起。）
-            gx1 = min(s["bbox"][0] for s in clip)
-            gy1 = min(s["bbox"][1] for s in clip)
-            gx2 = max(s["bbox"][2] for s in clip)
-            gy2 = max(s["bbox"][3] for s in clip)
-            gap = 12.0
-            # 错开量按"这一组较短边的 15%（不小于 24px）"算，再乘粘贴次数。
-            # 以前按整组包围盒错开，细长的一组会被甩到很远的地方。
-            dx = max(24.0, 0.15 * (gx2 - gx1)) * self._paste_n
-            dy = max(24.0, 0.15 * (gy2 - gy1)) * self._paste_n
-            W, H = float(self.pm.width), float(self.pm.height)
-            # 整组不越界：越界就把整组挪回来，组内相对位置不变（不会挤在页面边上）
-            if gx2 + dx > W:
-                dx -= (gx2 + dx - W)
-            if gy2 + dy > H:
-                dy -= (gy2 + dy - H)
-            if gx1 + dx < 0:
-                dx = -gx1
-            if gy1 + dy < 0:
-                dy = -gy1
+            # 原位粘贴：新框直接盖在被复制的那一份上面（同一个位置），贴出来是选中状态，
+            # 直接拖到要去的地方就行 —— 不用再自己把偏移回来的框拖回去。
             self.begin_change()
             self.scene.clearSelection()
             made = 0
             for s in clip:
-                b = s["bbox"]
                 ns = copy.deepcopy(s)
-                ns["bbox"] = [b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy]
                 ns["ocr_index"] = None
+                ns["locked"] = False      # 贴出来的必须能动，哪怕被复制的原框是锁着的
                 self.pm.shapes.append(ns)
                 it = BoxItem(ns)
                 self.scene.addItem(it)
@@ -3116,34 +3491,64 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.end_change()
             self.on_selection()
             self.statusBar().showMessage(
-                "已粘贴 %d 个框（整组错开 %.0f×%.0f 像素，排在旁边不重叠；"
-                "再按 Ctrl+V 再贴一份）" % (made, dx, dy), 6000)
+                "已原位粘贴 %d 个框（盖在原框上面，现在是选中的，直接拖走就行）" % made, 6000)
 
         def on_undo(self):
             if not self.undo:
                 self.statusBar().showMessage("没有可撤销的操作（Ctrl+Y 可以重做）", 3000)
                 return
-            page, snap = self.undo.pop()
-            self.redo.append((self.page, [(i, dict(s)) for i, s in enumerate(self.pm.shapes)]))
-            self._restore(page, snap)
+            entry = _as_pages(self.undo.pop())
+            self.redo.append(self._snap_pages(entry))
+            self._restore_many(entry)
             self.statusBar().showMessage("已撤销；想还原按 Ctrl+Y", 4000)
 
         def on_redo(self):
             if not self.redo:
                 self.statusBar().showMessage("没有可重做的操作", 3000)
                 return
-            page, snap = self.redo.pop()
-            self.undo.append((self.page, [(i, dict(s)) for i, s in enumerate(self.pm.shapes)]))
-            self._restore(page, snap)
+            entry = _as_pages(self.redo.pop())
+            self.undo.append(self._snap_pages(entry))
+            self._restore_many(entry)
             self.statusBar().showMessage("已重做", 3000)
 
-        def _restore(self, page, snap):
-            """把某一页恢复成快照的样子（撤销/重做共用）。"""
-            if page != self.page:
-                self.goto_page(page)
-            self.pm.shapes = [dict(s) for _i, s in snap]
-            self._rebuild_items()
-            self.pm.dirty = True
+        def _pm_of(self, page):
+            """拿到某一页的页面模型：当前页 / 改过还没存的页 / 从 JSON 临时读一页。"""
+            try:
+                if self.pm is not None and page == self.page:
+                    return self.pm
+                if page in self.edited:
+                    return self.edited[page]
+                return PageModel(self.dbg, page)
+            except Exception:
+                return None
+
+        def _snap_pages(self, entry):
+            """把 entry 里涉及的页的"现在"存成快照（撤销/重做互换时用）。"""
+            out = []
+            for page, _snap in entry:
+                pm = self._pm_of(page)
+                if pm is not None:
+                    out.append((page, [(i, dict(s)) for i, s in enumerate(pm.shapes)]))
+            return out
+
+        def _restore_many(self, entry):
+            """把若干页恢复成快照的样子（撤销/重做共用，整册操作也是一步一件）。"""
+            pages = [p for p, _s in entry]
+            # 先把不在当前页的那些页恢复好（写进 edited，goto 时会用内存里这份）
+            for page, snap in [(p, s) for p, s in entry if p != self.page]:
+                pm = self._pm_of(page)
+                if pm is None:
+                    continue
+                pm.shapes = [dict(s) for _i, s in snap]
+                pm.dirty = True
+                self.edited[page] = pm
+            if pages and self.page not in pages:
+                # 撤销的不是当前页：跳回去，让人看见撤销了什么（和以前的习惯一致）
+                self.goto_page(pages[0])
+            for _page, snap in [(p, s) for p, s in entry if p == self.page]:
+                self.pm.shapes = [dict(s) for _i, s in snap]
+                self._rebuild_items()
+                self.pm.dirty = True
             self.refresh_info()
             self.on_selection()
 
@@ -3315,7 +3720,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             prog.setWindowTitle("补全 LBD 编号")
             prog.setMinimumDuration(0)
             prog.setWindowModality(Qt.WindowModality.WindowModal)
-            lines, n_ok, n_auto, n_miss, n_skip = [], 0, 0, 0, 0
+            lines, n_ok, n_auto, n_miss, n_skip, n_locked = [], 0, 0, 0, 0, 0
             check = []          # 要人核的：位置可能错的（紫）+ 按顺序推的（黄）
             try:
                 for k, pg in enumerate(todo):
@@ -3352,6 +3757,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     n_auto += st["auto"]
                     n_miss += st["missed"]
                     n_skip += st["kept"]
+                    n_locked += st.get("locked", 0)
                     note = ""
                     if hit and sheet and _clean_key(hit) != _clean_key(sheet):
                         note = "；⚠页面文字里印的是 %s（按顺序推的是 %s）" % (hit, sheet)
@@ -3374,9 +3780,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 self.refresh_info()
                 self.on_selection()
             head = ("框内文字取到 %d 个；按标签表顺序补 %d 个（黄色，请核一下）；"
-                    "没取到 %d 个（红色，手填）；已有名字跳过 %d 个。\n"
+                    "没取到 %d 个（红色，手填）；已有名字跳过 %d 个%s。\n"
                     "要你核的一共 %d 个（下面列出来；紫=号跳号、黄=按顺序推的）\n\n"
-                    % (n_ok, n_auto, n_miss, n_skip, len(check)))
+                    % (n_ok, n_auto, n_miss, n_skip,
+                       ("；锁定的 %d 个没动" % n_locked) if n_locked else "",
+                       len(check)))
             if not whole:
                 n_node = sum(1 for s in self.pm.shapes if s.get("label") == "Node")
                 head = ("第 %d 页（Node 框 %d 个）\n" % (self.page, n_node)) + head
@@ -4004,8 +4412,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             for pg, pm in pms.items():
                 hit = False
                 for s in pm.shapes:
-                    if s.get("label") != "Tracker":
-                        continue
+                    if s.get("label") != "Tracker" or s.get("locked"):
+                        continue          # 锁上的支架不动
                     L = max(s["bbox"][2] - s["bbox"][0], s["bbox"][3] - s["bbox"][1])
                     gi = 0
                     for c in cuts:
@@ -4133,7 +4541,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             for n in self.dbg.page_numbers():
                 self.cmb_page.addItem(str(n), n)
             self.cmb_page.blockSignals(False)
-            self.setWindowTitle("LBD 标注工具 v0.2 — %s" % os.path.basename(dest))
+            self.setWindowTitle("LBD 标注工具 v%s — %s"
+                                % (ANNOTATOR_VERSION, os.path.basename(dest)))
             keep = self.page if self.page in self.dbg.pages else self.dbg.page_numbers()[0]
             self.pm = None
             self.goto_page(keep)
@@ -4339,8 +4748,10 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         orig_boxes = {tuple(round(v, 1) for v in it.shape_data["bbox"])
                       for it in win.items[:n_before]}
         new_boxes = [tuple(round(v, 1) for v in p.shape_data["bbox"]) for p in pasted]
-        print("   粘贴的框和原框位置完全重合的个数: %d（应为 0，否则就是'挤在一起'）"
-              % sum(1 for b in new_boxes if b in orig_boxes))
+        n_same = sum(1 for b in new_boxes if b in orig_boxes)
+        print("   粘贴的框和原框位置完全重合的个数: %d/%d（应全部重合：就是原位叠一份）  %s"
+              % (n_same, len(new_boxes),
+                 "通过" if new_boxes and n_same == len(new_boxes) else "不一致！"))
         # 跨页粘贴：复制 -> 翻到下一页 -> 粘贴
         win.scene.clearSelection()
         win.items[0].setSelected(True)
@@ -4379,6 +4790,73 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         print("   坐标 %s -> %s  %s" % (box_before, box_after,
                                         "一致" if box_after == box_before else "变了！"))
         print("   底图像素 %s" % ("一致" if pix_after == pix_before else "变了！"))
+
+        # ---------------- 锁定框：不能选/不能拖/删不掉/能撤销/能存盘/清理不删
+        win.goto_page(first)
+        it_lock = win.items[0]
+        win.scene.clearSelection()
+        it_lock.setSelected(True)
+        win.on_toggle_lock()
+        flag = BoxItem.GraphicsItemFlag
+        ok_sel = not (it_lock.flags() & flag.ItemIsSelectable)
+        ok_mov = not (it_lock.flags() & flag.ItemIsMovable)
+        n_before_lock = len(win.items)
+        it_lock.setSelected(True)                 # 锁上的框不该还能被选中
+        win.on_delete()                           # 选不中 -> 也删不掉
+        ok_del = (len(win.items) == n_before_lock
+                  and it_lock.shape_data in win.pm.shapes)
+        win.on_undo()                             # Ctrl+Z 撤销"锁定"这一步
+        ok_undo = bool(win.items) and not win.items[0].is_locked()
+        print("锁定：不可选 %s；不可拖 %s；选不中也删不掉 %s；撤销能解锁 %s"
+              % (ok_sel, ok_mov, ok_del, ok_undo))
+        win.items[0].set_locked(True)
+        dest_lock = os.path.join(app_dir(), "smoke_lock.json")
+        win.do_save(dest_lock, quiet=True)
+        back = [s for s in PageModel(DebugJson(dest_lock), first).shapes
+                if s.get("locked")]
+        print("   锁定状态存进 JSON 再读回来: %d 个（应为 1）  %s"
+              % (len(back), "通过" if len(back) == 1 else "不一致！"))
+        fake = [{"label": "Tracker", "name": "", "bbox": [0, 0, 20, 300],
+                 "confidence": 0.9, "source": "model", "raw": {}, "locked": True},
+                {"label": "Tracker", "name": "", "bbox": [0, 0, 20, 300],
+                 "confidence": 0.9, "source": "model", "raw": {}}]
+        kept2, _st2 = clean_shapes(fake)
+        print("   清理多余框会保留锁定的那个: %s"
+              % ("通过" if len(kept2) == 1 and kept2[0].get("locked") else "不一致！"))
+
+        # 一键锁定整页 Node
+        win.goto_page(first)
+        win.on_lock_page_nodes()
+        nd = [s for s in win.pm.shapes if s.get("label") == "Node"]
+        tk = [s for s in win.pm.shapes if s.get("label") != "Node"]
+        ok_lock_all = bool(nd) and all(s.get("locked") for s in nd)
+        ok_only_node = not any(s.get("locked") for s in tk)
+        win.on_lock_page_nodes()                 # 再点一次 = 全解锁
+        ok_unlock_all = not any(s.get("locked") for s in win.pm.shapes)
+        print("一键锁定本页 Node：%d 个 Node 全锁上 %s；别的类别没动 %s；再点一次全解锁 %s"
+              % (len(nd), ok_lock_all, ok_only_node, ok_unlock_all))
+
+        # 整册清理多余框 + 一步撤销（用页面模型直接量，不靠翻页重新读盘）
+        pgs_all = win.dbg.page_numbers()
+        p_first = pgs_all[0]
+        win.goto_page(p_first)
+        donor = dict(win.pm.shapes[0])
+        donor.update({"source": "model", "raw": {}, "locked": False, "name": ""})
+        win.pm.shapes.append(dict(donor))     # 造两个和它完全一样的"多余框"
+        win.pm.shapes.append(dict(donor))
+        win.pm.dirty = True
+        win.edited[p_first] = win.pm
+        n_before_clean = len(win.pm.shapes)
+        tot, lines = win.clean_pages(pgs_all, clean_manual=False, quiet=True)
+        n_after_clean = len(win.edited[p_first].shapes)
+        win.on_undo()                         # 一次撤销要把整册一起撤回
+        n_after_undo = len((win.edited.get(p_first) or win.pm).shapes)
+        print("整册清理：第 %d 页 %d -> %d 个框（整册共删 %d，动了 %d 页）；"
+              "Ctrl+Z 一次撤回 -> %d  %s"
+              % (p_first, n_before_clean, n_after_clean, tot["removed"],
+                 tot["pages"], n_after_undo,
+                 "通过" if (n_after_clean < n_before_clean
+                            and n_after_undo == n_before_clean) else "不一致！"))
         return 0
     return app.exec()
 
@@ -4502,7 +4980,7 @@ def autofill_run(json_path, pdf_path, xlsx_path, out_path=None, only_page=None,
 
 def main():
     fix_std_streams()
-    ap = argparse.ArgumentParser(description="LBD 标注工具 v0.2")
+    ap = argparse.ArgumentParser(description="LBD 标注工具 v%s" % ANNOTATOR_VERSION)
     ap.add_argument("json", nargs="?", default=None,
                     help="识别结果 debug JSON（不填就打开对话框）")
     ap.add_argument("--selftest", action="store_true", help="无界面自检")
