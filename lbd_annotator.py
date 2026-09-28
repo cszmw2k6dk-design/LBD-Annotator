@@ -43,7 +43,7 @@ SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
-ANNOTATOR_VERSION = "0.8"                       # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.9"                       # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -4511,12 +4511,20 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         def on_check_update(self):
             """联网查 Release：有新版本就给下载/打开网页的入口。
 
-            只读 GitHub 的公开 API，不写任何文件（下载是你点了才做）。
+            整个检查（连读本机凭据）都在后台线程里做，界面只弹一个能取消的忙等框：
+            以前是先设全局等待光标、再在后台请求，网络一慢光标就转半天，看着像卡死；
+            而且读凭据那一步还在主线程上，凭据库慢的时候界面真的会僵住。
+            只读公开 API，不写任何文件（下载是你点了才做）。
             """
+            from PySide6.QtWidgets import QProgressDialog
             repo = str(self.settings.get("update_repo") or UPDATE_REPO)
-            tok = update_token(self.settings)
+            prog = QProgressDialog("正在检查更新（%s）…" % repo, "取消", 0, 0, self)
+            prog.setWindowTitle("检查更新")
+            prog.setMinimumDuration(0)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            cancel = threading.Event()
+            prog.canceled.connect(cancel.set)      # 后台线程里不能读 wasCanceled()
             self.statusBar().showMessage("正在检查更新（%s）…" % repo, 0)
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
             from PySide6.QtCore import QObject as _QO2, Signal as _SIG2
 
@@ -4524,31 +4532,41 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 done = _SIG2(object)
 
             sig = _Sig()
+            t0 = time.time()
 
             def worker():
-                sig.done.emit(fetch_latest_release(repo, tok))
+                try:
+                    tok = update_token(self.settings)      # CredRead 也可能慢，别放主线程
+                    info, err = fetch_latest_release(repo, tok, timeout=10)
+                except Exception as e:                     # noqa: BLE001
+                    info, err = None, "%s" % e
+                sig.done.emit((info, err))
 
             def back(res):
-                QApplication.restoreOverrideCursor()
+                prog.close()
                 self.statusBar().showMessage("", 0)
+                if cancel.is_set():
+                    self.statusBar().showMessage("已取消检查更新", 3000)
+                    return
                 info, err = res if isinstance(res, tuple) else (None, "未知错误")
-                self._show_update_result(info, err, repo)
+                self._show_update_result(info, err, repo, time.time() - t0)
 
             sig.done.connect(back)
             threading.Thread(target=worker, daemon=True).start()
 
-        def _show_update_result(self, info, err, repo):
+        def _show_update_result(self, info, err, repo, elapsed=0.0):
             page = "https://github.com/%s/releases/latest" % repo
             if err or not info:
                 QMessageBox.warning(
                     self, "检查更新失败",
-                    "连不上 GitHub，或者这个私有仓库不认当前凭据：\n%s\n\n"
+                    "等了 %.0f 秒没拿到结果：\n%s\n\n"
                     "· 能正常 clone 这个仓库的机器上，会直接用本机 git 存好的凭据，"
                     "一般不用管；\n"
                     "· 也可以在本工具的 annotator_settings.json 里加 "
                     "\"update_token\"（只读 token）；\n"
                     "· 或者手动打开 Release 页下载，覆盖旧的 exe：\n%s\n\n"
-                    "如果是公司网络挡了 github.com，换手机热点试一下也行。" % (err, page))
+                    "如果是公司网络挡了 github.com，换手机热点试一下也行。"
+                    % (elapsed, err, page))
                 return
             tag = (info.get("tag_name") or "").strip()
             cur, new = parse_version(ANNOTATOR_VERSION), parse_version(tag)
@@ -4572,6 +4590,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 box.setIcon(QMessageBox.Icon.Information)
                 head = ("发现新版本：%s（%s）\n当前版本：v%s\n"
                         % (tag, date, ANNOTATOR_VERSION))
+                head += "（检查用时 %.1f 秒）\n" % elapsed
                 if exe:
                     head += "安装包：%s（%.1f MB）\n" % (
                         exe[0].get("name"), (exe[0].get("size") or 0) / 1048576.0)
@@ -4594,11 +4613,13 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             if new and cur and new < cur:
                 QMessageBox.information(
                     self, "检查更新",
-                    "当前 v%s 比 Release 里最新的 %s 还新（本地开发版）。" % (ANNOTATOR_VERSION, tag))
+                    "当前 v%s 比 Release 里最新的 %s 还新（本地开发版）。\n\n"
+                    "（检查用时 %.1f 秒）" % (ANNOTATOR_VERSION, tag, elapsed))
                 return
             QMessageBox.information(
                 self, "已是最新版本",
-                "当前 v%s 就是最新版本（远端 %s，%s）。" % (ANNOTATOR_VERSION, tag, date))
+                "当前 v%s 就是最新版本（远端 %s，%s）。\n\n（检查用时 %.1f 秒）"
+                % (ANNOTATOR_VERSION, tag, date, elapsed))
 
         def _open_url(self, url):
             try:
