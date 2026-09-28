@@ -2,13 +2,16 @@
 
 要点
 - 只收「同一目录下同名 png + json」的成对样本（x-anylabeling 的坐标是相对它自己那张图的）
+- 数据源 = 老批次（scan_dataset.ROOTS）+ 新批次（build_tmp/newdata，batch_002、008~013）
+- 低清页默认丢弃：老数据里 1080x720 那批 218 页只标了 Node、没有 Tracker，且要放大 2.37 倍才够 2560，
+  属于分布外样本；用 --min-side 1500 排除（老高清 9000x6000 页不受影响）
 - 同一张图纸存在高/低分辨率两份时，只保留一份（默认保留分辨率高的）
 - 大图统一缩到 --max-side，标注同步缩放；小图原样放过去
 - 按图纸（去掉 _pNN 后缀）分组切 train/val，避免同一张图的不同页同时进训练和验证
 
 用法:
-    python prepare_yolo.py --dry-run          # 只出报告，不写文件
-    python prepare_yolo.py                    # 生成 dataset/
+    python prepare_yolo.py --dry-run --min-side 1500     # 只出报告，不写文件
+    python prepare_yolo.py --min-side 1500 --out dataset_v2
 """
 from __future__ import annotations
 
@@ -27,6 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scan_dataset import IMAGE_EXTS, PAGE_RE, ROOTS  # noqa: E402
 
 OUT_DEFAULT = Path(__file__).resolve().parent / "dataset"
+# 新批次解压目录（batch_002、batch_008~013，700 页 9000x6000，框比老数据贴线更准）
+EXTRA_ROOTS = [str(Path(__file__).resolve().parent.parent / "build_tmp" / "newdata")]
 # 类别顺序跟标注工具 lbd_annotator.py 的 CLASSES 对齐（0=Node, 1=Tracker, 2=Box）
 CLASS_ORDER = ["Node", "Tracker", "Box"]
 # 原始 json 里的叫法 -> 导出用的叫法（A-F/G-Mhalf 只标了 Node，batch_003-007 标了 Node + Typical）
@@ -43,10 +48,19 @@ def iter_files(root: Path):
             yield Path(dirpath) / name
 
 
-def collect_pairs() -> list[dict]:
+def default_roots() -> list[str]:
+    """老批次（存在的）+ 新批次解压目录，去重保序。"""
+    roots = [r for r in ROOTS if Path(r).is_dir()]
+    roots += [r for r in EXTRA_ROOTS if Path(r).is_dir() and r not in roots]
+    return roots
+
+
+def collect_pairs(roots: list[str] | None = None) -> list[dict]:
     """返回 [(image, json)] 的成对样本，同目录同名才算一对。"""
+    if roots is None:
+        roots = default_roots()
     per_dir: dict[Path, dict[str, Path]] = defaultdict(dict)
-    for r in ROOTS:
+    for r in roots:
         root = Path(r)
         if not root.is_dir():
             continue
@@ -117,12 +131,23 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--dedup", choices=["res", "boxes"], default="res",
                     help="同一图纸有高低两份时保留哪份：res=分辨率高的，boxes=框更多的")
+    ap.add_argument("--min-side", type=int, default=0,
+                    help="长边小于该值的页整页丢弃（0=不丢）。丢老低清那批用 1500")
+    ap.add_argument("--roots", default=None,
+                    help="逗号分隔的标注根目录，覆盖默认（默认=老批次 + build_tmp/newdata）")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     from PIL import Image
 
-    pairs = collect_pairs()
+    if args.roots:
+        roots = [r.strip() for r in args.roots.split(",") if r.strip()]
+    else:
+        roots = default_roots()
+    print(f"[0/6] 数据根目录 {len(roots)} 个:")
+    for r in roots:
+        print(f"        {r}")
+    pairs = collect_pairs(roots)
     print(f"[1/6] 同目录成对样本: {len(pairs)}")
 
     # --- 读尺寸 + 读标注 ---
@@ -133,6 +158,22 @@ def main() -> int:
         for s in p["shapes"]:
             s["label"] = RENAME.get(s["label"], s["label"])
         p["group"] = PAGE_RE.sub("", p["stem"])
+
+    # --- 丢低清页：老数据 1080x720 那批（只标了 Node、无 Tracker，放大 2.37 倍才够 2560）---
+    if args.min_side > 0:
+        low = [p for p in pairs if max(p["w"], p["h"]) < args.min_side]
+        if low:
+            pairs = [p for p in pairs if max(p["w"], p["h"]) >= args.min_side]
+            by_g = Counter(p["group"] for p in low)
+            n_box = sum(len(p["shapes"]) for p in low)
+            by_cls = Counter(s["label"] for p in low for s in p["shapes"])
+            print(f"[1b]  丢弃低清页 {len(low)} 张 / {n_box} 框（长边 < {args.min_side}），"
+                  f"涉及 {len(by_g)} 张图纸，类别 {dict(by_cls)}")
+            for g, n in by_g.most_common():
+                print(f"        {n:>3}页 {g}")
+            print(f"        -> 剩余 {len(pairs)} 张")
+        else:
+            print(f"[1b]  没有长边 < {args.min_side} 的页")
 
     # --- 同名去重：同一张图纸只留一份 ---
     by_stem: dict[str, list[dict]] = defaultdict(list)
