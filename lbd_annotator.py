@@ -43,7 +43,7 @@ SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
-ANNOTATOR_VERSION = "0.6"                       # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.7"                       # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -2580,7 +2580,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                          "结果写进 JSON 的 raw.strings")
             a.triggered.connect(self.on_rack_grade)
             tb2.addAction(a)
-            a = QAction("清理多余框", self)
+            a = QAction("清理多余框(本页)", self)
             a.setToolTip("删掉多余的框：已经有手工框的地方、同一个编号重复的、"
                          "互相重叠 90% 以上的、形状离谱的 Tracker。\n"
                          "只删模型画的框，手工框一个都不动；锁定的框也不动；"
@@ -3124,7 +3124,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             undone, lines = [], []
             tot = {"removed": 0, "by_manual": 0, "by_number": 0, "by_overlap": 0,
                    "manual_dup": 0, "by_shape": 0, "kept": 0, "kept_manual": 0,
-                   "pages": 0}
+                   "pages": 0, "first": None, "cur": 0, "changed": []}
             for k, pg in enumerate(pages):
                 if on_step is not None and on_step(k, len(pages), pg) is False:
                     break                      # 用户点了取消
@@ -3142,6 +3142,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                             "manual_dup", "by_shape", "kept", "kept_manual"):
                     tot[key] += st.get(key, 0)
                 tot["pages"] += 1
+                tot["changed"].append(pg)
+                if tot["first"] is None:
+                    tot["first"] = pg
+                if pg == self.page:
+                    tot["cur"] += st["removed"]
                 lines.append("第 %s 页：删 %d" % (pg, st["removed"]))
             if undone:
                 self.undo.append(undone)
@@ -3168,53 +3173,154 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             body = "\n".join(lines[:40])
             if len(lines) > 40:
                 body += "\n…（共 %d 页有清理）" % len(lines)
-            QMessageBox.information(
-                self, "清理多余框",
-                "共删掉 %d 个多余框（%d 页）：\n"
-                "  已经有手工框了 %d 个\n"
-                "  同一个编号重复 %d 个\n"
-                "  模型框互相重叠 %d 个\n"
-                "  手工框互相重叠 %d 个%s\n"
-                "  形状离谱（Tracker 又宽又扁）%d 个\n\n"
-                "%s\n\n锁定的框一个没动。可用 Ctrl+Z 一次撤销这一步。"
-                % (tot["removed"], tot["pages"], tot["by_manual"], tot["by_number"],
-                   tot["by_overlap"], tot["manual_dup"],
-                   "" if clean_manual else "（这次没清手工框）",
-                   tot["by_shape"], body))
+            box = QMessageBox(self)
+            box.setWindowTitle("清理多余框")
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText(
+                "共删掉 %d 个多余框（%d 页）；本页删了 %d 个。" % (
+                    tot["removed"], tot["pages"], tot.get("cur", 0)))
+            box.setInformativeText(
+                "已经有手工框了 %d 个\n"
+                "同一个编号重复 %d 个\n"
+                "模型框互相重叠 %d 个\n"
+                "手工框互相重叠 %d 个%s\n"
+                "形状离谱（Tracker 又宽又扁）%d 个\n\n"
+                "锁定的框一个没动；Ctrl+Z 可以一次撤销这一步。\n"
+                "改动要保存才落盘 —— 别忘了存。"
+                % (tot["by_manual"], tot["by_number"], tot["by_overlap"],
+                   tot["manual_dup"],
+                   "" if clean_manual else "（这次没清手工框）", tot["by_shape"]))
+            box.setDetailedText(body)
+            b_save = box.addButton("现在保存", QMessageBox.ButtonRole.AcceptRole)
+            b_jump = None
+            if tot.get("first") is not None and tot["first"] != self.page:
+                b_jump = box.addButton("跳到第 %s 页看看" % tot["first"],
+                                       QMessageBox.ButtonRole.ActionRole)
+            box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            hit = box.clickedButton()
+            if hit is b_save:
+                self.on_save_over()
+            elif b_jump is not None and hit is b_jump:
+                self.goto_page(tot["first"])
 
-        def on_clean_shapes(self, quiet=False):
+        def scan_clean(self, pages, on_step=None):
+            """只扫描不修改：返回 (只清模型框的统计, 连手工框一起清的统计)。
+
+            每项含 removed / pages / first / cur（当前页能删多少）。
+            """
+            a = {"removed": 0, "pages": 0, "first": None, "cur": 0}
+            b = {"removed": 0, "pages": 0, "first": None, "cur": 0}
+            for k, pg in enumerate(pages):
+                if on_step is not None and on_step(k, len(pages), pg) is False:
+                    break
+                pm = self._pm_of(pg)
+                if pm is None:
+                    continue
+                _k1, s1 = clean_shapes(pm.shapes, clean_manual=False)
+                _k2, s2 = clean_shapes(pm.shapes, clean_manual=True)
+                for d, s in ((a, s1), (b, s2)):
+                    if s["removed"]:
+                        d["removed"] += s["removed"]
+                        d["pages"] += 1
+                        if d["first"] is None:
+                            d["first"] = pg
+                        if pg == self.page:
+                            d["cur"] += s["removed"]
+            return a, b
+
+        def on_clean_shapes(self, quiet=False, clean_manual=None):
             """清掉当前页多余的框（只删模型画的，人工框不动）。"""
             if not self.pm:
                 return None
-            clean_manual = self._ask_clean_manual("清理多余框", "第 %d 页" % self.page)
             if clean_manual is None:
-                return None
+                clean_manual = self._ask_clean_manual("清理多余框", "第 %d 页" % self.page)
+                if clean_manual is None:
+                    return None
             return self.clean_pages([self.page], clean_manual, quiet=quiet)
 
-        def on_clean_shapes_all(self):
-            """整册清理：所有页跑一遍，整册算一步撤销。"""
+        def on_clean_shapes_all(self, quiet=False, clean_manual=None):
+            """整册清理：先扫描汇报能删多少，确认后逐页清，最后给"保存/跳转"。
+
+            clean_manual 给了就跳过所有弹窗（自检用），quiet=True 只跳过最后的结果框。
+            """
+            from PySide6.QtWidgets import QProgressDialog
             if not (self.pm and self.dbg):
                 return None
             pages = self.dbg.page_numbers()
-            clean_manual = self._ask_clean_manual(
-                "清理多余框（整册）", "整册 %d 页" % len(pages))
+            scan = {"removed": 0, "pages": 0, "first": None, "cur": 0, "locked": 0}
             if clean_manual is None:
-                return None
-            prog = QProgressDialog("正在清理整册多余框…", "取消", 0, len(pages), self)
-            prog.setWindowTitle("清理多余框（整册）")
-            prog.setMinimumDuration(0)
-            prog.setWindowModality(Qt.WindowModality.WindowModal)
+                prog = QProgressDialog("正在扫描整册多余框…", "取消", 0, len(pages), self)
+                prog.setWindowTitle("清理多余框（整册）")
+                prog.setMinimumDuration(0)
+                prog.setWindowModality(Qt.WindowModality.WindowModal)
+
+                def scan_step(k, total, pg):
+                    prog.setValue(k)
+                    prog.setLabelText("扫描第 %d 页（%d/%d）…" % (pg, k + 1, total))
+                    QApplication.processEvents()
+                    return not prog.wasCanceled()
+
+                try:
+                    sa, sb = self.scan_clean(pages, on_step=scan_step)
+                finally:
+                    prog.close()
+                if prog.wasCanceled():
+                    self.statusBar().showMessage("已取消扫描，什么都没改", 4000)
+                    return None
+                if not sa["removed"] and not sb["removed"]:
+                    QMessageBox.information(
+                        self, "清理多余框（整册）",
+                        "整册 %d 页扫完了，按现在的规则没有多余框可清。\n\n"
+                        "（只按「模型框之间的重复」算：手工框要么用「连手工框一起清」，"
+                        "要么本来就不重复；锁定的框一律不算。）" % len(pages))
+                    return None
+                box = QMessageBox(self)
+                box.setWindowTitle("清理多余框（整册）")
+                box.setIcon(QMessageBox.Icon.Question)
+                box.setText("整册 %d 页扫完了，要按哪种规则清？" % len(pages))
+                box.setInformativeText(
+                    "· 只清模型框：能删 %d 个（分布在 %d 页）\n"
+                    "· 连手工框一起清：能删 %d 个（分布在 %d 页）\n\n"
+                    "本页（第 %s 页）分别能删 %d 个 / %d 个。\n"
+                    "锁定的框一个都不动。清完可以用 Ctrl+Z 一次全撤销。"
+                    % (sa["removed"], sa["pages"], sb["removed"], sb["pages"],
+                       self.page, sa["cur"], sb["cur"]))
+                b_m = box.addButton("只清模型框", QMessageBox.ButtonRole.YesRole)
+                b_a = box.addButton("连手工框一起清", QMessageBox.ButtonRole.ActionRole)
+                box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+                box.setDefaultButton(b_m)
+                box.exec()
+                hit = box.clickedButton()
+                if hit is b_m:
+                    clean_manual = False
+                elif hit is b_a:
+                    clean_manual = True
+                else:
+                    self.statusBar().showMessage("已取消，什么都没改", 4000)
+                    return None
+
+            prog2 = QProgressDialog("正在清理整册多余框…", "取消", 0, len(pages), self)
+            prog2.setWindowTitle("清理多余框（整册）")
+            prog2.setMinimumDuration(0)
+            prog2.setWindowModality(Qt.WindowModality.WindowModal)
 
             def step(k, total, pg):
-                prog.setValue(k)
-                prog.setLabelText("第 %d 页（%d/%d）…" % (pg, k + 1, total))
+                prog2.setValue(k)
+                prog2.setLabelText("清理第 %d 页（%d/%d）…" % (pg, k + 1, total))
                 QApplication.processEvents()
-                return not prog.wasCanceled()
+                return not prog2.wasCanceled()
 
             try:
-                return self.clean_pages(pages, clean_manual, quiet=False, on_step=step)
+                tot, lines = self.clean_pages(pages, clean_manual,
+                                              quiet=True, on_step=step)
             finally:
-                prog.close()
+                prog2.close()
+            if prog2.wasCanceled():
+                self.statusBar().showMessage("整册清理被取消（已清的部分还可以 Ctrl+Z 撤销）", 6000)
+            if not quiet:
+                self._show_clean_result(tot, lines, clean_manual, len(pages))
+            return tot, lines
 
         def on_delete(self):
             if not self.pm:
@@ -5102,6 +5208,15 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                  tot["pages"], n_after_undo,
                  "通过" if (n_after_clean < n_before_clean
                             and n_after_undo == n_before_clean) else "不一致！"))
+        # 存盘再重读：清理必须真的落到文件里（"清理不生效"最容易卡在这一步）。
+        # 注意要放在撤销检查之后 —— 保存会清空撤销栈。
+        win.clean_pages(pgs_all, clean_manual=False, quiet=True)
+        dest_all = os.path.join(app_dir(), "smoke_clean_all.json")
+        win.do_save(dest_all, quiet=True)
+        n_saved = len(PageModel(DebugJson(dest_all), p_first).shapes)
+        print("   整册清理后存盘重读：第 %d 页 %d 个框（清理前 %d）  %s"
+              % (p_first, n_saved, n_before_clean,
+                 "通过" if n_saved < n_before_clean else "没写进去！"))
 
         # 在线更新：版本比较 + 仓库地址（不联网，纯逻辑）
         ok_ver = (parse_version("v0.6") > parse_version("v0.5")
@@ -5111,6 +5226,21 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         ok_repo = UPDATE_REPO.endswith("/LBD-Annotator")
         print("在线更新：版本比较 %s；检查的仓库 %s %s"
               % (ok_ver, UPDATE_REPO, "通过" if ok_repo else "写错了！"))
+
+        # 按钮级自检：真的走一遍"点按钮"的路径
+        # （QProgressDialog 漏 import 那种错，只有点了按钮才会炸，光测底层函数测不出来）
+        try:
+            n_before_btn = len(win.pm.shapes)
+            tot_btn, _ls = win.on_clean_shapes_all(quiet=True, clean_manual=False)
+            ok_btn = bool(tot_btn) and "removed" in tot_btn
+            print("点按钮路径：清理多余框(整册) 扫了 %d 页，删 %d 个；本页 %d -> %d  %s"
+                  % (len(win.dbg.page_numbers()), tot_btn["removed"] if ok_btn else -1,
+                     n_before_btn, len(win.pm.shapes), "通过" if ok_btn else "出错！"))
+            tot_one, _l1 = win.on_clean_shapes(quiet=True, clean_manual=False)
+            ok_one = bool(tot_one) and "removed" in tot_one
+            print("点按钮路径：清理多余框(本页) %s" % ("通过" if ok_one else "出错！"))
+        except Exception as e:                       # noqa: BLE001
+            print("点按钮路径：出错！%s: %s" % (type(e).__name__, e))
         return 0
     return app.exec()
 
