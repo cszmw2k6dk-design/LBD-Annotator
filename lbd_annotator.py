@@ -43,7 +43,7 @@ SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
-ANNOTATOR_VERSION = "0.13"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.14"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -173,6 +173,33 @@ def update_token(settings=None):
     if not tok:
         tok = windows_git_credential()
     return tok
+
+
+def peek_data_yaml(path):
+    """粗略读一下 data.yaml 的类别名和数据集根目录，返回 (names, path)。
+
+    训练前拿来给人核对用：如果读出来是 person/dog/horse 这种，就说明选错文件了
+    （ultralytics 的默认数据集 coco8 就是那些类别）。
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            txt = f.read()
+    except Exception:                          # noqa: BLE001
+        return [], ""
+    names = []
+    m = re.search(r"names\s*:\s*\[([^\]]*)\]", txt)
+    if m:
+        names = [s.strip().strip("'\"") for s in m.group(1).split(",") if s.strip()]
+    else:
+        blk = re.search(r"names\s*:\s*\n((?:[ \t]+\d+[ \t]*:[^\n]*\n?)+)", txt)
+        if blk:
+            names = [ln.split(":", 1)[1].strip().strip("'\"")
+                     for ln in blk.group(1).splitlines() if ":" in ln]
+    root = ""
+    mr = re.search(r"^[ \t]*path[ \t]*:[ \t]*(.+)$", txt, re.M)
+    if mr:
+        root = mr.group(1).strip().strip("'\"")
+    return names, root
 
 
 def find_pythons():
@@ -4539,25 +4566,58 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     lbl.setText("先选 data.yaml —— 就是「导出 YOLO 数据集…」生成的那个")
                     return
                 mdl = ed_model.currentText().strip() or "yolov8n.pt"
-                if os.path.sep in mdl or "/" in mdl:
-                    if not os.path.exists(mdl):
-                        lbl.setText("模型文件不存在：%s" % mdl)
-                        return
+                mdl_local = os.path.exists(mdl)
+                if (os.path.sep in mdl or "/" in mdl) and not mdl_local:
+                    lbl.setText("模型文件不存在：%s" % mdl)
+                    return
                 self.settings["train_model"] = mdl
                 save_settings(self.settings)
                 if chk_resume.isChecked():
+                    # 续训只能用那次训练的 last.pt —— 用别的（比如默认的 yolov8n.pt）
+                    # ultralytics 拿不到原来那次的设置，会按默认值跑 coco8（4 张示例图），
+                    # 结果就是"训练完了但学的是猫狗"。
+                    if not mdl_local:
+                        lbl.setText("续训要选那次训练留下的 last.pt（runs/detect/<名字>/"
+                                    "weights/last.pt），不能用 %s" % mdl)
+                        return
+                    if os.path.basename(mdl).lower() != "last.pt":
+                        QMessageBox.warning(
+                            self, "续训要选 last.pt",
+                            "续训（resume）只有那次训练留下的 weights/last.pt 才能接着跑，"
+                            "你现在选的是：\n%s\n\n"
+                            "用别的模型（比如默认的 yolov8n.pt、或者 best.pt）时，"
+                            "ultralytics 读不到「原来那次」的设置，会拿它自带的 coco8"
+                            "（4 张示例图：人/狗/马…）按默认参数跑一遍 —— "
+                            "看着像训练成功了，其实和你的数据无关。\n\n"
+                            "要接着自己的数据练，请：\n"
+                            "· 续训：选 runs/detect/<那次的名字>/weights/last.pt\n"
+                            "· 或取消勾选「续训」，用下面的 data.yaml + 模型正常开一轮"
+                            % mdl)
+                        return
                     code = ("from ultralytics import YOLO;"
                             "YOLO(r'%s').train(resume=True)" % mdl)
                     lbl.setText("续训：用 last.pt 接着原来那次跑"
                                 "（data/epochs 这些参数会被忽略）")
                 else:
+                    names, root = peek_data_yaml(d)
+                    ep, im = ed_ep.text().strip() or "20", ed_im.text().strip() or "1280"
+                    ba, dv = ed_ba.text().strip() or "4", ed_dv.text().strip() or "cpu"
+                    if QMessageBox.question(
+                            self, "开始训练前确认",
+                            "模型：%s%s\n数据：%s\n类别：%s\n"
+                            "轮数 %s　imgsz %s　batch %s　device %s\n\n开始训练吗？"
+                            % (mdl, "" if mdl_local else "（本地没有，会自动下载）", d,
+                               ("%d 类：%s" % (len(names), "、".join(names[:8])))
+                               if names else "（读不出类别名，自己确认一下这份 data.yaml）",
+                               ep, im, ba, dv),
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
+                        lbl.setText("已取消")
+                        return
                     code = ("from ultralytics import YOLO;"
                             "YOLO(r'%s').train(data=r'%s', imgsz=%s, epochs=%s, "
                             "batch=%s, device='%s')"
-                            % (mdl, d, ed_im.text().strip() or "1280",
-                               ed_ep.text().strip() or "20",
-                               ed_ba.text().strip() or "4",
-                               ed_dv.text().strip() or "cpu"))
+                            % (mdl, d, im, ep, ba, dv))
                 lbl.setText("训练已启动（日志在下面滚；权重在 runs/detect/train/weights/best.pt）")
                 run([p, "-c", code], "训练")
 
