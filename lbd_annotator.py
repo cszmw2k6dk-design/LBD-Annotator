@@ -42,8 +42,9 @@ OCR_SECTION = "ocr_node_name_results"
 SECTION_ORDER = (TRACKER_SECTION, BOX_SECTION, OCR_SECTION)
 DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
-DEFAULT_JSON = r"C:\Users\ZhaokeShi\OneDrive - Voltage, LLC\桌面\little-debug.json"
-ANNOTATOR_VERSION = "0.14"                      # 标注工具自己的版本号
+# 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
+DEFAULT_JSON = ""
+ANNOTATOR_VERSION = "0.15"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -173,6 +174,28 @@ def update_token(settings=None):
     if not tok:
         tok = windows_git_credential()
     return tok
+
+
+def parse_page_spec(text, available):
+    """把 "3-8,12" / "3，8" 这种页码写法解析成页号列表（只保留文档里真有的页）。
+
+    返回空列表 = 没指定有效页。页码用的是 JSON 里的页号。
+    """
+    avail = set(available)
+    out = set()
+    for part in re.split(r"[,，、;；\s]+", str(text or "").strip()):
+        if not part:
+            continue
+        m = re.match(r"^(\d+)\s*[-~－—]\s*(\d+)$", part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            for p in range(min(a, b), max(a, b) + 1):
+                if p in avail:
+                    out.add(p)
+            continue
+        if part.isdigit() and int(part) in avail:
+            out.add(int(part))
+    return sorted(out)
 
 
 def peek_data_yaml(path):
@@ -1123,7 +1146,7 @@ def xlsx_lbd_rows(path, sheet_name):
         return []
     order = sorted(cells_all)
     # 表头（C 列 "Item Code" / A 列 "LBD NO."）之后才开始算 LBD 行，
-    # 不然 "Lynx Plus 1.01" 这种标题行会被当成第一行
+    # 不然像 "XXX Plus 1.01" 这种标题行会被当成第一行
     start = 0
     for k, rn in enumerate(order):
         a = cells_all[rn].get("A", "")
@@ -1140,8 +1163,8 @@ def xlsx_lbd_rows(path, sheet_name):
         if c and rows:
             rows[-1][1].append(c)
     numbered = [_lbd_num_in(a) for a, _l in rows]
-    # 只要有一行 A 列写了 "LBD-15" 这种真编号，就按真编号走（South Platte）；
-    # 否则按"这个分表里的第几行"编号（Yellow Viking 的 "1.C.1" 这种）
+    # 只要有一行 A 列写了 "LBD-15" 这种真编号，就按真编号走；
+    # 否则按"这个分表里的第几行"编号（"1.C.1" 这种）
     use_num = any(n is not None for n in numbered)
     out = []
     k = 0
@@ -2848,6 +2871,16 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.btn_del = QPushButton("删除这个框（Delete）")
             self.btn_del.clicked.connect(self.on_delete)
             sl.addWidget(self.btn_del)
+            sl.addWidget(QLabel("———— 本页统计 ————"))
+            self.lbl_stats = QLabel("-")
+            self.lbl_stats.setWordWrap(True)
+            self.lbl_stats.setStyleSheet("color:#222;")
+            sl.addWidget(self.lbl_stats)
+            self.lbl_racks = QLabel("")
+            self.lbl_racks.setWordWrap(True)
+            self.lbl_racks.setTextFormat(Qt.TextFormat.PlainText)
+            self.lbl_racks.setStyleSheet("color:#444; font-size:11px;")
+            sl.addWidget(self.lbl_racks)
             sl.addStretch(1)
             side.setMaximumWidth(330)
 
@@ -3528,6 +3561,75 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             except Exception:
                 pass
 
+        # ---------------- 本页统计（右侧栏下半部分）
+        def page_rack_stats(self):
+            """本页按 LBD 汇总：每个 Node（阵列块）里套着几个支架、共几串。
+
+            判定方式：支架框的中心落在哪个 Node 框里，就算那个 LBD 的。
+            串数取「支架按长度分档」写进 raw.strings 的值；没分过档的就是 0。
+            返回 (每行明细, 合计)。
+            """
+            rows, tot = [], {"racks": 0, "strings": 0, "graded": 0}
+            if not self.pm:
+                return rows, tot
+            nodes = [s for s in self.pm.shapes if s.get("label") == "Node"]
+            racks = [s for s in self.pm.shapes if s.get("label") == "Tracker"]
+            tot["racks"] = len(racks)
+            for r in racks:
+                st = (r.get("raw") or {}).get("strings")
+                if isinstance(st, int) and st > 0:
+                    tot["strings"] += st
+                    tot["graded"] += 1
+            for nd in nodes:
+                b = nd.get("bbox")
+                if not b:
+                    continue
+                inside = []
+                for r in racks:
+                    rb = r.get("bbox")
+                    if not rb:
+                        continue
+                    cx, cy = (rb[0] + rb[2]) / 2.0, (rb[1] + rb[3]) / 2.0
+                    if b[0] <= cx <= b[2] and b[1] <= cy <= b[3]:
+                        inside.append(r)
+                if not inside:
+                    continue
+                st = sum((r.get("raw") or {}).get("strings") or 0 for r in inside)
+                rows.append(((nd.get("name") or "（没填名字）"), len(inside), st))
+            rows.sort(key=lambda x: str(x[0]))
+            return rows, tot
+
+        def update_sidebar_stats(self):
+            """右侧栏下半部分：本页各类框数量 + 按 LBD 的支架/串数汇总。"""
+            try:
+                if not (self.pm and self.dbg):
+                    self.lbl_stats.setText("-")
+                    self.lbl_racks.setText("")
+                    return
+                c = self.pm.counts()
+                locked = sum(1 for s in self.pm.shapes if s.get("locked"))
+                self.lbl_stats.setText(
+                    "本页：Tracker %d 个，Node %d 个%s"
+                    % (c["Tracker"], c["Node"], ("，锁定 %d" % locked) if locked else ""))
+                rows, tot = self.page_rack_stats()
+                if not tot["graded"]:
+                    self.lbl_racks.setText(
+                        "还没分档：点「支架按长度分档」之后，\n这里会按 LBD 列出各有多少串。")
+                    return
+                lines = ["按 LBD 汇总（本页）："]
+                for nm, n, st in rows[:30]:
+                    lines.append("  %s：%d 个支架%s"
+                                 % (nm, n, "，共 %d 串" % st if st else ""))
+                if len(rows) > 30:
+                    lines.append("  …还有 %d 个 LBD" % (len(rows) - 30))
+                lines.append("合计：%d 个支架，共 %d 串%s"
+                             % (tot["racks"], tot["strings"],
+                                "" if tot["graded"] == tot["racks"]
+                                else "（%d 个没分档）" % (tot["racks"] - tot["graded"])))
+                self.lbl_racks.setText("\n".join(lines))
+            except Exception:                      # noqa: BLE001
+                pass
+
         # ---------------- 锁定框
         def sync_lock_ui(self):
             """按当前选中状态刷新「锁定/解锁」按钮和侧栏那个勾。"""
@@ -3664,6 +3766,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 % MODE_TEXT.get(self.canvas.mode, self.canvas.mode))
             self.update_state_label()
             self.sync_lock_nodes_action()
+            self.update_sidebar_stats()
 
         def keyPressEvent(self, ev):
             k = ev.key()
@@ -4221,11 +4324,29 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             h2.addWidget(chk_clean)
             h2.addWidget(QLabel("范围"))
             cmb_scope = QComboBox()
-            cmb_scope.addItems(["本页", "整册"])
+            cmb_scope.addItems(["本页", "整册", "指定页码"])
             cmb_scope.setCurrentIndex(1 if whole else 0)
             h2.addWidget(cmb_scope)
+            ed_pages = QLineEdit()
+            ed_pages.setPlaceholderText("例：3-8,12（选「指定页码」时用）")
+            ed_pages.setMaximumWidth(200)
+            ed_pages.setEnabled(False)
+            ed_pages.setToolTip("只识别这几页；页码是 JSON 里的页号。"
+                                "支持 3-8 区间、逗号分隔，例如 3-8,12")
+            h2.addWidget(ed_pages)
+            cmb_scope.currentIndexChanged.connect(
+                lambda i: ed_pages.setEnabled(i == 2))
             h2.addStretch(1)
             v.addLayout(h2)
+            from PySide6.QtWidgets import QProgressBar
+            hp = QHBoxLayout()
+            lbl_prog = QLabel("识别进度：还没开始")
+            hp.addWidget(lbl_prog)
+            prog = QProgressBar()
+            prog.setRange(0, 100)
+            prog.setValue(0)
+            hp.addWidget(prog, 1)
+            v.addLayout(hp)
             log = QPlainTextEdit()
             log.setReadOnly(True)
             v.addWidget(log, 1)
@@ -4261,10 +4382,17 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             class _Sig(_QO):
                 res = _SIG(int, str, str)      # 页号, 图片路径, JSON 框
                 msg = _SIG(str)
+                prog = _SIG(int, int)          # 已完成页数, 总页数
 
             em = _Sig()
             em.msg.connect(lambda s: (log.appendPlainText(s),
                                       log.clear() if log.blockCount() > 3000 else None))
+            def _on_prog(done, total):
+                prog.setRange(0, max(1, total))
+                prog.setValue(done)
+                lbl_prog.setText("识别进度：%d/%d 页（%.0f%%）"
+                                 % (done, total, 100.0 * done / max(1, total)))
+            em.prog.connect(_on_prog)
             labels = ["Node", "Tracker", "Box"]
 
             def _apply(pg, img_path, js):
@@ -4340,16 +4468,26 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             em.res.connect(_apply)
 
             def work():
-                if cmb_scope.currentIndex() == 0:
+                idx = cmb_scope.currentIndex()
+                if idx == 0:
                     pages = [self.page]
-                else:
+                elif idx == 1:
                     # 整册 = 文档里的**所有页**（识别模型本来就是给"还没框的图"找框的，
                     # 不能只挑"已经画过 Node 的页"，否则一张没标过的图会显示 0 页）
                     pages = sorted(self.dbg.page_numbers())
+                else:
+                    pages = parse_page_spec(ed_pages.text(), self.dbg.page_numbers())
+                    if not pages:
+                        em.msg.emit("「指定页码」里没填有效的页号。例：3-8,12"
+                                    "（页码用 JSON 里的页号，整册是 %s~%s）"
+                                    % (self.dbg.page_numbers()[0],
+                                       self.dbg.page_numbers()[-1]))
+                        return
                 model = ed_m.text().strip()
                 conf = ed_c.text().strip() or "0.25"
                 imgsz = ed_i.text().strip() or "1920"
                 em.msg.emit("开始：%d 页，模型 %s" % (len(pages), os.path.basename(model)))
+                em.prog.emit(0, len(pages))
                 for n, pg in enumerate(pages):
                     em.msg.emit("[%d/%d] 第 %s 页 …" % (n + 1, len(pages), pg))
                     try:
@@ -4370,6 +4508,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         em.res.emit(pg, img_in, js)
                     except Exception as e:
                         em.msg.emit("    第 %s 页出错：%s" % (pg, e))
+                    em.prog.emit(n + 1, len(pages))
                 em.msg.emit("识别结束")
 
             def do_run():
@@ -5507,6 +5646,31 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         ok_repo = UPDATE_REPO.endswith("/LBD-Annotator")
         print("在线更新：版本比较 %s；检查的仓库 %s %s"
               % (ok_ver, UPDATE_REPO, "通过" if ok_repo else "写错了！"))
+
+        # 识别页码解析 + 右侧栏统计（本页 Tracker 数 / 按 LBD 的串数汇总）
+        ok_spec = (parse_page_spec("3-5,7", [1, 2, 3, 4, 5, 6, 7]) == [3, 4, 5, 7]
+                   and parse_page_spec("x", [1, 2]) == []
+                   and parse_page_spec("2-3", [1, 5]) == [])
+        print("识别页码解析（3-5,7 / 无效输入）: %s"
+              % ("通过" if ok_spec else "不一致！"))
+        win.goto_page(pgs_all[0])
+        _nodes = [s for s in win.pm.shapes if s["label"] == "Node"]
+        _racks = [s for s in win.pm.shapes if s["label"] == "Tracker"]
+        if _nodes and _racks:
+            _nd = _nodes[0]
+            _nd["name"] = "TEST-LBD-1"
+            _racks[0]["bbox"] = [(_nd["bbox"][0] + _nd["bbox"][2]) / 2 - 5,
+                                 (_nd["bbox"][1] + _nd["bbox"][3]) / 2 - 5,
+                                 (_nd["bbox"][0] + _nd["bbox"][2]) / 2 + 5,
+                                 (_nd["bbox"][1] + _nd["bbox"][3]) / 2 + 5]
+            _racks[0].setdefault("raw", {})["strings"] = 3
+            _rows, _tot = win.page_rack_stats()
+            _hit = [r for r in _rows if r[0] == "TEST-LBD-1"]
+            print("侧栏统计：本页 Tracker %d 个；TEST-LBD-1 -> %s（应为 1 个支架 3 串）  %s"
+                  % (len(_racks), _hit[0][1:] if _hit else "没算到",
+                     "通过" if (_hit and _hit[0][1] == 1 and _hit[0][2] == 3) else "不一致！"))
+        else:
+            print("侧栏统计：本页没有 Node/Tracker，跳过")
 
         # 按钮级自检：真的走一遍"点按钮"的路径
         # （QProgressDialog 漏 import 那种错，只有点了按钮才会炸，光测底层函数测不出来）
