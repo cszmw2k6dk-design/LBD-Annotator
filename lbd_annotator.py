@@ -44,7 +44,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.15"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.16"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -2767,7 +2767,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             tb.addAction(a)
             a = QAction("补全编号(整册)", self)
             a.setToolTip("整册逐页补：框内文字取号；取不到的按标签表顺序补（标黄）；"
-                         "再取不到标红等人手填")
+                         "再取不到标红等人手填。\n"
+                         "没选标签表也能跑：那就只用框内文字取号，号码不跟表核对")
             a.triggered.connect(lambda: self.on_autofill(True))
             tb.addAction(a)
             from PySide6.QtWidgets import QCheckBox
@@ -4077,10 +4078,20 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 self.statusBar().showMessage("正在补第 %d 页（Node %d 个）…" % (self.page, n_node))
                 QApplication.processEvents()
             sheets, rows_of = self._sheet_rows()
+            text_only = False
             if not sheets:
-                QMessageBox.information(self, "缺标签表",
-                                        "先点工具栏「选标签表…」选上 LBD 标签表(xlsx)。")
-                return
+                # 没选标签表也能干：只用框内文字取号（号码不跟表核对）
+                if QMessageBox.question(
+                        self, "没选标签表",
+                        "没有选 LBD 标签表(xlsx)。\n\n"
+                        "· 是 —— 只用「框内文字」取号：框里印了编号就用它，"
+                        "框里没印号的留空标红，不按标签表顺序推。\n"
+                        "· 否 —— 先点工具栏「选标签表…」选一个"
+                        "（那样还能用表里的号按顺序补、并和表核对）。",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
+                    return
+                text_only = True
             if not self.pdf or not os.path.exists(self.pdf):
                 QMessageBox.information(
                     self, "缺 PDF",
@@ -4135,8 +4146,10 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     by_order = sheets[idx] if 0 <= idx < len(sheets) else ""
                     # 直接标 PDF 时没有"图纸顺序"可依，就用页面上印的分表名；
                     # 识别结果 JSON 还是按"第几页 = 第几个分表"（和主程序一致）。
-                    sheet = (hit or by_order) if blank else by_order
-                    num_set = {n for n, _l in (rows_of(sheet) if sheet else [])}
+                    # 没选标签表时也只能靠页面上印的名字（否则名字里会缺 INV 前缀）
+                    sheet = (hit or by_order) if (blank or text_only) else by_order
+                    num_set = (set() if text_only
+                               else {n for n, _l in (rows_of(sheet) if sheet else [])})
                     st = autofill_shapes(pm.shapes, items, sheet, num_set,
                                          pm.width, pm.height)
                     pm.dirty = True
@@ -4175,6 +4188,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     % (n_ok, n_auto, n_miss, n_skip,
                        ("；锁定的 %d 个没动" % n_locked) if n_locked else "",
                        len(check)))
+            if text_only:
+                head = ("【这次没选标签表】名字全部来自框内文字，"
+                        "号码没有和标签表核对过 —— 请抽几页确认一下。\n\n") + head
             if not whole:
                 n_node = sum(1 for s in self.pm.shapes if s.get("label") == "Node")
                 head = ("第 %d 页（Node 框 %d 个）\n" % (self.page, n_node)) + head
@@ -5722,16 +5738,16 @@ def autofill_run(json_path, pdf_path, xlsx_path, out_path=None, only_page=None,
     跟界面上「补全编号」用的是同一套函数，方便先拿真实文件核对。
     """
     dbg = DebugJson(json_path)
-    sheets = xlsx_sheet_names(xlsx_path)
+    sheets = xlsx_sheet_names(xlsx_path) if (xlsx_path and os.path.exists(xlsx_path)) else []
     if not sheets:
-        print("标签表里读不到分表名：%s" % xlsx_path)
-        return 2
+        # 没给标签表（或表读不出来）：只用框内文字取号，号码不跟表核对
+        print("没给标签表 —— 只用框内文字取号（框里没印号的会留空）")
     cache = {}
 
     def rows_of(nm):
         if nm not in cache:
             try:
-                cache[nm] = xlsx_lbd_rows(xlsx_path, nm)
+                cache[nm] = xlsx_lbd_rows(xlsx_path, nm) if sheets else []
             except Exception as e:
                 print("  读分表 %s 失败：%s" % (nm, e))
                 cache[nm] = []
@@ -5765,6 +5781,9 @@ def autofill_run(json_path, pdf_path, xlsx_path, out_path=None, only_page=None,
                     s["_check"] = False
         items = ptext.items(pg)
         hit, _cnt = page_sheet_by_text(items, sheets)
+        if not sheets and hit:
+            # 没给标签表：分表名就用页面上印的（这样名字里还带 INV 前缀）
+            sheet = hit
         st = autofill_shapes(pm.shapes, items, sheet, num_set, pm.width, pm.height)
         if csv_path:
             rr, _dry = check_rows(pm.shapes, items, sheet, num_set, pm.width, pm.height)
@@ -5845,9 +5864,9 @@ def main():
         src = a.json or DEFAULT_JSON
         pdf = a.pdf or str(load_settings().get("pdf") or "")
         xl = a.xlsx or str(load_settings().get("xlsx") or "")
-        if not (src and os.path.exists(src) and pdf and os.path.exists(pdf)
-                and xl and os.path.exists(xl)):
-            print("--autofill 需要：JSON 路径 + --pdf + --xlsx（都要存在）")
+        # 标签表可以不给：不给就只用框内文字取号（号码不跟表核对）
+        if not (src and os.path.exists(src) and pdf and os.path.exists(pdf)):
+            print("--autofill 需要：JSON 路径 + --pdf（--xlsx 可选）")
             return 2
         return autofill_run(src, pdf, xl, a.out, a.page, a.force, a.csv)
     if a.selftest:
