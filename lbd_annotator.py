@@ -44,7 +44,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.17"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.18"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -2650,6 +2650,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.settings = load_settings()
             # 不读"上次的 PDF"：路径不落盘，每次都是干净开局（要 PDF 自己点「选 PDF…」）
             self.pdf = ""
+            self._ptext = None          # PDF 文字层缓存（换 PDF 时要清掉）
             self.dpi = int(self.settings.get("dpi") or 0)
             self.xlsx = self.settings.get("xlsx") or ""
             self._sheet_cache = None
@@ -2921,6 +2922,13 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.lbl_racks.setTextFormat(Qt.TextFormat.PlainText)
             self.lbl_racks.setStyleSheet("color:#444; font-size:11px;")
             sl.addWidget(self.lbl_racks)
+            self.lbl_boxtext = QLabel("")
+            self.lbl_boxtext.setWordWrap(True)
+            self.lbl_boxtext.setTextFormat(Qt.TextFormat.PlainText)
+            self.lbl_boxtext.setStyleSheet("color:#064; font-size:11px;")
+            self.lbl_boxtext.setToolTip("选中一个框，这里列出 PDF 文字层里落在它里面"
+                                        "（含略微超出边缘）的全部文字，按从上到下、从左到右排。")
+            sl.addWidget(self.lbl_boxtext)
             sl.addStretch(1)
             side.setMaximumWidth(330)
 
@@ -2981,6 +2989,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 return
             self.dbg = doc
             self.pdf = p
+            self._ptext = None
             self.update_pdf_button()
             self.edited.clear()
             self.undo.clear()
@@ -3040,6 +3049,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     self.pdf = better
             if not self.pdf:
                 self.pdf = guess_pdf(path)
+            self._ptext = None
             if self.pdf:
                 self.update_pdf_button()
             self.cmb_page.blockSignals(True)
@@ -3175,6 +3185,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             if not p:
                 return
             self.pdf = p
+            self._ptext = None
             if self.dpi <= 0:
                 # 底图还停在内嵌图的话，换 PDF 看不出任何变化，直接切到 250 DPI
                 self.dpi = 250
@@ -3602,6 +3613,36 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 pass
 
         # ---------------- 本页统计（右侧栏下半部分）
+        def page_text_items(self, page=None):
+            """这一页的 PDF 文字块（懒加载 + 按页缓存；没选 PDF 就返回空）。"""
+            if not (self.pdf and os.path.exists(self.pdf)):
+                return []
+            try:
+                if self._ptext is None:
+                    self._ptext = PdfText(self.pdf)
+                return self._ptext.items(int(page if page is not None else self.page))
+            except Exception:                      # noqa: BLE001
+                return []
+
+        def box_texts_sorted(self, shape, items, width, height, tol_ratio=0.006):
+            """框里（含略微超出边缘）的**全部文字**，按 从上到下、从左到右 排好。"""
+            if not (shape and items):
+                return []
+            b = shape.get("bbox")
+            if not b:
+                return []
+            tol = max(6.0, float(tol_ratio) * max(width or 1, height or 1))
+            out = []
+            for it in items:
+                txt = (it[0] or "").strip()
+                if not txt:
+                    continue
+                px, py = it[1] * (width or 1), (1.0 - it[2]) * (height or 1)
+                if _box_dist(b, px, py) <= tol:
+                    out.append((round(py, 1), round(px, 1), txt))
+            out.sort()
+            return [t for _y, _x, t in out]
+
         def page_rack_stats(self):
             """本页按 LBD 汇总：每个 Node（阵列块）里套着几个支架、共几串。
 
@@ -3667,6 +3708,24 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                 "" if tot["graded"] == tot["racks"]
                                 else "（%d 个没分档）" % (tot["racks"] - tot["graded"])))
                 self.lbl_racks.setText("\n".join(lines))
+            except Exception:                      # noqa: BLE001
+                pass
+            # 选中的框里到底印了哪些字（全部文字，不只编号）
+            try:
+                it = self.current_item()
+                if it is None:
+                    self.lbl_boxtext.setText("")
+                    return
+                items = self.page_text_items()
+                if not items:
+                    self.lbl_boxtext.setText("框内文字：（读不到 PDF 文字层 —— 没选 PDF，"
+                                             "或者这份图纸是扫描图/文字已转曲）")
+                    return
+                txts = self.box_texts_sorted(it.shape_data, items,
+                                             self.pm.width, self.pm.height)
+                self.lbl_boxtext.setText(
+                    "框内文字（%d 条）：\n%s" % (len(txts), "\n".join(txts[:20]))
+                    if txts else "框内文字：（这个框里没读到文字）")
             except Exception:                      # noqa: BLE001
                 pass
 
@@ -5318,16 +5377,22 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     num_set = {n for n, _l in (rows_of(sheet) if sheet else [])}
                     rr, _dry = check_rows(pm.shapes, items, sheet, num_set,
                                           pm.width, pm.height)
+                    # 每个框里到底印了哪些字（全部文字，不只编号）—— 给人在 Excel 里核
+                    box_txt = {i: self.box_texts_sorted(s, items, pm.width, pm.height)
+                               for i, s in enumerate(pm.shapes)
+                               if s.get("label") == "Node"}
                     for r in rr:
                         r["page"] = pg
                         r["sheet"] = sheet
+                        r["boxtext"] = " | ".join(box_txt.get(r.get("ix"), []))
                         rows.append(r)
             finally:
                 prog.close()
-            cols = ["page", "sheet", "ix", "cx", "cy", "now", "cand", "sug", "src"]
+            cols = ["page", "sheet", "ix", "cx", "cy", "now", "cand", "sug", "src",
+                    "boxtext"]
             head = {"page": "页号", "sheet": "分表", "ix": "框序号", "cx": "中心X",
                     "cy": "中心Y", "now": "现有名字", "cand": "框内候选(号@距离px)",
-                    "sug": "建议名字", "src": "建议来源"}
+                    "sug": "建议名字", "src": "建议来源", "boxtext": "框内全部文字"}
             try:
                 with open(path, "w", encoding="utf-8-sig", newline="") as f:
                     w = csv.DictWriter(f, fieldnames=cols)
