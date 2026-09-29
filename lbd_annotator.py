@@ -44,7 +44,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.16"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.17"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -1197,6 +1197,41 @@ def _lbd_num_in(text):
     return int(m.group(1)) if m else None
 
 
+def _clean_lbd_label(txt):
+    """框里那串编号：去掉分表名和 LBD 标记，**保留前面的序号段**。
+
+    '1.01.1.C.5'        -> '1.01.1.C.5'
+    'INV31B102_LBD_07'  -> '07'
+    'LBD 1.01.1.C.5'    -> '1.01.1.C.5'
+    """
+    t = re.sub(r"\s+", "", str(txt or ""))
+    t = re.sub(r"INV\s*\d+\s*[A-Za-z]\s*\d+", "", t, flags=re.I)
+    m = re.search(r"LBD[\s_\-–—:]*([0-9][0-9A-Za-z._\-]*)", t, re.I)
+    if m:
+        t = m.group(1)
+    t = re.split(r"[()\[\]{}]", t)[0]          # 后面跟的 "(2)" 这种注解不要
+    return t.strip("-_ .|()[]#")
+
+
+def _name_num(name):
+    """名字里的"号"：取最后一段数字。'…-LBD-1.01.1.C.5' -> 5，'…-LBD-07' -> 7。"""
+    segs = re.findall(r"\d+", str(name or ""))
+    return int(segs[-1]) if segs else None
+
+
+def _lbd_name(sheet, label, num):
+    """拼 LBD 名字：<分表名>-LBD-<编号>。
+
+    整段编号原样用（1.01.1.C.5）；只有一段数字就补成两位（07）。
+    """
+    lab = str(label or "").strip("-_ .|()[]#")
+    if not lab and num is not None:
+        lab = "%02d" % int(num)
+    elif re.fullmatch(r"0*\d{1,3}", lab):
+        lab = "%02d" % int(lab)
+    return ("%s-LBD-%s" % (sheet, lab)) if sheet else ("LBD-%s" % lab)
+
+
 def _inv_in(text):
     """文字里自带的 INV 分表名（如 INV31B102_LBD_07 -> INV31B102），没有返回 None。"""
     m = INV_RE.search(str(text or ""))
@@ -1256,7 +1291,9 @@ def _flag_suspicious(shapes):
     for s in shapes:
         if s.get("label") != "Node":
             continue
-        n = _lbd_num_in(s.get("name") or "")
+        # 名字里的"号"= 最后一段数字：既能认 "…-LBD-07"（7），
+        # 也能认 "…-LBD-1.01.1.C.5"（5）—— 跳号检查就靠它
+        n = _name_num(s.get("name") or "")
         if n is None:
             continue
         cx, cy = _box_center(s["bbox"])
@@ -1521,7 +1558,7 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             continue
         old = got.get(inside)
         if old is None or 0.0 < old[0]:
-            got[inside] = (0.0, num)
+            got[inside] = (0.0, num, _txt)
     for px, py, num in left_c:
         best, bd = None, None
         for i, s in todo:
@@ -1532,19 +1569,21 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
                 best, bd = i, d
         if best is None or bd is None or bd > tol:
             continue
-        got[best] = (bd, num)
+        got[best] = (bd, num, txt)
 
     # 3) 抢号：同一个号只留最近的那个框
-    keep = {}
-    for i, (d, num) in sorted(got.items(), key=lambda kv: kv[1][0]):
+    keep, keep_lab = {}, {}
+    for i, (d, num, txt) in sorted(got.items(), key=lambda kv: kv[1][0]):
         if num in keep:
             continue
         keep[i] = num
+        keep_lab[i] = _clean_lbd_label(txt)
 
     used = set(keep.values())
     for i, s in todo:
         if i in keep:
-            s["name"] = "%s-LBD-%02d" % (sheet, keep[i]) if sheet else "LBD-%02d" % keep[i]
+            # 编号整段带上（框里印的是 1.01.1.C.5 就写 1.01.1.C.5，不是只留 5）
+            s["name"] = _lbd_name(sheet, keep_lab.get(i, ""), keep[i])
             s["_auto"] = False
             stat["filled"] += 1
 
@@ -1576,7 +1615,7 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
                 continue
             seen_num.add(val)
             s = dict(todo)[i]
-            s["name"] = "%s-LBD-%02d" % (sheet, val) if sheet else "LBD-%02d" % val
+            s["name"] = _lbd_name(sheet, "", val)
             s["_auto"] = False
             s["_check"] = False
             keep[i] = val
@@ -1626,7 +1665,7 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             if val in used:
                 continue
             s = dict(todo)[i]
-            s["name"] = "%s-LBD-%02d" % (sheet, val) if sheet else "LBD-%02d" % val
+            s["name"] = _lbd_name(sheet, _clean_lbd_label(txt), val)
             s["_auto"] = False
             s["_check"] = False
             keep[i] = val
@@ -1646,7 +1685,7 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             for _cy, _cx, i, s in row:
                 if k >= len(free):
                     break
-                s["name"] = "%s-LBD-%02d" % (sheet, free[k])
+                s["name"] = _lbd_name(sheet, "", free[k])
                 s["_auto"] = True
                 stat["auto"] += 1
                 k += 1
