@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.30"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.31"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -3264,8 +3264,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a.triggered.connect(lambda _c=False: self.on_ocr_read(True))
             menu_more.addSeparator()
             self.chk_force = QCheckBox("重算(覆盖已有名字)")
-            self.chk_force.setToolTip("勾上：已经有名字的框也重算一遍（识别给的名字不对时用这个）\n"
-                                      "只影响上面那条「补全编号」；「自动补编号」本身一律重算")
+            self.chk_force.setToolTip(
+                "勾上 = 已有名字也清掉、重新识别一遍重新填（位置也会重算）。\n"
+                "· 重算后没填回来的框，原来的名字会自动还回去，不会把好名字弄丢\n"
+                "· 不勾 → 名字不动，只把缺的编号位置补上\n"
+                "「补全编号」和「自动补编号」都认这个勾。")
             self.chk_force.setChecked(bool(self.settings.get("force")))
             wa = QWidgetAction(menu_more)
             wa.setDefaultWidget(self.chk_force)
@@ -4895,6 +4898,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             # 这样只有文字层能搞定的图纸，压根不会去查/装 OCR 组件。
             pyp = str(self.settings.get("python") or "")
             ocr_ready = {"v": None}
+            # 「重算(覆盖已有名字)」勾选框：勾上 = 已有名字也清掉重新填
+            try:
+                force_names = bool(self.chk_force.isChecked())
+            except Exception:
+                force_names = False
 
             def ensure_ocr():
                 """真要 OCR 了才查 Python / rapidocr —— 只有文字层的图纸不用装任何东西。"""
@@ -4986,18 +4994,33 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         except Exception:
                             items = []
                     if items:
-                        for s in pm.shapes:             # 不是规范编号的名字当作没名字，重算
-                            if (s.get("label") == "Node" and not s.get("locked")
-                                    and not _full_lbd_name(s.get("name"))):
-                                if (s.get("name") or "").strip():
-                                    touched = True
-                                s["name"] = ""
-                                s["_auto"] = False
-                                s["_check"] = False
-                                s["_miss"] = False
+                        # 勾了「重算」-> 已有名字也清掉重填；没勾 -> 只把"不是规范编号"
+                        # 的名字清掉（规范名字留着，缺位置的话下面会补上）
+                        cleared = {}
+                        for si, s in enumerate(pm.shapes):
+                            if s.get("label") != "Node" or s.get("locked"):
+                                continue
+                            nm = (s.get("name") or "").strip()
+                            if not (force_names or not _full_lbd_name(nm)):
+                                continue
+                            if nm:
+                                touched = True
+                                cleared[si] = nm
+                            s["name"] = ""
+                            s["_auto"] = False
+                            s["_check"] = False
+                            s["_miss"] = False
                         st0 = autofill_shapes(pm.shapes, items,
                                               page_sheet_by_text(items, [])[0] or "",
                                               set(), pm.width, pm.height)
+                        # 重算没填回来的，把原来的名字还回去 —— 重算绝不能把好名字弄丢
+                        for si, old in cleared.items():
+                            s = pm.shapes[si]
+                            if not (s.get("name") or "").strip():
+                                s["name"] = old
+                                s["_auto"] = False
+                                s["_miss"] = False
+                                stat["restored"] = stat.get("restored", 0) + 1
                         if st0.get("filled") or st0.get("pos_added"):
                             touched = True
                             stat["text"] += st0["filled"]
@@ -5138,6 +5161,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 if stat.get("no_python"):
                     text_msg += ("⚠ 有 %d 个框本来要 OCR，但没选 Python / 没装 OCR 组件，"
                                  "这次跳过了。\n" % stat["no_python"])
+                if force_names:
+                    text_msg += "（勾了「重算」：已有名字已清掉重填）"
+                    if stat.get("restored"):
+                        text_msg += "，其中 %d 个没填回来、已还原原来的名字" % stat["restored"]
+                    text_msg += "\n"
                 QMessageBox.information(
                     self, "自动补编号",
                     text_msg + "支架框（Tracker）一个没读、没写名字；锁定的框也没动。"
