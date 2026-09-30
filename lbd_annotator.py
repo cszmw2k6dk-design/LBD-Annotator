@@ -44,7 +44,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.22"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.23"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -1353,6 +1353,15 @@ def ocr_text_to_name(txt):
     return "", "noise"
 
 
+def _full_lbd_name(txt):
+    """文字里带整段编号（INV01A01-LBD-01）就把它原样当名字用；没有返回 None。
+
+    文字层里这条文字本身就是"分表+编号"的完整写法，比事后拿分表名拼一遍更靠得住。
+    """
+    nm, kind = ocr_text_to_name(txt)
+    return nm if kind == "ok" else None
+
+
 def _name_num(name):
     """名字里的"号"：取最后一段数字。'…-LBD-1.01.1.C.5' -> 5，'…-LBD-07' -> 7。"""
     segs = re.findall(r"\d+", str(name or ""))
@@ -1580,7 +1589,7 @@ def _page_candidates(text_items, sheet, num_set, width, height):
     裸数字候选：整条文字就是个号（"07"），有些图框里只印这个，没有 "LBD" 字样 —
             这条通道以前没有，所以"每个框里都有号、有的却取不到"。
     """
-    raw, bare, wrong = [], [], 0
+    raw, full, bare, wrong = [], [], [], 0
     for it in text_items:
         num = _lbd_num_in(it[0])
         inv = _inv_in(it[0])
@@ -1589,6 +1598,12 @@ def _page_candidates(text_items, sheet, num_set, width, height):
             continue
         px = it[1] * width
         py = (1.0 - it[2]) * height
+        # 整段编号（INV01A01-LBD-01）单独归一类：这种文字本身就把分表和号写全了，
+        # 绝不能当"图例/引线名单"丢掉 —— 用户那本 Steel River 上，全页 20 个编号
+        # 就是被 _drop_legend 当图例清掉，然后兜底抓了旁边的 "MV1A" 当编号。
+        if _full_lbd_name(it[0]):
+            full.append((px, py, num, it[0]))
+            continue
         if num is not None:
             if sheet and num_set and num not in num_set:
                 continue
@@ -1597,7 +1612,7 @@ def _page_candidates(text_items, sheet, num_set, width, height):
             m = BARE_NUM_RE.match(it[0].strip())
             if m:
                 bare.append((px, py, int(m.group(1)), it[0]))
-    return _drop_legend(raw, height), bare, wrong
+    return full + _drop_legend(raw, height), bare, wrong
 
 
 def _box_texts(shapes, text_items, width, height, tol_ratio=0.006):
@@ -1782,18 +1797,23 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
         got[best] = (bd, num, txt)
 
     # 3) 抢号：同一个号只留最近的那个框
-    keep, keep_lab = {}, {}
+    keep, keep_lab, full_name = {}, {}, {}
     for i, (d, num, txt) in sorted(got.items(), key=lambda kv: kv[1][0]):
         if num in keep:
             continue
         keep[i] = num
         keep_lab[i] = _clean_lbd_label(txt)
+        nm = _full_lbd_name(txt)          # 整段编号（INV01A01-LBD-01）就原样用
+        if nm:
+            full_name[i] = nm
 
     used = set(keep.values())
     for i, s in todo:
         if i in keep:
+            # 文字层里本身就是整段编号（INV01A01-LBD-01）-> 原样用，别拿分表名重拼
             # 编号整段带上（框里印的是 1.01.1.C.5 就写 1.01.1.C.5，不是只留 5）
-            s["name"] = _lbd_name(sheet, keep_lab.get(i, ""), keep[i])
+            s["name"] = (full_name.get(i)
+                         or _lbd_name(sheet, keep_lab.get(i, ""), keep[i]))
             s["_auto"] = False
             stat["filled"] += 1
 
@@ -1851,6 +1871,12 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
                 segs = [int(g) for g in re.findall(r"\d{1,3}", t2)]
                 if not segs:
                     continue
+                # 旁边那些旁注（"MV1A"、"TCH, TYP."、"LBD CLUSTER, TYP."）不是编号：
+                # 以前会拿它们里的数字硬凑一个名字（用户看到 "LBD-MV1A" 就是这么来的）
+                nm_ok, kind = ocr_text_to_name(txt)
+                if kind == "noise" and not BARE_NUM_RE.match(txt.strip()):
+                    stat["dropped"] = stat.get("dropped", 0) + 1
+                    continue
                 val = None
                 for v in reversed(segs):
                     if not sheet or not num_set or v in num_set:
@@ -1871,11 +1897,15 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
                 # -> 过滤掉，不猜号
                 stat["dropped"] = stat.get("dropped", 0) + 1
                 continue
-            flag, _d, val, _txt = pref[0]
+            flag, _d, val, pick_txt = pref[0]
             if val in used:
                 continue
             s = dict(todo)[i]
-            s["name"] = _lbd_name(sheet, _clean_lbd_label(txt), val)
+            # 注意：只能用"挑中的那条文字"（pick_txt）拼名字。
+            # 原来这里用的是外层循环残留的 txt，于是框里明明写着 INV01A01-LBD-06，
+            # 名字却被拼成框边那条旁注（"LBD-MV1A"）—— 用户看到的就是这个。
+            s["name"] = (_full_lbd_name(pick_txt)
+                         or _lbd_name(sheet, _clean_lbd_label(pick_txt), val))
             s["_auto"] = False
             s["_check"] = False
             keep[i] = val
