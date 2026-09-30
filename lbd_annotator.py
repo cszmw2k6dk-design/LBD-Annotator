@@ -44,7 +44,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.18"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.19"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -174,6 +174,73 @@ def update_token(settings=None):
     if not tok:
         tok = windows_git_credential()
     return tok
+
+
+OCR_BOX_SCRIPT = r'''
+import json, os, sys
+from PIL import Image
+from rapidocr_onnxruntime import RapidOCR
+
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+img = Image.open(cfg["img"]).convert("RGB")
+sx = img.width / float(cfg.get("page_w") or img.width)
+sy = img.height / float(cfg.get("page_h") or img.height)
+crops = []
+for b in cfg["boxes"]:
+    x1, y1, x2, y2 = b["bbox"]
+    X1, Y1, X2, Y2 = x1 * sx, y1 * sy, x2 * sx, y2 * sy
+    w, h = max(1.0, X2 - X1), max(1.0, Y2 - Y1)
+    mx, my = w * 0.15 + 2, h * 0.10 + 2
+    box = (max(0, int(X1 - mx)), max(0, int(Y1 - my)),
+           min(img.width, int(X2 + mx)), min(img.height, int(Y2 + my)))
+    c = img.crop(box)
+    if c.width < 8 or c.height < 8:
+        continue
+    if c.height > c.width * 1.15:            # 竖排：转成横的（180 度交给角度分类器）
+        c = c.rotate(90, expand=True)
+    if min(c.size) < 40:                     # 太小就放大，OCR 才认得出
+        z = max(2, int(40 / max(1, min(c.size))) + 1)
+        c = c.resize((c.width * z, c.height * z), Image.LANCZOS)
+    crops.append((b, c))
+
+groups, cur = [], []
+for b, c in crops:                           # 每 30 块拼一条长图，一次 OCR 全读
+    cur.append((b, c))
+    if len(cur) >= 30:
+        groups.append(cur)
+        cur = []
+if cur:
+    groups.append(cur)
+
+eng = RapidOCR()
+out = {}
+for grp in groups:
+    W = max(c.width for _b, c in grp) + 24
+    H = sum(c.height + 12 for _b, c in grp) + 12
+    sheet = Image.new("RGB", (W, H), (255, 255, 255))
+    ys, y = {}, 12
+    for b, c in grp:
+        sheet.paste(c, (12, y))
+        ys[b["ix"]] = (y, y + c.height)
+        y += c.height + 12
+    tmp = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "_ocr_sheet.png")
+    sheet.save(tmp)
+    res, _el = eng(tmp)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    for box, t, s in (res or []):
+        yy = (min(p[1] for p in box) + max(p[1] for p in box)) / 2.0
+        for ix, (a, b2) in ys.items():
+            if a - 4 <= yy <= b2 + 4:
+                old = out.get(ix)
+                if old is None or float(s) > old[1]:
+                    out[ix] = (t, float(s))
+                break
+print("@@" + json.dumps([{"ix": k, "text": v[0], "score": v[1]}
+                         for k, v in sorted(out.items())], ensure_ascii=False))
+'''
 
 
 def parse_page_spec(text, available):
@@ -2841,6 +2908,16 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a.setToolTip("同上，但范围默认选好「整册」：整本图纸逐页跑模型，自动把框画上来")
             a.triggered.connect(lambda _c=False: self.on_ai_detect(True))
             tb.addAction(a)
+            a = QAction("OCR 读框内文字(本页)", self)
+            a.setToolTip("用 OCR 读每个框（Node/Tracker）里的文字 —— 图纸里的字被转成矢量轮廓、\n"
+                         "没有文字层时用这个；竖排标签也能读。\n"
+                         "需要 Python 环境里装 rapidocr-onnxruntime（没装会问你要不要装）。")
+            a.triggered.connect(lambda: self.on_ocr_read(False))
+            tb.addAction(a)
+            a = QAction("OCR 读框内文字(整册)", self)
+            a.setToolTip("同上，整册逐页跑（有进度提示，可直接 Ctrl+Z 撤销）")
+            a.triggered.connect(lambda: self.on_ocr_read(True))
+            tb.addAction(a)
             tb.addWidget(QLabel("  名字 "))
             self.cmb_name = QComboBox()
             # (显示方式, 字号, 只画选中的那个)
@@ -4389,6 +4466,127 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             except Exception:
                 import traceback
                 QMessageBox.critical(self, "识别面板出错（把这段发我）", traceback.format_exc())
+
+        # ---------------- OCR：读框里的文字（图纸里那些字是矢量轮廓时的兜底）
+        def on_ocr_read(self, whole=False):
+            """用 OCR 读每个框（Node/Tracker）里的文字 —— 竖排也能读。"""
+            try:
+                self._ocr_read_impl(whole)
+            except Exception:
+                import traceback
+                QMessageBox.critical(self, "OCR 出错（把这段发我）", traceback.format_exc())
+
+        def _ocr_read_impl(self, whole=False):
+            import json as _json
+            import subprocess
+            import tempfile
+            if not (self.pm and self.dbg):
+                self.statusBar().showMessage("先打开一份 JSON 再 OCR", 5000)
+                return
+            if not (self.pdf and os.path.exists(self.pdf)):
+                QMessageBox.information(self, "缺 PDF", "OCR 要用渲染出来的底图，请先「选 PDF…」。")
+                return
+            pyp = str(self.settings.get("python") or "")
+            if not (pyp and os.path.exists(pyp)):
+                QMessageBox.information(self, "缺 Python",
+                                        "先在「训练环境…」里选好 Python 解释器（3.12 那个）。")
+                return
+            chk = subprocess.run([pyp, "-c", "import rapidocr_onnxruntime"],
+                                 capture_output=True, text=True, creationflags=_NO_WINDOW)
+            if chk.returncode != 0:
+                if QMessageBox.question(
+                        self, "要装 OCR 组件",
+                        "这个 Python 里还没有 rapidocr-onnxruntime"
+                        "（约 20MB，离线跑 OCR 用）。\n\n现在装吗？装完会自动继续。",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
+                    return
+                self.statusBar().showMessage("正在装 rapidocr-onnxruntime …", 0)
+                QApplication.processEvents()
+                p = subprocess.run([pyp, "-m", "pip", "install", "rapidocr-onnxruntime"],
+                                   capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", creationflags=_NO_WINDOW)
+                self.statusBar().showMessage("", 0)
+                if p.returncode != 0:
+                    QMessageBox.warning(self, "装不上",
+                                        ((p.stdout or "")[-600:] + (p.stderr or "")[-600:]))
+                    return
+            script = os.path.join(tempfile.gettempdir(), "lbd_ocr.py")
+            with open(script, "w", encoding="utf-8") as f:
+                f.write(OCR_BOX_SCRIPT)
+            dpi = self.dpi if self.dpi > 0 else 333
+            order = self._page_order() or [self.page]
+            todo = order if whole else [self.page]
+            stat = {"boxes": 0, "filled": 0, "raw": 0, "missed": 0, "pages": 0}
+            for n, pg in enumerate(todo):
+                self.statusBar().showMessage("OCR 第 %s 页（%d/%d）…"
+                                             % (pg, n + 1, len(todo)), 0)
+                QApplication.processEvents()
+                pm = self.pm if pg == self.page else (self.edited.get(pg)
+                                                      or PageModel(self.dbg, pg))
+                boxes = [{"ix": i, "label": s.get("label"), "bbox": s["bbox"]}
+                         for i, s in enumerate(pm.shapes)
+                         if s.get("label") in ("Node", "Tracker") and not s.get("locked")]
+                if not boxes:
+                    continue
+                img = self.renderer.render(self.pdf, pg, dpi)
+                cfgp = os.path.join(tempfile.gettempdir(), "lbd_ocr_cfg.json")
+                with open(cfgp, "w", encoding="utf-8") as f:
+                    _json.dump({"img": img, "page_w": pm.width, "page_h": pm.height,
+                                "boxes": boxes}, f, ensure_ascii=False)
+                pr = subprocess.run([pyp, script, cfgp], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=7200,
+                                    creationflags=_NO_WINDOW)
+                data = []
+                for line in (pr.stdout or "").splitlines():
+                    if line.startswith("@@"):
+                        data = _json.loads(line[2:])
+                if not data:
+                    self.statusBar().showMessage("第 %s 页没拿到 OCR 结果：%s"
+                                                 % (pg, (pr.stderr or "")[-200:]), 8000)
+                    continue
+                got = {int(r["ix"]): r for r in data}
+                self.begin_change()
+                for i, s in enumerate(pm.shapes):
+                    r = got.get(i)
+                    if not r or s.get("locked"):
+                        continue
+                    txt = (r.get("text") or "").strip()
+                    stat["boxes"] += 1
+                    if not txt:
+                        s["_miss"] = True
+                        stat["missed"] += 1
+                        continue
+                    s["_miss"] = False
+                    up = txt.upper().replace(" ", "")
+                    if re.search(r"INV\s*\d+\s*[A-Z]\s*\d+\s*[-_]?\s*LBD\s*[-_]?\s*\d+", up, re.I):
+                        s["name"] = up                       # 标签本身就带 INV..-LBD-..
+                        s["_check"] = False
+                        stat["filled"] += 1
+                    else:
+                        s["name"] = txt[:40]                 # 读到了但不是标准编号 -> 标紫要人核
+                        s["_check"] = True
+                        stat["raw"] += 1
+                pm.dirty = True
+                self.edited[pg] = pm
+                stat["pages"] += 1
+                if pg == self.page:
+                    self._rebuild_items()
+            self.mark_dirty()
+            self.on_selection()
+            self.statusBar().showMessage(
+                "OCR 完成：%d 页 / %d 个框，认出编号 %d 个，读到别的文字 %d 个，没读到 %d 个"
+                % (stat["pages"], stat["boxes"], stat["filled"], stat["raw"],
+                   stat["missed"]), 0)
+            QMessageBox.information(
+                self, "OCR 读框内文字",
+                "跑完 %d 页、%d 个框：\n"
+                "  · 认出标准编号：%d 个（绿）\n"
+                "  · 读到别的文字：%d 个（紫，写成名字了，请核一下）\n"
+                "  · 没读到：%d 个（红，等人手填）\n\n"
+                "锁定的框一个没动；可以直接 Ctrl+Z 撤销。"
+                % (stat["pages"], stat["boxes"], stat["filled"], stat["raw"],
+                   stat["missed"]))
 
         def _ai_detect_impl(self, whole=False):
             from PySide6.QtWidgets import (QDialog, QPlainTextEdit, QVBoxLayout, QHBoxLayout,
