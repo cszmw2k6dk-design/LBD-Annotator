@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.36"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.37"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -7006,9 +7006,15 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
 
         # 整册清理多余框 + 一步撤销（用页面模型直接量，不靠翻页重新读盘）
         pgs_all = win.dbg.page_numbers()
-        p_first = pgs_all[0]
+        # 自检本来跑的是自带样例；拿别的文件跑时有的页可能是空的（比如封面页），
+        # 不能假设"第 1 页一定有框"，否则自检会在这儿崩（用户看到的就是这个 traceback）
+        p_first = next((p for p in pgs_all
+                        if (win.edited.get(p) or PageModel(win.dbg, p)).shapes), pgs_all[0])
         win.goto_page(p_first)
-        donor = dict(win.pm.shapes[0])
+        donor = dict(win.pm.shapes[0]) if win.pm.shapes else {
+            "label": "Node", "name": "", "bbox": [100.0, 100.0, 400.0, 900.0],
+            "confidence": None, "class_id": DEFAULT_CLASS_ID["Node"],
+            "source": "manual", "raw": {}, "ocr_index": None}
         donor.update({"source": "model", "raw": {}, "locked": False, "name": ""})
         win.pm.shapes.append(dict(donor))     # 造两个和它完全一样的"多余框"
         win.pm.shapes.append(dict(donor))
