@@ -17,6 +17,7 @@
     改名写进 final_node_name —— 这正是下游 extract_lines_from_debug 读的字段。
 """
 import argparse
+import collections
 import copy
 import glob
 import hashlib
@@ -44,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.24"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.25"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -1360,6 +1361,75 @@ def _full_lbd_name(txt):
     """
     nm, kind = ocr_text_to_name(txt)
     return nm if kind == "ok" else None
+
+
+# --------------------------------------------------- 每页比例尺（1 IN = ? FT）
+SCALE_ONE_RE = re.compile(
+    r"1\s*(?:\"|''|IN\b|INCH(?:ES)?)\s*[=:]\s*(\d+(?:\.\d+)?)\s*(?:FT\b|FEET|')", re.I)
+SCALE_FT_PER_IN_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:FT\b|FEET|')\s*(?:PER|/|每)\s*(?:\"|IN\b|INCH)", re.I)
+SHEET_SIZE_RE = re.compile(r'(\d+(?:\.\d+)?)\s*"\s*[xX×]\s*(\d+(?:\.\d+)?)\s*"')
+
+
+def read_page_scale(items):
+    """从一页的文字层里读出「1 IN = ? FT」。返回 (每英寸英尺数, 说明)。
+
+    读不到返回 (None, 原因)。图纸上比例尺就两种写法，都认：
+      ① 一句话：SCALE: 1" = 100'-0" / 1 IN = 100 FT
+      ② 标尺表格（Steel River 这种）：标题栏里一行 "1  2  IN"、下一行 "100  200  FT"，
+         数字上下对齐 —— 按 x 对齐把 1↔100、2↔200 配成对，用它们的比值（防止只看一行取错）。
+    """
+    txt = [((it[0] or "").strip(), float(it[1]), float(it[2])) for it in items]
+    txt = [t for t in txt if t[0]]
+    for s, _x, _y in txt:                       # ① 一句话
+        m = SCALE_ONE_RE.search(s) or SCALE_FT_PER_IN_RE.search(s)
+        if m:
+            v = float(m.group(1))
+            if 0 < v < 100000:
+                return v, "文字里写着 1 IN = %g FT" % v
+    # ② 标尺表格
+    inch_lbl = [t for t in txt if re.fullmatch(r"IN|INCH(?:ES)?|\"", t[0], re.I)]
+    ft_lbl = [t for t in txt if re.fullmatch(r"FT|FEET|'", t[0], re.I)]
+    ratios = []
+    for _s, ix, iy in inch_lbl:
+        for _s2, fx, fy in ft_lbl:
+            if abs(fy - iy) > 0.06 or fx < ix:
+                continue                        # FT 得在同一块表里偏下/偏右
+            nums_i = [t for t in txt
+                      if abs(t[2] - iy) <= 0.012 and t[1] < ix + 0.02
+                      and re.fullmatch(r"\d+(?:\.\d+)?", t[0])]
+            nums_f = [t for t in txt
+                      if abs(t[2] - fy) <= 0.012 and t[1] < fx + 0.02
+                      and re.fullmatch(r"\d+(?:\.\d+)?", t[0])]
+            for s3, x3, _y3 in nums_i:
+                v_i = float(s3)
+                if v_i <= 0:
+                    continue
+                near = min(nums_f, key=lambda t: abs(t[1] - x3), default=None)
+                if near is None or abs(near[1] - x3) > 0.02:
+                    continue
+                v_f = float(near[0])
+                if v_f > v_i:
+                    ratios.append(v_f / v_i)
+    if ratios:
+        ratios.sort()
+        v = ratios[len(ratios) // 2]
+        return v, "标题栏标尺表（%d 对数字）" % len(ratios)
+    return None, "这页文字层里没找到比例尺"
+
+
+def read_sheet_width_in(items):
+    """从"22\" x 34\" SHEETS"这种说明里读出图纸幅面（取大的一边，单位英寸）。"""
+    for it in items:
+        m = SHEET_SIZE_RE.search(str(it[0] or ""))
+        if m:
+            try:
+                a, b = float(m.group(1)), float(m.group(2))
+            except ValueError:
+                continue
+            if a > 1 and b > 1:
+                return max(a, b)
+    return None
 
 
 def _name_num(name):
@@ -5802,11 +5872,50 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
 
             threading.Thread(target=worker, daemon=True).start()
 
+        def _page_scale_info(self, pg, pm=None):
+            """这一页的 (1 IN = ? FT, 哪来的, 每英寸多少像素)。整册分档要按页折算长度用。
+
+            比例尺和"每英寸像素"两个都从**文字层**里读：
+              · 比例尺 = 标题栏标尺表 / "1\" = 100'-0\"" 这种文字；
+              · 每英寸像素 = 图纸幅面（"22\" x 34\" SHEETS"）反推，比依赖 DPI 设置可靠。
+            读不到的（没选 PDF、图纸没有文字层）返回 (None, 原因, dpi)。
+            """
+            cache = getattr(self, "_scale_cache", None)
+            if cache is None:
+                cache = self._scale_cache = {}
+            if pg in cache:
+                return cache[pg]
+            dpi = float(self.dpi) if self.dpi and self.dpi > 0 else 250.0
+            items = []
+            if self.pdf and os.path.exists(self.pdf):
+                try:
+                    if getattr(self, "_ptext_scale", None) is None:
+                        self._ptext_scale = PdfText(self.pdf)
+                    items = self._ptext_scale.items(pg)
+                except Exception:
+                    items = []
+            ppi = dpi
+            try:
+                sheet_w = read_sheet_width_in(items)
+                if sheet_w and pm is not None and getattr(pm, "width", 0):
+                    ppi = float(pm.width) / float(sheet_w)
+            except Exception:
+                pass
+            sc, why = read_page_scale(items)
+            out = (sc, why, ppi)
+            cache[pg] = out
+            return out
+
         def on_rack_grade(self):
             """Tracker（支架）按长边长度分档：短的 2 串、长的 3 串（可改）→ 写进 raw.strings。
 
             分档用的是**整册所有页画过的支架**（不是只看当前页），
             这样每一页的"长/短"用的是同一套门槛，跨页也不会忽长忽短。
+
+            长度先按**每一页自己的比例尺**折算成英尺再比。这本图纸每页比例尺不一样
+            （第 1 页 1IN=100FT、第 2 页 1IN=120FT、第 30 页 1IN=80FT…），直接拿像素
+            比长度会把同一种支架分成两类 —— 用户反馈的"明明差不多长却分成两种"里，
+            有一部分就是这个原因造成的。
             """
             from PySide6.QtWidgets import QInputDialog
             if not self.dbg:
@@ -5816,13 +5925,47 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             for pg in pages:
                 pms[pg] = (self.pm if pg == self.page
                            else (self.edited.get(pg) or PageModel(self.dbg, pg)))
-            racks = [s for pm in pms.values() for s in pm.shapes
+            racks = [(pg, s) for pg, pm in pms.items() for s in pm.shapes
                      if s.get("label") == "Tracker"]
             if not racks:
                 QMessageBox.information(self, "没有支架框", "整册里都没有 Tracker（支架）框。")
                 return
-            longs = sorted(max(s["bbox"][2] - s["bbox"][0], s["bbox"][3] - s["bbox"][1])
-                           for s in racks)
+            # ---- 每页比例尺：1 IN = ? FT（从标题栏文字层读；读不到就用整册最常见的那个）
+            from PySide6.QtWidgets import QProgressDialog
+            prog = QProgressDialog("正在读每页比例尺（从图纸标题栏的文字层）…", "取消",
+                                   0, len(pms), self)
+            prog.setWindowTitle("支架按长度分档")
+            prog.setMinimumDuration(0)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            scale_of, ppi_of, why_of = {}, {}, {}
+            for kp, (pg, pm) in enumerate(pms.items()):
+                prog.setValue(kp)
+                prog.setLabelText("第 %s 页 比例尺（%d/%d）…" % (pg, kp + 1, len(pms)))
+                QApplication.processEvents()
+                if prog.wasCanceled():
+                    prog.close()
+                    return
+                sc, why, ppi = self._page_scale_info(pg, pm)
+                scale_of[pg], why_of[pg], ppi_of[pg] = sc, why, ppi
+            prog.close()
+            known = [v for v in scale_of.values() if v]
+            dom = None
+            if known:
+                cnt = collections.Counter(round(v, 3) for v in known)
+                dom = cnt.most_common(1)[0][0]
+            no_scale = sorted(pg for pg in pms if not scale_of[pg])
+            use_ft = bool(known)
+
+            def length_of(pg, s):
+                """这个支架有多长。有比例尺 -> 英尺；没有 -> 退回像素。"""
+                L = max(s["bbox"][2] - s["bbox"][0], s["bbox"][3] - s["bbox"][1])
+                if not use_ft:
+                    return float(L), None
+                sc = scale_of[pg] or dom
+                ppi = ppi_of[pg] or 250.0
+                return (L / ppi) * sc, sc
+
+            longs = sorted(length_of(pg, s)[0] for pg, s in racks)
             # 按"长度差 ≤10%"聚类：差在 10% 以内的算同一类（不再等分位硬切）
             groups = []
             for L in longs:
@@ -5833,13 +5976,30 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         continue
                 groups.append([L])
             k0 = len(groups)
+            unit = "英尺" if use_ft else "像素"
+            if use_ft:
+                sc_txt = "；".join(
+                    "%s FT/IN×%d 页" % (s, c)
+                    for s, c in collections.Counter(
+                        round(scale_of[pg], 3) for pg in pms if scale_of[pg]
+                    ).most_common())
+                head_note = ("整册 %d 个支架框，长度已按每页比例尺折算成英尺"
+                             "（本册比例尺：%s）\n" % (len(racks), sc_txt))
+                if no_scale:
+                    head_note += ("⚠ 这 %d 页没读到比例尺，按最常见的 %g FT/IN 算：%s\n"
+                                  % (len(no_scale), dom, ",".join(str(x) for x in no_scale[:12])))
+            else:
+                head_note = ("整册 %d 个支架框（**没读到比例尺**，只能按像素长度分档 ——\n"
+                             "  每页比例尺不一样时这样不准；先在「选 PDF…」选上 PDF，\n"
+                             "  比例尺要从图纸标题栏的文字层里读）\n" % len(racks))
             txt, ok = QInputDialog.getText(
                 self, "支架串数分档",
-                "整册 %d 个支架框，按「长度差 ≤%d%% 算同一类」分成 %d 类。\n"
+                head_note +
+                "按「长度差 ≤%d%% 算同一类」分成 %d 类。\n"
                 "按「短 → 长」填每类的串数（逗号分开）。\n"
                 "档数跟上面的类数一致最准（长度差不多的支架保证在同一档）；\n"
                 "填的档数不一样时，会按长度重新聚成你填的档数，不会切在长度接近的地方："
-                % (len(racks), int(RACK_LEN_TOL * 100), k0),
+                % (int(RACK_LEN_TOL * 100), k0),
                 text=",".join(str(2 + i) for i in range(k0)))
             if not ok or not txt.strip():
                 return
@@ -5870,13 +6030,14 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 cuts = _kmeans_cuts(longs, k)
             counts = {lv: 0 for lv in levels}
             spans = {lv: [None, None] for lv in levels}
-            self.begin_change()
+            undone = []          # 整册分档算"一步"：Ctrl+Z 一次全撤回
             for pg, pm in pms.items():
                 hit = False
+                snap = [(i, dict(s)) for i, s in enumerate(pm.shapes)]
                 for s in pm.shapes:
                     if s.get("label") != "Tracker" or s.get("locked"):
                         continue          # 锁上的支架不动
-                    L = max(s["bbox"][2] - s["bbox"][0], s["bbox"][3] - s["bbox"][1])
+                    L, _sc = length_of(pg, s)
                     gi = 0
                     for c in cuts:
                         if L > c:
@@ -5884,6 +6045,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     lv = levels[min(gi, k - 1)]
                     raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
                     raw["strings"] = lv
+                    raw["length_ft"] = None if not use_ft else round(L, 1)
+                    if use_ft:
+                        raw["page_scale_ft_per_in"] = _sc
                     s["raw"] = raw
                     s["name"] = "%d串" % lv
                     counts[lv] = counts.get(lv, 0) + 1
@@ -5892,26 +6056,32 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     sp[1] = L if sp[1] is None else max(sp[1], L)
                     hit = True
                 if hit:
+                    undone.append((pg, snap))
                     pm.dirty = True
                     self.edited[pg] = pm
-            self.end_change()
+            if undone:
+                self.undo.append(undone)
+                del self.undo[:-200]
+                self.redo.clear()
             self.mark_dirty()
+            self.on_selection()
             for it in self.items:
                 it.update()
             QMessageBox.information(
                 self, "支架分档完成",
                 "整册 %d 个支架框（%d 页），按长度分成 %d 档"
                 "（自动按「长度差 ≤%d%% 算一类」分出来 %d 类%s）：\n%s\n\n"
-                "已写进 JSON（raw.strings），框上也标了串数。\n"
+                "长度按每页比例尺折算成%s再比；已写进 JSON"
+                "（raw.strings、raw.length_ft、raw.page_scale_ft_per_in），框上也标了串数。\n"
                 "（主程序要拿这个值来定类型，还需要我加 3 行读取代码）"
                 % (len(racks), len(pages), k, int(RACK_LEN_TOL * 100), k0,
                    "" if k == k0 else "，你填的档数不一样，已按长度重新聚档",
                    "\n".join(
                        "%d串：%d 个%s" % (
                            lv, counts[lv],
-                           "（长度 %.0f~%.0f）" % (spans[lv][0], spans[lv][1])
+                           "（长度 %.0f~%.0f %s）" % (spans[lv][0], spans[lv][1], unit)
                            if counts[lv] else "")
-                       for lv in levels)))
+                       for lv in levels), unit))
 
         def on_export_check(self):
             """导出核对表 CSV：每页每个 Node 框一行（现有名字 / 框内候选 / 建议）。"""
