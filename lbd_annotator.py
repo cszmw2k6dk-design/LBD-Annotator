@@ -4980,6 +4980,24 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                                       or PageModel(self.dbg, pg))
                 snap = [(i, dict(s)) for i, s in enumerate(pm.shapes)]
                 touched = False
+                cleared = {}            # 这次被清掉名字的框（重算）-> 最后没填回来就还原
+
+                def restore_cleared():
+                    """重算没填回来的框，把原来的名字还回去 —— 重算绝不能把好名字弄丢。
+
+                    必须放在 OCR 之后：还原早了那些框就有名字了，OCR 就不会去补它们。
+                    """
+                    n_r = 0
+                    for si, old in cleared.items():
+                        s2 = pm.shapes[si]
+                        if not (s2.get("name") or "").strip():
+                            s2["name"] = old
+                            s2["_auto"] = False
+                            s2["_miss"] = False
+                            n_r += 1
+                    if n_r:
+                        stat["restored"] = stat.get("restored", 0) + n_r
+                    return n_r
                 # ① 有文字层的先把文字层用上：1~2 秒一页，而且字是原文、不会认错
                 if text_first:
                     if ptext is None:                   # 这个 PDF 读完一次就复用
@@ -4996,7 +5014,6 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     if items:
                         # 勾了「重算」-> 已有名字也清掉重填；没勾 -> 只把"不是规范编号"
                         # 的名字清掉（规范名字留着，缺位置的话下面会补上）
-                        cleared = {}
                         for si, s in enumerate(pm.shapes):
                             if s.get("label") != "Node" or s.get("locked"):
                                 continue
@@ -5013,14 +5030,6 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         st0 = autofill_shapes(pm.shapes, items,
                                               page_sheet_by_text(items, [])[0] or "",
                                               set(), pm.width, pm.height)
-                        # 重算没填回来的，把原来的名字还回去 —— 重算绝不能把好名字弄丢
-                        for si, old in cleared.items():
-                            s = pm.shapes[si]
-                            if not (s.get("name") or "").strip():
-                                s["name"] = old
-                                s["_auto"] = False
-                                s["_miss"] = False
-                                stat["restored"] = stat.get("restored", 0) + 1
                         if st0.get("filled") or st0.get("pos_added"):
                             touched = True
                             stat["text"] += st0["filled"]
@@ -5033,6 +5042,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                          if s.get("label") == "Node" and not s.get("locked")
                          and not (text_first and _full_lbd_name(s.get("name")))]
                 if not boxes:
+                    restore_cleared()
                     if touched:
                         undone.append((pg, snap))
                         pm.dirty = True
@@ -5041,6 +5051,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                             self._rebuild_items()
                     continue
                 if not ensure_ocr():
+                    restore_cleared()
                     stat["no_python"] += len(boxes)
                     continue
                 img = self.renderer.render(self.pdf, pg, dpi)
@@ -5057,6 +5068,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     if line.startswith("@@"):
                         data = _json.loads(line[2:])
                 if not data:
+                    restore_cleared()
                     self.statusBar().showMessage("第 %s 页没拿到 OCR 结果：%s"
                                                  % (pg, (pr.stderr or "")[-200:]), 8000)
                     continue
@@ -5114,6 +5126,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 # 没读到的：按「位置顺序 + 编号连续」推一把（推出来的标黄，要人核）
                 stat["inferred"] = stat.get("inferred", 0) + infer_lbd_names(pm.shapes,
                                                                             only_label="Node")
+                # 到这里文字层 + OCR 都试过了：还没名字的重算框，还原原来的名字
+                restore_cleared()
                 if pg == self.page:
                     self._rebuild_items()
             # 整册算"一步"：Ctrl+Z 一次能把这次补的名字全撤回来
