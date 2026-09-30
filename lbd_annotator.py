@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.25"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.26"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -4792,13 +4792,15 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                         "补编号要用 PDF（文字层 + 渲染底图），请先「选 PDF…」。")
                 return
             script = os.path.join(tempfile.gettempdir(), "lbd_ocr.py")
+            # 解释器路径先取好（下面跑 OCR 要用）；"有没有装 rapidocr"那步才是懒加载的 ——
+            # 这样只有文字层能搞定的图纸，压根不会去查/装 OCR 组件。
+            pyp = str(self.settings.get("python") or "")
             ocr_ready = {"v": None}
 
             def ensure_ocr():
                 """真要 OCR 了才查 Python / rapidocr —— 只有文字层的图纸不用装任何东西。"""
                 if ocr_ready["v"] is not None:
                     return ocr_ready["v"]
-                pyp = str(self.settings.get("python") or "")
                 if not (pyp and os.path.exists(pyp)):
                     QMessageBox.information(self, "缺 Python",
                                             "剩下这些框要 OCR，先在「训练环境…」里选好"
