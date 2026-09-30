@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.28"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.30"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -1849,9 +1849,33 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
              if s.get("label") == "Node" and not s.get("locked")]
     tol = max(6.0, float(tol_ratio) * max(width, height))
     stat = {"total": len(nodes), "filled": 0, "auto": 0, "missed": 0,
-            "wrong_sheet": 0, "kept": 0, "locked": locked_n}
+            "wrong_sheet": 0, "kept": 0, "locked": locked_n, "pos_added": 0}
     if not nodes:
         return stat
+
+    def _find_label_pos(s):
+        """框里那条编号文字印在哪儿：优先"整段文字和名字一样"的，其次"号一样"的。
+
+        名字已经有了（以前跑过、或者人填的）时也要把位置补上 —— 用户反馈的
+        "导出 JSON 里没有 lbd 编号位置"就是因为老逻辑见到已有名字就整框跳过。
+        """
+        name = (s.get("name") or "").strip()
+        if not name:
+            return None
+        want = _name_num(name)
+        nm = re.sub(r"\s+", "", name).upper()
+        fallback = None
+        b = s["bbox"]
+        for it in text_items:
+            px, py = it[1] * width, (1.0 - it[2]) * height
+            if not (b[0] <= px <= b[2] and b[1] <= py <= b[3]):
+                continue
+            up = re.sub(r"\s+", "", str(it[0] or "")).upper()
+            if up == nm:
+                return (px, py)
+            if fallback is None and want is not None and _lbd_num_in(it[0]) == want:
+                fallback = (px, py)
+        return fallback
 
     # 已经有人写过的名字：不动（免得把手工改的冲掉）
     todo = []
@@ -1859,6 +1883,14 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
         if (s.get("name") or "").strip() and not s.get("_auto"):
             stat["kept"] += 1
             s["_miss"] = False
+            raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+            if not raw.get("label_pos"):            # 老文件没有位置 -> 现在补上
+                bb = _find_label_pos(s)
+                if bb:
+                    raw["label_pos"] = [int(round(bb[0])), int(round(bb[1]))]
+                    raw["label_src"] = raw.get("label_src") or "text_layer"
+                    s["raw"] = raw
+                    stat["pos_added"] += 1
         else:
             s["name"] = ""
             s["_miss"] = False
@@ -3162,22 +3194,6 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a.setToolTip("选 LBD 标签表(xlsx)：分表名、LBD 编号、要填的名字都从这张表来")
             a.triggered.connect(self.on_pick_xlsx)
             tb.addAction(a)
-            a = QAction("补全编号(本页)", self)
-            a.setToolTip("从框内文字取 LBD 编号补名字（只跑当前页）")
-            a.triggered.connect(lambda: self.on_autofill(False))
-            tb.addAction(a)
-            a = QAction("补全编号(整册)", self)
-            a.setToolTip("整册逐页补：框内文字取号；取不到的按标签表顺序补（标黄）；"
-                         "再取不到标红等人手填。\n"
-                         "没选标签表也能跑：那就只用框内文字取号，号码不跟表核对")
-            a.triggered.connect(lambda: self.on_autofill(True))
-            tb.addAction(a)
-            from PySide6.QtWidgets import QCheckBox
-            self.chk_force = QCheckBox("重算(覆盖已有名字)")
-            self.chk_force.setToolTip(
-                "勾上：已经有名字的框也重算一遍（识别给的名字不对时用这个）")
-            self.chk_force.setChecked(bool(self.settings.get("force")))
-            tb.addWidget(self.chk_force)
             a = QAction("导出核对表…", self)
             a.setToolTip("每个框一行：现有名字 / 框内找到的候选 / 建议名字 —— 导出 CSV 在 Excel 里核")
             a.triggered.connect(self.on_export_check)
@@ -3202,16 +3218,6 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a.setToolTip("同上，但范围默认选好「整册」：整本图纸逐页跑模型，自动把框画上来")
             a.triggered.connect(lambda _c=False: self.on_ai_detect(True))
             tb.addAction(a)
-            a = QAction("OCR 读框内文字(本页)", self)
-            a.setToolTip("用 OCR 读每个 LBD 框（Node）里的文字 —— 图纸里的字被转成矢量轮廓、\n"
-                         "没有文字层时用这个；竖排标签也能读。支架框（Tracker）不读、不写名字。\n"
-                         "需要 Python 环境里装 rapidocr-onnxruntime（没装会问你要不要装）。")
-            a.triggered.connect(lambda: self.on_ocr_read(False))
-            tb.addAction(a)
-            a = QAction("OCR 读框内文字(整册)", self)
-            a.setToolTip("同上，整册逐页跑（有进度提示，可直接 Ctrl+Z 撤销）；同样只写 Node 框")
-            a.triggered.connect(lambda: self.on_ocr_read(True))
-            tb.addAction(a)
             a = QAction("自动补编号(本页)", self)
             a.setToolTip("一键补编号：先用 PDF 文字层读（1~2 秒一页、字是原文不会认错），\n"
                          "只有文字层没给到号的框才自动去 OCR。\n"
@@ -3223,6 +3229,49 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                          "整册算一步，Ctrl+Z 一次全撤回。")
             a.triggered.connect(lambda: self.on_auto_name(True))
             tb.addAction(a)
+            # 两条单独的路线收进这个下拉里，工具栏就不会一排按钮挤着。
+            # 平时点「自动补编号」就够了；要只走文字层 / 强制 OCR 时再来这儿。
+            from PySide6.QtWidgets import (QCheckBox, QMenu, QToolButton,
+                                           QWidgetAction)
+            btn_more = QToolButton(self)
+            # 名字里别用 '▾' 这类字符：控制台按 GBK 打印时会 UnicodeEncodeError
+            # （工具栏上其它下拉都是"……"结尾，跟它们保持一致）
+            btn_more.setText("补编号选项…")
+            btn_more.setToolTip(
+                "单独跑某一条路时用这里：\n"
+                "· 补全编号 = 只读 PDF 文字层（快，不用装任何东西，号码可跟标签表核对）\n"
+                "· OCR 读框内文字 = 强制用 OCR（图纸没有文字层、或文字层里的编号不对时用）\n\n"
+                "平时直接点「自动补编号」就行：它先走文字层，没拿到号的框再自动 OCR。")
+            btn_more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            menu_more = QMenu(btn_more)
+            a = menu_more.addAction("补全编号（只走文字层）· 本页")
+            a.setToolTip("从框内文字取 LBD 编号补名字（只跑当前页），不跑 OCR")
+            a.triggered.connect(lambda _c=False: self.on_autofill(False))
+            a = menu_more.addAction("补全编号（只走文字层）· 整册")
+            a.setToolTip("整册逐页补：框内文字取号；取不到的按标签表顺序补（标黄）；"
+                         "再取不到标红等人手填。\n"
+                         "没选标签表也能跑：那就只用框内文字取号，号码不跟表核对")
+            a.triggered.connect(lambda _c=False: self.on_autofill(True))
+            menu_more.addSeparator()
+            a = menu_more.addAction("OCR 读框内文字（强制 OCR）· 本页")
+            a.setToolTip("用 OCR 读每个 LBD 框（Node）里的文字 —— 图纸里的字被转成矢量轮廓、\n"
+                         "没有文字层、或文字层里的编号不对时用这个；竖排标签也能读。\n"
+                         "支架框（Tracker）不读、不写名字；需要 rapidocr-onnxruntime"
+                         "（没装会问你要不要装）")
+            a.triggered.connect(lambda _c=False: self.on_ocr_read(False))
+            a = menu_more.addAction("OCR 读框内文字（强制 OCR）· 整册")
+            a.setToolTip("同上，整册逐页跑（有进度提示，可直接 Ctrl+Z 撤销）；同样只写 Node 框")
+            a.triggered.connect(lambda _c=False: self.on_ocr_read(True))
+            menu_more.addSeparator()
+            self.chk_force = QCheckBox("重算(覆盖已有名字)")
+            self.chk_force.setToolTip("勾上：已经有名字的框也重算一遍（识别给的名字不对时用这个）\n"
+                                      "只影响上面那条「补全编号」；「自动补编号」本身一律重算")
+            self.chk_force.setChecked(bool(self.settings.get("force")))
+            wa = QWidgetAction(menu_more)
+            wa.setDefaultWidget(self.chk_force)
+            menu_more.addAction(wa)
+            btn_more.setMenu(menu_more)
+            tb.addWidget(btn_more)
             tb.addWidget(QLabel("  名字 "))
             self.cmb_name = QComboBox()
             # (显示方式, 字号, 只画选中的那个)
@@ -4949,10 +4998,12 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         st0 = autofill_shapes(pm.shapes, items,
                                               page_sheet_by_text(items, [])[0] or "",
                                               set(), pm.width, pm.height)
-                        if st0.get("filled"):
+                        if st0.get("filled") or st0.get("pos_added"):
                             touched = True
                             stat["text"] += st0["filled"]
-                            stat["text_pages"] += 1
+                            if st0.get("filled"):
+                                stat["text_pages"] += 1
+                            stat["pos_added"] = stat.get("pos_added", 0) + st0.get("pos_added", 0)
                 # ② 文字层没给到号的框（自动补编号时）才送去 OCR；单跑 OCR 时全部重读
                 boxes = [{"ix": i, "label": s.get("label"), "bbox": s["bbox"]}
                          for i, s in enumerate(pm.shapes)
@@ -6344,6 +6395,31 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         win.load_file(path)
         print("载入 OK：共 %d 页，第 %d 页 %d 个框"
               % (len(win.dbg.page_numbers()), win.page, len(win.items)))
+        # 开发用：LBD_SHOT=<png 路径> 时，把窗口截一张图、并把工具栏按钮列出来，
+        # 方便改完界面肉眼核对（自检本来就跑在 offscreen 上，不需要显示器）
+        _shot = os.environ.get("LBD_SHOT")
+        if _shot:
+            from PySide6.QtWidgets import QToolBar, QToolButton
+
+            def _p(s):
+                try:
+                    print(s)
+                except UnicodeEncodeError:      # 控制台按 GBK 编码时别把自检弄崩
+                    print(s.encode("ascii", "replace").decode("ascii"))
+
+            for t in win.findChildren(QToolBar):
+                _p("工具栏[%s]：%s" % (t.windowTitle(),
+                                     " | ".join(a.text() for a in t.actions() if a.text())))
+            for b in win.findChildren(QToolButton):
+                if b.menu() is not None:
+                    _p("下拉[%s]：%s" % (b.text(),
+                                       " | ".join(a.text() or "（勾选框）"
+                                                  for a in b.menu().actions()
+                                                  if not a.isSeparator())))
+            win.show()
+            QApplication.processEvents()
+            win.grab().save(_shot)
+            _p("截图：%s（%dx%d）" % (_shot, win.width(), win.height()))
         print("内存：载入后 %.0f MB（%s）"
               % (rss_mb(), win._img_note or "底图来源见下"))
         first = win.page
