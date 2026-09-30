@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.31"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.33"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -2502,6 +2502,14 @@ class PageModel:
             rec["node_bbox"] = {"x1": s["bbox"][0], "y1": s["bbox"][1],
                                 "x2": s["bbox"][2], "y2": s["bbox"][3]}
             rec["final_node_name"] = s["name"]
+            # 编号印在哪儿：名字旁边再放一份，省得下游为了拿位置还得去翻 detections.raw
+            raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+            if raw.get("label_pos"):
+                rec["label_pos"] = [int(raw["label_pos"][0]), int(raw["label_pos"][1])]
+                rec["label_src"] = raw.get("label_src") or ""
+            else:
+                rec.pop("label_pos", None)
+                rec.pop("label_src", None)
             out.append(rec)
         return out
 
@@ -4998,6 +5006,19 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     if n_r:
                         stat["restored"] = stat.get("restored", 0) + n_r
                     return n_r
+
+                def commit_page():
+                    """这一页只要动过（补了名字/位置、或重算还原过），就登记成"改过" ——
+                    保存（另存为/覆盖原文件）写的是 self.edited 里的页，不登记就等于白干。
+                    这里以前漏了：文字层补好了、但 OCR 那步因为没装/没配 Python 直接跳过时，
+                    整页的结果不会进 self.edited，覆盖原文件以后就"看不出改过"。
+                    """
+                    if touched:
+                        undone.append((pg, snap))
+                        pm.dirty = True
+                        self.edited[pg] = pm
+                        if pg == self.page:
+                            self._rebuild_items()
                 # ① 有文字层的先把文字层用上：1~2 秒一页，而且字是原文、不会认错
                 if text_first:
                     if ptext is None:                   # 这个 PDF 读完一次就复用
@@ -5043,16 +5064,12 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                          and not (text_first and _full_lbd_name(s.get("name")))]
                 if not boxes:
                     restore_cleared()
-                    if touched:
-                        undone.append((pg, snap))
-                        pm.dirty = True
-                        self.edited[pg] = pm
-                        if pg == self.page:
-                            self._rebuild_items()
+                    commit_page()
                     continue
                 if not ensure_ocr():
                     restore_cleared()
                     stat["no_python"] += len(boxes)
+                    commit_page()
                     continue
                 img = self.renderer.render(self.pdf, pg, dpi)
                 cfgp = os.path.join(tempfile.gettempdir(), "lbd_ocr_cfg.json")
@@ -5071,6 +5088,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     restore_cleared()
                     self.statusBar().showMessage("第 %s 页没拿到 OCR 结果：%s"
                                                  % (pg, (pr.stderr or "")[-200:]), 8000)
+                    commit_page()
                     continue
                 got = {int(r["ix"]): r for r in data}
                 for r in data:
