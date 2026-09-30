@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.34"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.36"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -1125,6 +1125,87 @@ def save_settings(d):
         pass
 
 
+def _sp_key(path):
+    """起始页按"文件绝对路径"记（大小写不敏感），换机器/换目录互不影响。"""
+    try:
+        return os.path.abspath(str(path)).lower()
+    except Exception:
+        return str(path or "").lower()
+
+
+def start_page_of(path):
+    """这份 JSON 记住的"起始页"（打开时停在哪一页）；没记过返回 0。
+
+    为什么需要它：有些册子前面十几页是封面/说明，图纸从第 16、17 页才开始；
+    默认会停在"第一个有框的页"，但用户往往想直接从某一页开始看/标。
+    """
+    try:
+        d = load_settings().get("start_pages") or {}
+        return int(d.get(_sp_key(path)) or 0)
+    except Exception:
+        return 0
+
+
+def set_start_page(path, page):
+    """记下/清掉这份 JSON 的起始页（page<=0 = 清掉）。返回设置后的页码（0=已清除）。"""
+    try:
+        page = int(page or 0)
+    except Exception:
+        page = 0
+    d = load_settings()
+    sp = dict(d.get("start_pages") or {})
+    k = _sp_key(path)
+    if page > 0:
+        sp[k] = page
+    else:
+        sp.pop(k, None)
+    d["start_pages"] = sp
+    save_settings(d)
+    return page if page > 0 else 0
+
+
+def json_start_page(path):
+    """JSON 自己带的起始页（顶层字段 "lbd_start_page": N）；没有返回 0。
+
+    比"记在本机设置里"强的地方：跟着文件走 —— 换机器、发给别人、拷到别的目录都还在。
+    只读文件开头几 KB 就够（这个字段写在最外层）。
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            head = f.read(8192)
+    except Exception:
+        return 0
+    m = re.search(r'"lbd_start_page"\s*:\s*(\d+)', head)
+    try:
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+
+def write_json_start_page(path, page):
+    """把起始页写进 JSON 本身（顶层字段 lbd_start_page）；page<=0 = 删掉这个字段。
+
+    只动这一个字段，其余内容逐字节照搬（和标注工具"保存某几页"那套做法一致）。
+    返回写进去的页码（0 = 已删除）。
+    """
+    try:
+        page = int(page or 0)
+    except Exception:
+        page = 0
+    with open(path, "r", encoding="utf-8") as f:
+        txt = f.read()
+    txt = re.sub(r'"lbd_start_page"\s*:\s*\d+\s*,\s*', "", txt, count=1)
+    txt = re.sub(r',?\s*"lbd_start_page"\s*:\s*\d+', "", txt, count=1)
+    if page > 0:
+        i = txt.find("{")
+        if i < 0:
+            return 0
+        txt = txt[:i + 1] + '\n  "lbd_start_page": %d,' % page + txt[i + 1:]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(txt)
+    return page if page > 0 else 0
+
+
 # ------------------------------------------------------- PDF 文字层：框内找 LBD 标签
 # 这一套和主程序 app.py 里的 _pdf_text_items 等价，搬到标注工具里是为了
 # "从已经框好的 LBD 区域里取标签文字"，不依赖任何识别模型。
@@ -1162,6 +1243,58 @@ def _pdf_norm_pt(page, x, y):
     return (x / pw, y / ph)
 
 
+# Helvetica / Arial 标准字宽表（单位 1/1000 em，来自 PDF 规范里那套内置字体度量）。
+# CAD 图纸上的文字基本都是 Arial/Helvetica 系的，有这张表就能算出**真实字宽**，
+# 不用再按"0.5×字号×字数"估 —— 实测那套估算会把编号框压短 ~10%。
+_HELV_W = {}
+for _ch, _w in ((" ", 278), ("!", 278), ('"', 355), ("#", 556), ("$", 556),
+                ("%", 889), ("&", 667), ("'", 191), ("(", 333), (")", 333),
+                ("*", 389), ("+", 584), (",", 278), ("-", 333), (".", 278),
+                ("/", 278), (":", 278), (";", 278), ("<", 584), ("=", 584),
+                (">", 584), ("?", 556), ("@", 1015), ("[", 278), ("\\", 278),
+                ("]", 278), ("^", 469), ("_", 556), ("`", 333), ("{", 334),
+                ("|", 260), ("}", 334), ("~", 584)):
+    _HELV_W[_ch] = _w
+for _d in "0123456789":
+    _HELV_W[_d] = 556
+for _c, _w in (("A", 667), ("B", 667), ("C", 722), ("D", 722), ("E", 667),
+               ("F", 611), ("G", 778), ("H", 722), ("I", 278), ("J", 500),
+               ("K", 667), ("L", 556), ("M", 833), ("N", 722), ("O", 778),
+               ("P", 667), ("Q", 778), ("R", 722), ("S", 667), ("T", 611),
+               ("U", 722), ("V", 667), ("W", 944), ("X", 667), ("Y", 667),
+               ("Z", 611), ("a", 556), ("b", 556), ("c", 500), ("d", 556),
+               ("e", 556), ("f", 278), ("g", 556), ("h", 556), ("i", 222),
+               ("j", 222), ("k", 500), ("l", 222), ("m", 833), ("n", 556),
+               ("o", 556), ("p", 556), ("q", 556), ("r", 333), ("s", 500),
+               ("t", 278), ("u", 556), ("v", 500), ("w", 722), ("x", 500),
+               ("y", 500), ("z", 500)):
+    _HELV_W[_c] = _w
+
+
+def text_advance(text, size, font_name=""):
+    """这段文字在**文本空间**里有多长（还没乘矩阵）。返回 (宽度, 是不是按真字宽算的)。
+
+    字体是 Arial / Helvetica / Liberation / Nimbus 这类标准字时，用标准字宽表算真值；
+    其它字体（或表里没有的字符）退回"0.5×字号×字数"的估算。CAD 图纸基本都是前一类。
+    """
+    try:
+        cs = float(size)
+    except Exception:
+        cs = 0.0
+    nm = re.sub(r"^[A-Z]{6}\+", "", str(font_name or "")).lower()
+    known = ("arial" in nm or "helvetica" in nm or "liberation" in nm
+             or "nimbus" in nm or "helv" in nm)
+    if known and cs > 0 and text:
+        total = 0.0
+        for ch in text:
+            u = _HELV_W.get(ch)
+            if u is None:
+                return 0.5 * cs * len(text), False     # 有表里没有的字 -> 退回估算
+            total += u
+        return total / 1000.0 * cs, True
+    return 0.5 * cs * len(text), False
+
+
 def _pdf_text_items(page):
     """一页 -> [(文字, fx中心, fy中心, fx1, fy1, fx2, fy2)]（底图归一化坐标）。"""
     items = []
@@ -1182,7 +1315,11 @@ def _pdf_text_items(page):
             cs = float(size)
         except Exception:
             cs = 0.0
-        w = cs * 0.5 * len(text)
+        try:
+            fname = str(font.get("/BaseFont") or "") if font else ""
+        except Exception:
+            fname = ""
+        w, exact = text_advance(text, cs, fname)
         h = cs
         xs, ys = [], []
         for tx, ty in ((0.0, 0.0), (w, 0.0), (0.0, h), (w, h)):
@@ -1194,7 +1331,7 @@ def _pdf_text_items(page):
         fx1, fx2 = min(p[0] for p in pts), max(p[0] for p in pts)
         fy1, fy2 = min(p[1] for p in pts), max(p[1] for p in pts)
         items.append((text.strip(), (fx1 + fx2) * 0.5, (fy1 + fy2) * 0.5,
-                      fx1, fy1, fx2, fy2))
+                      fx1, fy1, fx2, fy2, exact))
 
     page.extract_text(visitor_text=visit_text)
     return items
@@ -1897,9 +2034,9 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             bb = (it[3] * width, (1.0 - it[6]) * height,
                   it[5] * width, (1.0 - it[4]) * height)
             if same:
-                return (px, py), bb
+                return (px, py), bb, (it[7] if len(it) > 7 else False)
             if hit is None:
-                hit = ((px, py), bb)
+                hit = ((px, py), bb, (it[7] if len(it) > 7 else False))
         return hit
 
     def _mark_positions():
@@ -1918,10 +2055,11 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             mk = _find_label_mark(s)
             if not mk:
                 continue
-            (cx, cy), bb = mk
+            (cx, cy), bb, exact = mk
             raw["label_pos"] = [int(round(cx)), int(round(cy))]
             raw["label_bbox"] = [int(round(v)) for v in bb]
             raw["label_src"] = raw.get("label_src") or "text_layer"
+            raw["label_box_kind"] = "metrics" if exact else "estimated"
             s["raw"] = raw
             stat["pos_added"] = stat.get("pos_added", 0) + 1
 
@@ -3435,6 +3573,13 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             b = QPushButton("下一页 ▶")
             b.clicked.connect(lambda: self.goto_offset(1))
             nav.addWidget(b)
+            self.btn_start = QPushButton("起始页")
+            self.btn_start.setToolTip(
+                "把**当前页**记成这份 JSON 的起始页：以后再打开这个文件，直接停在这一页。\n"
+                "再点一次＝取消（回到默认：停在第 1 个有框的页）。\n"
+                "按文件记（存在本机设置里，不动 JSON）。")
+            self.btn_start.clicked.connect(self.on_toggle_start_page)
+            nav.addWidget(self.btn_start)
             sl.addLayout(nav)
             sl.addWidget(QLabel("———— 选中的框 ————"))
             form = QFormLayout()
@@ -3511,6 +3656,57 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                                "JSON (*.json)")
             if p:
                 self.load_file(p)
+
+        def update_start_button(self):
+            """「起始页」按钮的状态：当前页正好是记过的起始页就打个勾。"""
+            try:
+                sp = 0
+                if self.dbg:
+                    sp = json_start_page(self.dbg.path) or start_page_of(self.dbg.path)
+                cur = self.page if self.dbg else 0
+                if sp and sp == cur:
+                    self.btn_start.setText("起始页 ✓")
+                    self.btn_start.setToolTip("当前页就是这份 JSON 的起始页（第 %d 页）。\n"
+                                              "点一下＝取消（把这个字段从 JSON 里去掉）。" % sp)
+                elif sp:
+                    self.btn_start.setText("起始页")
+                    self.btn_start.setToolTip(
+                        "这份 JSON 的起始页是第 %d 页。\n"
+                        "点一下＝把当前页（第 %s 页）改成起始页。" % (sp, cur))
+                else:
+                    self.btn_start.setText("起始页")
+                    self.btn_start.setToolTip(
+                        "把当前页写成这份 JSON 的起始页（顶层字段 lbd_start_page）：\n"
+                        "以后一打开就直接停在这一页，换机器、发给别人也生效。\n"
+                        "再点一次＝取消。")
+            except Exception:
+                pass
+
+        def on_toggle_start_page(self):
+            if not self.dbg:
+                return
+            cur = json_start_page(self.dbg.path) or start_page_of(self.dbg.path)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                if cur == self.page:
+                    write_json_start_page(self.dbg.path, 0)
+                    set_start_page(self.dbg.path, 0)     # 老的本机记录也一起清掉
+                    msg = "已取消起始页：这个 JSON 不再指定打开页"
+                else:
+                    n = write_json_start_page(self.dbg.path, self.page)
+                    set_start_page(self.dbg.path, 0)
+                    # 重新读一遍文件头：DebugJson 里那些按字节记的偏移不能乱
+                    self.dbg = DebugJson(self.dbg.path)
+                    msg = ("已把第 %d 页写进 JSON（lbd_start_page）；"
+                           "以后打开这份文件直接停这儿" % n)
+            except Exception as e:
+                msg = "写不进去：%s" % e
+            finally:
+                QApplication.restoreOverrideCursor()
+            self.statusBar().showMessage(msg, 8000)
+            if self.dbg:
+                self.goto_page(self.page)      # 重新按新文件读这一页（旧偏移作废了）
+            self.update_start_button()
 
         def on_open_pdf(self):
             """没有识别结果时，直接打开一份 PDF 从零标注。"""
@@ -3607,7 +3803,14 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             # 有框的页优先：整册 JSON（每页都写了空记录的那份）本来会停在第 1 页，
             # 明明有图纸却是一片空白，得自己翻半天。
             drw = drawing_pages(self.dbg)
-            self.goto_page(drw[0] if drw else pgs[0])
+            # 优先用 JSON 自己带的起始页（跟着文件走），其次本机设置里记的
+            want = json_start_page(path) or start_page_of(path)
+            if want and want in self.dbg.pages:
+                start = want                     # 这份文件记过起始页 -> 就停在那儿
+            else:
+                start = drw[0] if drw else pgs[0]
+            self.goto_page(start)
+            self.update_start_button()
 
         def goto_page(self, number):
             if not self.dbg or number not in self.dbg.pages:
@@ -3640,6 +3843,10 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.refresh_info()
             self.on_selection()
             self.prefetch_next()
+            try:
+                self.update_start_button()      # 翻页后刷新「起始页」按钮的勾
+            except Exception:
+                pass
 
         def prefetch_next(self):
             """后台把下一页渲染好，翻页就不用等。"""
@@ -6561,6 +6768,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         # 开发用：LBD_JSON / LBD_PDF 可以指定"用哪个文件跑截图检查"
         _j = os.environ.get("LBD_JSON")
         if _j:
+            if os.environ.get("LBD_REAL_SETTINGS"):
+                # 开发用：这次自检用**真实**的设置目录（默认自检走临时目录，
+                # 免得把用户设置改了）—— 用来验证「起始页」这类按文件记的设置
+                globals()["TEST_MODE"] = False
+                print("（这次用真实设置目录：%s）" % work_dir())
             win.pdf = os.environ.get("LBD_PDF") or win.pdf
             path = _j
         win.load_file(path)
@@ -7020,6 +7232,9 @@ def main():
     ap.add_argument("--pdf", default=None, help="配套 PDF（框内取文字用）")
     ap.add_argument("--xlsx", default=None, help="LBD 标签表(xlsx)")
     ap.add_argument("--page", type=int, default=None, help="--autofill 时只跑这一页")
+    ap.add_argument("--start-page", type=int, default=None,
+                    help="把这份 JSON 的起始页记下来（打开时直接停在这一页；0=清除）。"
+                         "不启动界面，写完就退出")
     ap.add_argument("--force", action="store_true",
                     help="--autofill 时把已有的 Node 名字也重算一遍")
     ap.add_argument("--csv", default=None,
@@ -7029,6 +7244,24 @@ def main():
     a = ap.parse_args()
     global TEST_MODE
     TEST_MODE = bool(a.smoke or a.memtest or a.roundtrip)   # 自检不碰用户的设置/缓存
+    if a.start_page is not None:
+        src = a.json or DEFAULT_JSON
+        if not (src and os.path.exists(src)):
+            print("--start-page 需要一个存在的 JSON 路径")
+            return 2
+        before = os.path.getsize(src)
+        v = write_json_start_page(src, a.start_page)      # 写进 JSON 本身
+        set_start_page(src, 0)                            # 顺手清掉老的本机记录
+        after = os.path.getsize(src)
+        try:                                              # 写完必须还是合法 JSON
+            with open(src, "r", encoding="utf-8") as f:
+                json.load(f)
+            ok = "JSON 校验通过"
+        except Exception as e:
+            ok = "⚠ JSON 校验失败：%s" % e
+        print("已写入：%s → lbd_start_page = %s（%d → %d 字节；%s）"
+              % (os.path.basename(src), v if v else "（已删除）", before, after, ok))
+        return 0
     if a.autofill:
         src = a.json or DEFAULT_JSON
         pdf = a.pdf or str(load_settings().get("pdf") or "")
