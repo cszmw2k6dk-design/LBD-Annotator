@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.26"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.28"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -209,11 +209,18 @@ def crop_of(b, mw, mh):
     if c.width < 8 or c.height < 8:
         return None
     b["h_raw"] = min(c.size)                   # 原图里这一块有多高（判断分辨率够不够）
+    raw_w, raw_h = c.size                     # 旋转前的大小，反算坐标要用
     if c.height > c.width * 1.15:            # 竖排：转成横的（180 度交给角度分类器）
         c = c.rotate(90, expand=True)
+        rot = True
+    else:
+        rot = False
+    z = 1
     if min(c.size) < 40:                     # 太小就放大，OCR 才认得出
         z = max(2, int(40 / max(1, min(c.size))) + 1)
         c = c.resize((c.width * z, c.height * z), Image.LANCZOS)
+    # 记下这一块的几何，等会儿把"识别到的文字在这张拼图上的坐标"换算回页面坐标
+    b["_geo"] = (box[0], box[1], raw_w, raw_h, rot, z)
     return c
 
 
@@ -247,15 +254,37 @@ def ocr_items(items, dbg_name=""):
     except OSError:
         pass
     got = {}
+    pos = {}
     for box, t, s in (res or []):
         yy = (min(p[1] for p in box) + max(p[1] for p in box)) / 2.0
+        xx = (min(p[0] for p in box) + max(p[0] for p in box)) / 2.0
         for ix, (a, b2) in ys.items():
             if a - 4 <= yy <= b2 + 4:
                 old = got.get(ix)
                 if old is None or float(s) > old[1]:
                     got[ix] = (t, float(s))
+                    pos[ix] = to_page(ix, xx, yy, a)
                 break
-    return got
+    return got, pos
+
+
+def to_page(ix, xs, ys_, paste_y):
+    """拼图上的一个点 -> 页面坐标（和 pm.shapes 里 bbox 同一个坐标系）。
+
+    一路反着来：去掉拼图留白 -> 去掉放大倍数 -> 反掉那次 90° 旋转 -> 加上裁块原点 -> 除以缩放。
+    （PIL rotate(90, expand=True) 的映射实测是 原(x,y) -> 新(y, 原宽-1-x)）
+    """
+    geo = geo_of.get(ix)
+    if not geo:
+        return None
+    x0, y0, raw_w, raw_h, rot, z = geo
+    cx = (xs - 12.0) / float(z)
+    cy = (ys_ - paste_y) / float(z)
+    if rot:
+        px_, py_ = raw_w - 1 - cy, cx
+    else:
+        px_, py_ = cx, cy
+    return ((x0 + px_) / sx, (y0 + py_) / sy)
 
 
 # 1) 主跑：按框本身裁，5 块拼一张
@@ -264,9 +293,12 @@ for b in cfg["boxes"]:
     c = crop_of(b, 0.0, 0.0)
     if c is not None:
         crops.append((b, c))
+geo_of = {b["ix"]: b.get("_geo") for b, _c in crops}
 out = {}
 for gi in range(0, len(crops), GROUP):
-    out.update(ocr_items(crops[gi:gi + GROUP], "g%d" % (gi // GROUP + 1)))
+    got_g, pos_g = ocr_items(crops[gi:gi + GROUP], "g%d" % (gi // GROUP + 1))
+    for ix, v in got_g.items():
+        out[ix] = (v[0], v[1], pos_g.get(ix))
 
 # 2) 补救：没读到标准编号的框单独再跑一次；还不行就把框往外扩 25%/15% 再单独跑一次
 #    （标签压在框线上、或者框裁得太紧把字切掉的情况，靠这一步捞回来）
@@ -277,14 +309,17 @@ for n, b in enumerate(bad[:80]):
         c = crop_of(b, mw, mh)
         if c is None:
             continue
-        got2 = ocr_items([(b, c)], "p%s_%s_%d" % (cfg.get("page", 0), tag, n))
+        geo_of[b["ix"]] = b.get("_geo")
+        got2, pos2 = ocr_items([(b, c)], "p%s_%s_%d" % (cfg.get("page", 0), tag, n))
         v = got2.get(b["ix"])
         if v and LBD_RE.search((v[0] or "").replace(" ", "")):
-            out[b["ix"]] = v
+            out[b["ix"]] = (v[0], v[1], pos2.get(b["ix"]))
             break
 
 _hm = {b["ix"]: b.get("h_raw") for b in cfg["boxes"]}
-print("@@" + json.dumps([{"ix": k, "text": v[0], "score": v[1], "h": _hm.get(k)}
+print("@@" + json.dumps([{"ix": k, "text": v[0], "score": v[1], "h": _hm.get(k),
+                          "pos": ([round(float(v[2][0])), round(float(v[2][1]))]
+                                  if v[2] else None)}
                          for k, v in sorted(out.items())], ensure_ascii=False))
 '''
 
@@ -1688,7 +1723,8 @@ def _page_candidates(text_items, sheet, num_set, width, height):
 def _box_texts(shapes, text_items, width, height, tol_ratio=0.006):
     """框里 / 框边上找到的**所有文字**（先全拿出来，谁是什么号后面再判断）。
 
-    返回 {框下标: [(距离, 文字)]}；每条文字只归给离它最近的那个框。
+    返回 {框下标: [(距离, 文字, x, y)]}；每条文字只归给离它最近的那个框。
+    x/y 是这条文字的中心（页面像素），补编号时拿它当"编号印在哪儿"。
     """
     nodes = [(i, s) for i, s in enumerate(shapes) if s.get("label") == "Node"]
     tol = max(6.0, float(tol_ratio) * max(width, height))
@@ -1704,7 +1740,7 @@ def _box_texts(shapes, text_items, width, height, tol_ratio=0.006):
             if bd is None or d < bd:
                 best, bd = i, d
         if best is not None and bd is not None and bd <= tol:
-            out.setdefault(best, []).append((round(bd), txt))
+            out.setdefault(best, []).append((round(bd), txt, px, py))
     for k in out:
         out[k].sort()
     return out
@@ -1772,7 +1808,7 @@ def check_rows(shapes, text_items, sheet, num_set, width, height):
         cx, cy = _box_center(s["bbox"])
         cand = sorted(got.get(i) or [])[:3]
         raw = []
-        for d, txt in (alltext.get(i) or [])[:6]:
+        for d, txt, _tx, _ty in (alltext.get(i) or [])[:6]:
             mark = ""
             # 标 × 的：这条文字被过滤掉了（号不在本分表号码表里 / 结尾像是被截断）
             mm = ANY_NUM_RE.search(re.sub(r"INV\s*\d+\s*[A-Za-z]\s*\d+", " ", txt, flags=re.I))
@@ -1841,6 +1877,7 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
     #      结果本该拿到它的框就空了 —— 表现就是"4 个框只读到 2 个"。）
     got = {}
     left_c = []
+    pos_of = {}                       # 框下标 -> 那条编号文字的中心（页面像素）
     for px, py, num, _txt in cands:
         inside = None
         for i, s in todo:
@@ -1854,6 +1891,7 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
         old = got.get(inside)
         if old is None or 0.0 < old[0]:
             got[inside] = (0.0, num, _txt)
+            pos_of[inside] = (px, py)
     for px, py, num, _ltxt in left_c:
         best, bd = None, None
         for i, s in todo:
@@ -1866,6 +1904,7 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             continue
         # 这里原来用的是外层循环残留的 txt（早就不在作用域了）——一走到这条路就崩
         got[best] = (bd, num, _ltxt)
+        pos_of[best] = (px, py)
 
     # 3) 抢号：同一个号只留最近的那个框
     keep, keep_lab, full_name = {}, {}, {}
@@ -1885,6 +1924,13 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             # 编号整段带上（框里印的是 1.01.1.C.5 就写 1.01.1.C.5，不是只留 5）
             s["name"] = (full_name.get(i)
                          or _lbd_name(sheet, keep_lab.get(i, ""), keep[i]))
+            # 把"这个编号印在图上的哪儿"一起记下来（主程序/核对都用得上）
+            bb = pos_of.get(i)
+            if bb:
+                raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+                raw["label_pos"] = [int(round(bb[0])), int(round(bb[1]))]
+                raw["label_src"] = "text_layer"
+                s["raw"] = raw
             s["_auto"] = False
             stat["filled"] += 1
 
@@ -1931,7 +1977,7 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
         left = [t for t in todo if t[0] not in keep]
         picks = {}
         for i, _s in left:
-            for d, txt in (bt.get(i) or []):
+            for d, txt, _tx, _ty in (bt.get(i) or []):
                 # ★ 先把分表名（INV31B101 这种）从文字里剔掉再找数字，
                 #   不然"任意数字"会抓到分表名里的 31，填出 INV31B101-LBD-31 这种鬼东西
                 if txt.rstrip().endswith(("-", "_", ".", "(", "#", "|")):
@@ -1957,7 +2003,7 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
                     stat["dropped"] = stat.get("dropped", 0) + 1
                     continue
                 in_set = (not sheet or not num_set or val in num_set)
-                picks.setdefault(i, []).append((0 if in_set else 1, d, val, txt))
+                picks.setdefault(i, []).append((0 if in_set else 1, d, val, txt, _tx, _ty))
         for i, lst in picks.items():
             if i in keep:
                 continue
@@ -1968,7 +2014,7 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
                 # -> 过滤掉，不猜号
                 stat["dropped"] = stat.get("dropped", 0) + 1
                 continue
-            flag, _d, val, pick_txt = pref[0]
+            flag, _d, val, pick_txt, pick_x, pick_y = pref[0]
             if val in used:
                 continue
             s = dict(todo)[i]
@@ -1977,6 +2023,10 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
             # 名字却被拼成框边那条旁注（"LBD-MV1A"）—— 用户看到的就是这个。
             s["name"] = (_full_lbd_name(pick_txt)
                          or _lbd_name(sheet, _clean_lbd_label(pick_txt), val))
+            raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+            raw["label_pos"] = [int(round(pick_x)), int(round(pick_y))]
+            raw["label_src"] = "text_layer"
+            s["raw"] = raw
             s["_auto"] = False
             s["_check"] = False
             keep[i] = val
@@ -4973,6 +5023,15 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         s["name"] = name                     # 像编号但不标准 -> 标紫要人核
                         s["_check"] = True
                         stat["raw"] += 1
+                    # 把"编号印在图上的哪儿"一起写下来（OCR 反算回页面坐标，实测和
+                    # 文字层独立算出来的位置差 8~9 px / 页面 8500 px）
+                    bb = r.get("pos")
+                    if bb:
+                        raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+                        raw["label_pos"] = [int(round(float(bb[0]))),
+                                            int(round(float(bb[1])))]
+                        raw["label_src"] = "ocr"
+                        s["raw"] = raw
                 pm.dirty = True
                 self.edited[pg] = pm
                 stat["pages"] += 1
