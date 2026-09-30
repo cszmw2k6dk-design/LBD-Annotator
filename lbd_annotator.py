@@ -44,7 +44,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.23"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.24"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -1779,12 +1779,12 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
                 inside = i
                 break
         if inside is None:
-            left_c.append((px, py, num))
+            left_c.append((px, py, num, _txt))   # 文字带上，别丢
             continue
         old = got.get(inside)
         if old is None or 0.0 < old[0]:
             got[inside] = (0.0, num, _txt)
-    for px, py, num in left_c:
+    for px, py, num, _ltxt in left_c:
         best, bd = None, None
         for i, s in todo:
             if i in got:                 # 已经有字了，别再抢
@@ -1794,7 +1794,8 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
                 best, bd = i, d
         if best is None or bd is None or bd > tol:
             continue
-        got[best] = (bd, num, txt)
+        # 这里原来用的是外层循环残留的 txt（早就不在作用域了）——一走到这条路就崩
+        got[best] = (bd, num, _ltxt)
 
     # 3) 抢号：同一个号只留最近的那个框
     keep, keep_lab, full_name = {}, {}, {}
@@ -3090,6 +3091,17 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a = QAction("OCR 读框内文字(整册)", self)
             a.setToolTip("同上，整册逐页跑（有进度提示，可直接 Ctrl+Z 撤销）；同样只写 Node 框")
             a.triggered.connect(lambda: self.on_ocr_read(True))
+            tb.addAction(a)
+            a = QAction("自动补编号(本页)", self)
+            a.setToolTip("一键补编号：先用 PDF 文字层读（1~2 秒一页、字是原文不会认错），\n"
+                         "只有文字层没给到号的框才自动去 OCR。\n"
+                         "只写 LBD 区域（Node）框；支架框不碰。")
+            a.triggered.connect(lambda: self.on_auto_name(False))
+            tb.addAction(a)
+            a = QAction("自动补编号(整册)", self)
+            a.setToolTip("同上，整册逐页跑：有文字层的图纸基本不用装 OCR 组件。\n"
+                         "整册算一步，Ctrl+Z 一次全撤回。")
+            a.triggered.connect(lambda: self.on_auto_name(True))
             tb.addAction(a)
             tb.addWidget(QLabel("  名字 "))
             self.cmb_name = QComboBox()
@@ -4689,44 +4701,66 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 import traceback
                 QMessageBox.critical(self, "OCR 出错（把这段发我）", traceback.format_exc())
 
-        def _ocr_read_impl(self, whole=False):
+        def on_auto_name(self, whole=True):
+            """一键补编号：先读 PDF 文字层（快、精确），没拿到号的框再自动上 OCR。"""
+            try:
+                self._ocr_read_impl(whole, text_first=True)
+            except Exception:
+                import traceback
+                QMessageBox.critical(self, "自动补编号出错（把这段发我）",
+                                     traceback.format_exc())
+
+        def _ocr_read_impl(self, whole=False, text_first=False):
             import json as _json
             import subprocess
             import tempfile
             if not (self.pm and self.dbg):
-                self.statusBar().showMessage("先打开一份 JSON 再 OCR", 5000)
+                self.statusBar().showMessage("先打开一份 JSON 再补编号", 5000)
                 return
             if not (self.pdf and os.path.exists(self.pdf)):
-                QMessageBox.information(self, "缺 PDF", "OCR 要用渲染出来的底图，请先「选 PDF…」。")
+                QMessageBox.information(self, "缺 PDF",
+                                        "补编号要用 PDF（文字层 + 渲染底图），请先「选 PDF…」。")
                 return
-            pyp = str(self.settings.get("python") or "")
-            if not (pyp and os.path.exists(pyp)):
-                QMessageBox.information(self, "缺 Python",
-                                        "先在「训练环境…」里选好 Python 解释器（3.12 那个）。")
-                return
-            chk = subprocess.run([pyp, "-c", "import rapidocr_onnxruntime"],
-                                 capture_output=True, text=True, creationflags=_NO_WINDOW)
-            if chk.returncode != 0:
-                if QMessageBox.question(
-                        self, "要装 OCR 组件",
-                        "这个 Python 里还没有 rapidocr-onnxruntime"
-                        "（约 20MB，离线跑 OCR 用）。\n\n现在装吗？装完会自动继续。",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
-                    return
-                self.statusBar().showMessage("正在装 rapidocr-onnxruntime …", 0)
-                QApplication.processEvents()
-                p = subprocess.run([pyp, "-m", "pip", "install", "rapidocr-onnxruntime"],
-                                   capture_output=True, text=True, encoding="utf-8",
-                                   errors="replace", creationflags=_NO_WINDOW)
-                self.statusBar().showMessage("", 0)
-                if p.returncode != 0:
-                    QMessageBox.warning(self, "装不上",
-                                        ((p.stdout or "")[-600:] + (p.stderr or "")[-600:]))
-                    return
             script = os.path.join(tempfile.gettempdir(), "lbd_ocr.py")
-            with open(script, "w", encoding="utf-8") as f:
-                f.write(OCR_BOX_SCRIPT)
+            ocr_ready = {"v": None}
+
+            def ensure_ocr():
+                """真要 OCR 了才查 Python / rapidocr —— 只有文字层的图纸不用装任何东西。"""
+                if ocr_ready["v"] is not None:
+                    return ocr_ready["v"]
+                pyp = str(self.settings.get("python") or "")
+                if not (pyp and os.path.exists(pyp)):
+                    QMessageBox.information(self, "缺 Python",
+                                            "剩下这些框要 OCR，先在「训练环境…」里选好"
+                                            " Python 解释器（3.12 那个）。")
+                    ocr_ready["v"] = False
+                    return False
+                chk = subprocess.run([pyp, "-c", "import rapidocr_onnxruntime"],
+                                     capture_output=True, text=True, creationflags=_NO_WINDOW)
+                if chk.returncode != 0:
+                    if QMessageBox.question(
+                            self, "要装 OCR 组件",
+                            "剩下这些框要 OCR，但这个 Python 里还没有 rapidocr-onnxruntime"
+                            "（约 20MB，离线跑 OCR 用）。\n\n现在装吗？装完会自动继续。",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
+                        ocr_ready["v"] = False
+                        return False
+                    self.statusBar().showMessage("正在装 rapidocr-onnxruntime …", 0)
+                    QApplication.processEvents()
+                    p = subprocess.run([pyp, "-m", "pip", "install", "rapidocr-onnxruntime"],
+                                       capture_output=True, text=True, encoding="utf-8",
+                                       errors="replace", creationflags=_NO_WINDOW)
+                    self.statusBar().showMessage("", 0)
+                    if p.returncode != 0:
+                        QMessageBox.warning(self, "装不上",
+                                            ((p.stdout or "")[-600:] + (p.stderr or "")[-600:]))
+                        ocr_ready["v"] = False
+                        return False
+                with open(script, "w", encoding="utf-8") as f:
+                    f.write(OCR_BOX_SCRIPT)
+                ocr_ready["v"] = True
+                return True
             # OCR 用当前渲染的底图就行（250 DPI 实测字高 ~30px，读得稳）
             dpi = self.dpi if self.dpi > 0 else 250
             dbg_dir = os.path.join(work_dir(), "ocr_debug")
@@ -4754,19 +4788,64 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     QMessageBox.StandardButton.Yes) == QMessageBox.StandardButton.Yes:
                 n_clr = self.clear_tracker_lbd_names(todo)
                 self.statusBar().showMessage("已清掉支架上 %d 个旧编号" % n_clr, 6000)
-            stat = {"boxes": 0, "filled": 0, "raw": 0, "missed": 0, "pages": 0}
+            stat = {"boxes": 0, "filled": 0, "raw": 0, "missed": 0, "pages": 0,
+                    "text": 0, "text_pages": 0, "no_python": 0}
             heights = []
+            undone, ptext = [], None
             for n, pg in enumerate(todo):
-                self.statusBar().showMessage("OCR 第 %s 页（%d/%d）…"
-                                             % (pg, n + 1, len(todo)), 0)
+                self.statusBar().showMessage(
+                    "%s第 %s 页（%d/%d）…" % ("补编号 " if text_first else "OCR ",
+                                             pg, n + 1, len(todo)), 0)
                 QApplication.processEvents()
                 pm = self.pm if pg == self.page else (self.edited.get(pg)
                                                       or PageModel(self.dbg, pg))
-                # 只读 LBD 框（Node）里的文字；支架（Tracker）不读
+                snap = [(i, dict(s)) for i, s in enumerate(pm.shapes)]
+                touched = False
+                # ① 有文字层的先把文字层用上：1~2 秒一页，而且字是原文、不会认错
+                if text_first:
+                    if ptext is None:                   # 这个 PDF 读完一次就复用
+                        try:
+                            ptext = PdfText(self.pdf)
+                        except Exception:
+                            ptext = False
+                    items = []
+                    if ptext:
+                        try:
+                            items = ptext.items(pg)
+                        except Exception:
+                            items = []
+                    if items:
+                        for s in pm.shapes:             # 不是规范编号的名字当作没名字，重算
+                            if (s.get("label") == "Node" and not s.get("locked")
+                                    and not _full_lbd_name(s.get("name"))):
+                                if (s.get("name") or "").strip():
+                                    touched = True
+                                s["name"] = ""
+                                s["_auto"] = False
+                                s["_check"] = False
+                                s["_miss"] = False
+                        st0 = autofill_shapes(pm.shapes, items,
+                                              page_sheet_by_text(items, [])[0] or "",
+                                              set(), pm.width, pm.height)
+                        if st0.get("filled"):
+                            touched = True
+                            stat["text"] += st0["filled"]
+                            stat["text_pages"] += 1
+                # ② 文字层没给到号的框（自动补编号时）才送去 OCR；单跑 OCR 时全部重读
                 boxes = [{"ix": i, "label": s.get("label"), "bbox": s["bbox"]}
                          for i, s in enumerate(pm.shapes)
-                         if s.get("label") == "Node" and not s.get("locked")]
+                         if s.get("label") == "Node" and not s.get("locked")
+                         and not (text_first and _full_lbd_name(s.get("name")))]
                 if not boxes:
+                    if touched:
+                        undone.append((pg, snap))
+                        pm.dirty = True
+                        self.edited[pg] = pm
+                        if pg == self.page:
+                            self._rebuild_items()
+                    continue
+                if not ensure_ocr():
+                    stat["no_python"] += len(boxes)
                     continue
                 img = self.renderer.render(self.pdf, pg, dpi)
                 cfgp = os.path.join(tempfile.gettempdir(), "lbd_ocr_cfg.json")
@@ -4789,11 +4868,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 for r in data:
                     if r.get("h"):
                         heights.append(float(r["h"]))
-                self.begin_change()
                 for i, s in enumerate(pm.shapes):
                     r = got.get(i)
                     if not r or s.get("locked"):
                         continue
+                    touched = True
                     txt = (r.get("text") or "").strip()
                     stat["boxes"] += 1
                     name, kind = ocr_text_to_name(txt)
@@ -4825,23 +4904,63 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 pm.dirty = True
                 self.edited[pg] = pm
                 stat["pages"] += 1
+                if touched:
+                    undone.append((pg, snap))
                 # 没读到的：按「位置顺序 + 编号连续」推一把（推出来的标黄，要人核）
                 stat["inferred"] = stat.get("inferred", 0) + infer_lbd_names(pm.shapes,
                                                                             only_label="Node")
                 if pg == self.page:
                     self._rebuild_items()
+            # 整册算"一步"：Ctrl+Z 一次能把这次补的名字全撤回来
+            if undone:
+                self.undo.append(undone)
+                del self.undo[:-200]
+                self.redo.clear()
             self.mark_dirty()
             self.on_selection()
-            self.statusBar().showMessage(
-                "OCR 完成：%d 页 / %d 个 LBD 框，认出编号 %d 个，读到别的文字 %d 个，没读到 %d 个"
-                % (stat["pages"], stat["boxes"], stat["filled"], stat["raw"],
-                   stat["missed"]), 0)
+            if text_first:
+                self.statusBar().showMessage(
+                    "自动补编号完成：文字层给了 %d 个（%d 页），OCR 再补 %d 个，剩 %d 个要人填"
+                    % (stat["text"], stat["text_pages"], stat["filled"],
+                       max(0, stat["missed"] - stat.get("inferred", 0))), 0)
+            else:
+                self.statusBar().showMessage(
+                    "OCR 完成：%d 页 / %d 个 LBD 框，认出编号 %d 个，读到别的文字 %d 个，没读到 %d 个"
+                    % (stat["pages"], stat["boxes"], stat["filled"], stat["raw"],
+                       stat["missed"]), 0)
             hmed = sorted(heights)[len(heights) // 2] if heights else 0
             hint = ""
             if hmed:
                 hint = ("\n标签在原图里约 %.0f px 高 —— %s"
                         % (hmed, "够用" if hmed >= 25 else
                            "偏小（认不出来多半是这个原因），可以把底图 DPI 调高再跑"))
+            if text_first:
+                text_msg = (
+                    "自动补编号跑完 %d 页：\n"
+                    "  · PDF 文字层直接给到编号：%d 个（%d 页）—— 这一路是原文，不会认错字\n"
+                    "  · 文字层没给到、改用 OCR：%d 个框，其中认出标准编号 %d 个（绿）\n"
+                    "  · 像编号但不标准：%d 个（紫，写成名字了，请核一下）\n"
+                    "  · 框里读到的是别的字（旁注之类）：%d 个（没写进名字，标红等人填）\n"
+                    "  · 没读到、但按位置+编号连续性推出来的：%d 个（黄，请核一下）\n"
+                    "  · 没读到也推不出来的：%d 个（红，等人手填）%s\n\n"
+                    % (len(todo), stat["text"], stat["text_pages"], stat["boxes"],
+                       stat["filled"], stat["raw"], stat.get("noise", 0),
+                       stat.get("inferred", 0),
+                       max(0, stat["missed"] - stat.get("inferred", 0)), hint))
+                if stat["boxes"]:
+                    text_msg += ("剩下的框是按框本身裁图、每 5 个框拼一张识别的；"
+                                 "裁好的小图在：%s\n" % dbg_dir)
+                else:
+                    text_msg += ("这批页一个框都没用上 OCR（文字层就够了），"
+                                 "所以没要 Python / rapidocr 组件。\n")
+                if stat.get("no_python"):
+                    text_msg += ("⚠ 有 %d 个框本来要 OCR，但没选 Python / 没装 OCR 组件，"
+                                 "这次跳过了。\n" % stat["no_python"])
+                QMessageBox.information(
+                    self, "自动补编号",
+                    text_msg + "支架框（Tracker）一个没读、没写名字；锁定的框也没动。"
+                    "可以直接 Ctrl+Z 撤销。")
+                return
             QMessageBox.information(
                 self, "OCR 读框内文字",
                 "跑完 %d 页、%d 个 LBD 框（Node）：\n"
