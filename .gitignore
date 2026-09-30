@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
+# 自检（--smoke）会在程序目录留下的测试产物
+smoke_*.json
+selftest_annotated.json
 *.exe
 *.zip
 *.spec
