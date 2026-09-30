@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.37"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.38"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -971,6 +971,76 @@ def project_name(json_path):
         return ""
 
 
+def source_pdf_name(json_path):
+    """从 JSON 开头取 source_pdf（这份识别结果是哪份 PDF 做出来的）。
+
+    比 project_name 靠谱：project_name 有可能是空的，而 source_pdf 就是文件名本身。
+    """
+    try:
+        with open(json_path, "rb") as f:
+            head = f.read(8192).decode("utf-8", "ignore")
+    except Exception:
+        return ""
+    m = re.search(r'"source_pdf"\s*:\s*"([^"]+)"', head)
+    return os.path.basename(m.group(1).strip()) if m else ""
+
+
+def _pdf_search_dirs(json_path=""):
+    """找 PDF 时看这些目录：JSON 旁边、下载、桌面（含 OneDrive 的"桌面"）、文档。"""
+    home = os.path.expanduser("~")
+    cands = []
+    if json_path:
+        cands.append(os.path.dirname(os.path.abspath(json_path)))
+    cands += [os.path.join(home, "Downloads"), os.path.join(home, "Desktop"),
+              os.path.join(home, "Documents")]
+    for pat in ("OneDrive*/桌面", "OneDrive*/Desktop", "OneDrive*/桌面/*"):
+        cands += glob.glob(os.path.join(home, pat))
+    out, seen = [], set()
+    for d in cands:
+        if d and os.path.isdir(d) and d.lower() not in seen:
+            seen.add(d.lower())
+            out.append(d)
+    return out
+
+
+def find_pdf_by_name(name, json_path="", fuzzy=False, max_depth=3):
+    """按文件名找 PDF。fuzzy=True 时再按"名字里像"的找一遍（例如只差日期/版本）。"""
+    want = os.path.basename(str(name or "")).strip().lower()
+    if not want:
+        return ""
+    stem = os.path.splitext(want)[0]
+    for d in _pdf_search_dirs(json_path):
+        base = d.rstrip(os.sep).count(os.sep)
+        for root, subdirs, files in os.walk(d):
+            if root.count(os.sep) - base > max_depth:
+                subdirs[:] = []
+                continue
+            for f in files:
+                if f.lower() == want:
+                    return os.path.join(root, f)
+    if not fuzzy or not stem:
+        return ""
+    # 差日期的版本（"2026.04.16 Bigway Solar - ... _Plans.pdf" vs "2026.6.2 Bigway Solar- E&S 90_.pdf"）：
+    # 名字里的"词"（长度≥4）有一半以上重合就当像
+    words = [w for w in re.findall(r"[a-z]{4,}", stem)]
+    if not words:
+        return ""
+    for d in _pdf_search_dirs(json_path):
+        base = d.rstrip(os.sep).count(os.sep)
+        for root, subdirs, files in os.walk(d):
+            if root.count(os.sep) - base > max_depth:
+                subdirs[:] = []
+                continue
+            for f in sorted(files):
+                fl = f.lower()
+                if not fl.endswith(".pdf"):
+                    continue
+                hit = sum(1 for w in words if w in fl)
+                if hit >= max(2, (len(words) + 1) // 2):
+                    return os.path.join(root, f)
+    return ""
+
+
 def guess_pdf(json_path, exact_only=False):
     """按 JSON 里的 project_name 猜 PDF（同目录优先，其次 Downloads / 桌面）。
     exact_only=True 时只认文件名完全对得上的，不用兜底。"""
@@ -997,11 +1067,9 @@ def guess_pdf(json_path, exact_only=False):
                         return os.path.join(root, f)
     if exact_only:
         return ""
-    d = dirs[0]
-    if os.path.isdir(d):
-        for f in sorted(os.listdir(d)):
-            if f.lower().endswith(".pdf"):
-                return os.path.join(d, f)
+    # 兜底**不再**"目录里随便拿一个 PDF" —— 那会拿别项目的图纸当底图
+    #（用户反馈的"PDF 底图不对"就有这一条）。宁可没底图，也不要错的。
+    return ""
     return ""
 
 
@@ -3784,12 +3852,77 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             if self.pdf and not os.path.exists(self.pdf):
                 self.pdf = ""
             pname = project_name(path)
-            if self.pdf and pname and pname.lower() not in os.path.basename(self.pdf).lower():
-                better = guess_pdf(path, exact_only=True)
-                if better:
-                    self.pdf = better
-            if not self.pdf:
-                self.pdf = guess_pdf(path)
+            src_name = source_pdf_name(path)          # 这份 JSON 是哪份 PDF 做出来的
+            want = src_name or (pname + ".pdf" if pname else "")
+            pdf_note = ""
+
+            def _same_pdf(a, b):
+                a, b = os.path.basename(str(a or "")).lower(), os.path.basename(str(b or "")).lower()
+                if not a or not b:
+                    return False
+                sa, sb = os.path.splitext(a)[0], os.path.splitext(b)[0]
+                return a == b or sa == sb or sa in sb or sb in sa
+
+            cur = os.path.basename(self.pdf) if self.pdf else ""
+            if want and self.pdf and _same_pdf(want, cur):
+                pass                                    # 就是这份，没毛病
+            else:
+                exact = find_pdf_by_name(want, path) if want else ""
+                fuzzy = "" if exact else (find_pdf_by_name(want, path, fuzzy=True)
+                                          if want else "")
+                if exact:
+                    self.pdf = exact
+                    if cur and not _same_pdf(exact, cur):
+                        pdf_note = ("已按 JSON 里写的源文件名换成：\n  %s\n"
+                                    % os.path.basename(exact))
+                elif fuzzy:
+                    # 名字像不代表是同一份：先看页数，对不上直接不用；
+                    # 就算页数够，也**问一句**再用 —— 底图拿错比没底图更坑
+                    sizes = pdf_page_sizes(fuzzy)
+                    need = max(self.dbg.page_numbers()) if self.dbg.page_numbers() else 0
+                    if sizes and need and len(sizes) < need:
+                        self.pdf = ""
+                        pdf_note = ("本机找到一份名字像的图纸：\n  %s\n"
+                                    "但它只有 %d 页，这份 JSON 有 %d 页 —— 不是同一份，"
+                                    "所以没拿它当底图。\n点「选 PDF…」选上正确的那份"
+                                    "（JSON 里写的是：%s）。"
+                                    % (os.path.basename(fuzzy), len(sizes), need, want))
+                    else:
+                        ask = ("本机找不到 JSON 里写的那份 PDF：\n  %s\n\n"
+                               "找到一份名字像的：\n  %s\n（%d 页，这份 JSON 有 %d 页）\n\n"
+                               "要用它当底图吗？如果不是同一份图纸，框和底图会对不上。"
+                               % (want, os.path.basename(fuzzy),
+                                  len(sizes) if sizes else 0, need))
+                        use = False
+                        if TEST_MODE:
+                            print("底图询问（自检自动选否）：", ask.replace("\n", " "))
+                        else:
+                            use = (QMessageBox.question(
+                                self, "这份 PDF 是同一份图纸吗？", ask,
+                                QMessageBox.StandardButton.Yes
+                                | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No)
+                                == QMessageBox.StandardButton.Yes)
+                        if use:
+                            self.pdf = fuzzy
+                            pdf_note = "已用你确认的那份 PDF 当底图：\n  %s\n" % os.path.basename(fuzzy)
+                        else:
+                            self.pdf = ""
+                            pdf_note = ("这份 JSON 对应的是：\n  %s\n本机没找到它，"
+                                        "所以这次先不给底图（免得框和底图对不上）。\n"
+                                        "点「选 PDF…」选上正确的 PDF，选一次会记住。"
+                                        % want)
+                else:
+                    if self.pdf:
+                        pdf_note = ("这份 JSON 对应的是：\n  %s\n工具里上次选的是：\n  %s\n"
+                                    "两者不是一份图纸，本机也没找到那份 PDF，所以这次先不给底图"
+                                    "（免得框和底图对不上）。\n点「选 PDF…」选上正确的 PDF，选一次会记住。"
+                                    % (want or "（JSON 里没写）", cur))
+                    self.pdf = ""
+            if pdf_note and not TEST_MODE:
+                QMessageBox.warning(self, "底图对不上", pdf_note)
+            elif pdf_note:
+                print("底图警告：", pdf_note.replace("\n", " "))
             self._ptext = None
             if self.pdf:
                 self.update_pdf_button()
@@ -3947,8 +4080,37 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     self.cmb_dpi.setCurrentIndex(i)
                     self.cmb_dpi.blockSignals(False)
             self.update_pdf_button()
+            self.check_pdf_pages(p)           # 选的 PDF 页数明显对不上就提醒一句
             if self.dbg:
                 self.goto_page(self.page)
+
+        def check_pdf_pages(self, pdf):
+            """选的 PDF 和这份 JSON 是不是同一份：先看名字，再看页数。
+
+            底图不对（框和图纸错位）十次有九次是"拿了别项目的 PDF 当底图"，
+            提醒比默默画错强。
+            """
+            if not (self.dbg and pdf):
+                return
+            try:
+                want = source_pdf_name(self.dbg.path) or ""
+                cur = os.path.basename(pdf)
+                msg = ""
+                if want:
+                    a, b = os.path.splitext(want)[0].lower(), os.path.splitext(cur)[0].lower()
+                    if not (a == b or a in b or b in a):
+                        msg += ("这份 JSON 是「%s」做出来的，你现在选的是「%s」。\n" % (want, cur))
+                need = max(self.dbg.page_numbers()) if self.dbg.page_numbers() else 0
+                sizes = pdf_page_sizes(pdf)
+                if sizes and need and len(sizes) < need:
+                    msg += ("这份 PDF 只有 %d 页，但 JSON 里有 %d 页。\n" % (len(sizes), need))
+                if msg:
+                    QMessageBox.warning(
+                        self, "这份 PDF 对吗？",
+                        msg + "\n如果不是同一份图纸，底图和框会对不上；"
+                              "确认要接着用就点「OK」。")
+            except Exception:
+                pass
 
         def update_pdf_button(self):
             if self.pdf:
