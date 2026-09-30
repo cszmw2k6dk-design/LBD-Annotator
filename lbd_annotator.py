@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.33"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.34"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -255,17 +255,23 @@ def ocr_items(items, dbg_name=""):
         pass
     got = {}
     pos = {}
+    lbox = {}
     for box, t, s in (res or []):
-        yy = (min(p[1] for p in box) + max(p[1] for p in box)) / 2.0
-        xx = (min(p[0] for p in box) + max(p[0] for p in box)) / 2.0
+        xs1 = min(p[0] for p in box)
+        xs2 = max(p[0] for p in box)
+        ys1 = min(p[1] for p in box)
+        ys2 = max(p[1] for p in box)
+        yy = (ys1 + ys2) / 2.0
+        xx = (xs1 + xs2) / 2.0
         for ix, (a, b2) in ys.items():
             if a - 4 <= yy <= b2 + 4:
                 old = got.get(ix)
                 if old is None or float(s) > old[1]:
                     got[ix] = (t, float(s))
                     pos[ix] = to_page(ix, xx, yy, a)
+                    lbox[ix] = to_page_box(ix, xs1, ys1, xs2, ys2, a)
                 break
-    return got, pos
+    return got, pos, lbox
 
 
 def to_page(ix, xs, ys_, paste_y):
@@ -287,6 +293,17 @@ def to_page(ix, xs, ys_, paste_y):
     return ((x0 + px_) / sx, (y0 + py_) / sy)
 
 
+def to_page_box(ix, xs1, ys1, xs2, ys2, paste_y):
+    """拼图上一个矩形 -> 页面上的矩形（四个角都反算一遍再取外框，旋转也不怕）。"""
+    pts = [to_page(ix, xs1, ys1, paste_y), to_page(ix, xs2, ys1, paste_y),
+           to_page(ix, xs1, ys2, paste_y), to_page(ix, xs2, ys2, paste_y)]
+    pts = [p for p in pts if p]
+    if not pts:
+        return None
+    return (min(p[0] for p in pts), min(p[1] for p in pts),
+            max(p[0] for p in pts), max(p[1] for p in pts))
+
+
 # 1) 主跑：按框本身裁，5 块拼一张
 crops = []
 for b in cfg["boxes"]:
@@ -296,9 +313,9 @@ for b in cfg["boxes"]:
 geo_of = {b["ix"]: b.get("_geo") for b, _c in crops}
 out = {}
 for gi in range(0, len(crops), GROUP):
-    got_g, pos_g = ocr_items(crops[gi:gi + GROUP], "g%d" % (gi // GROUP + 1))
+    got_g, pos_g, box_g = ocr_items(crops[gi:gi + GROUP], "g%d" % (gi // GROUP + 1))
     for ix, v in got_g.items():
-        out[ix] = (v[0], v[1], pos_g.get(ix))
+        out[ix] = (v[0], v[1], pos_g.get(ix), box_g.get(ix))
 
 # 2) 补救：没读到标准编号的框单独再跑一次；还不行就把框往外扩 25%/15% 再单独跑一次
 #    （标签压在框线上、或者框裁得太紧把字切掉的情况，靠这一步捞回来）
@@ -310,16 +327,17 @@ for n, b in enumerate(bad[:80]):
         if c is None:
             continue
         geo_of[b["ix"]] = b.get("_geo")
-        got2, pos2 = ocr_items([(b, c)], "p%s_%s_%d" % (cfg.get("page", 0), tag, n))
+        got2, pos2, box2 = ocr_items([(b, c)], "p%s_%s_%d" % (cfg.get("page", 0), tag, n))
         v = got2.get(b["ix"])
         if v and LBD_RE.search((v[0] or "").replace(" ", "")):
-            out[b["ix"]] = (v[0], v[1], pos2.get(b["ix"]))
+            out[b["ix"]] = (v[0], v[1], pos2.get(b["ix"]), box2.get(b["ix"]))
             break
 
 _hm = {b["ix"]: b.get("h_raw") for b in cfg["boxes"]}
 print("@@" + json.dumps([{"ix": k, "text": v[0], "score": v[1], "h": _hm.get(k),
                           "pos": ([round(float(v[2][0])), round(float(v[2][1]))]
-                                  if v[2] else None)}
+                                  if v[2] else None),
+                          "bbox": ([round(float(x)) for x in v[3]] if v[3] else None)}
                          for k, v in sorted(out.items())], ensure_ascii=False))
 '''
 
@@ -1853,29 +1871,59 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
     if not nodes:
         return stat
 
-    def _find_label_pos(s):
-        """框里那条编号文字印在哪儿：优先"整段文字和名字一样"的，其次"号一样"的。
+    def _find_label_mark(s):
+        """框里那条编号文字印在哪儿：(中心, 小框) —— 都是页面像素坐标。
 
-        名字已经有了（以前跑过、或者人填的）时也要把位置补上 —— 用户反馈的
-        "导出 JSON 里没有 lbd 编号位置"就是因为老逻辑见到已有名字就整框跳过。
+        优先"整段文字和名字一样"的，其次"号一样"的。名字已经有了（以前跑过、或者
+        人填的）时也要能拿到 —— 用户反馈的"导出 JSON 里没有 lbd 编号位置"就是因为
+        老逻辑见到已有名字就整框跳过。
         """
         name = (s.get("name") or "").strip()
         if not name:
             return None
         want = _name_num(name)
         nm = re.sub(r"\s+", "", name).upper()
-        fallback = None
+        hit = None
         b = s["bbox"]
         for it in text_items:
             px, py = it[1] * width, (1.0 - it[2]) * height
             if not (b[0] <= px <= b[2] and b[1] <= py <= b[3]):
                 continue
             up = re.sub(r"\s+", "", str(it[0] or "")).upper()
-            if up == nm:
-                return (px, py)
-            if fallback is None and want is not None and _lbd_num_in(it[0]) == want:
-                fallback = (px, py)
-        return fallback
+            same = (up == nm)
+            if not same and (want is None or _lbd_num_in(it[0]) != want):
+                continue
+            # 文字项的框：x1,x2 直接换算；y 是自下而上的，要翻过来
+            bb = (it[3] * width, (1.0 - it[6]) * height,
+                  it[5] * width, (1.0 - it[4]) * height)
+            if same:
+                return (px, py), bb
+            if hit is None:
+                hit = ((px, py), bb)
+        return hit
+
+    def _mark_positions():
+        """给已经定了名字的框补上"编号印在哪儿"：label_pos（中心）+ label_bbox（小框）。
+
+        已经有名字、只有中心没框的（老文件）也在这里补齐。按标签表顺序推出来的名字
+        没有对应文字，给不出框，跳过。
+        """
+        for _i, s in nodes:
+            nm = (s.get("name") or "").strip()
+            if not nm or s.get("_auto"):
+                continue
+            raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+            if raw.get("label_pos") and raw.get("label_bbox"):
+                continue
+            mk = _find_label_mark(s)
+            if not mk:
+                continue
+            (cx, cy), bb = mk
+            raw["label_pos"] = [int(round(cx)), int(round(cy))]
+            raw["label_bbox"] = [int(round(v)) for v in bb]
+            raw["label_src"] = raw.get("label_src") or "text_layer"
+            s["raw"] = raw
+            stat["pos_added"] = stat.get("pos_added", 0) + 1
 
     # 已经有人写过的名字：不动（免得把手工改的冲掉）
     todo = []
@@ -1883,20 +1931,13 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
         if (s.get("name") or "").strip() and not s.get("_auto"):
             stat["kept"] += 1
             s["_miss"] = False
-            raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
-            if not raw.get("label_pos"):            # 老文件没有位置 -> 现在补上
-                bb = _find_label_pos(s)
-                if bb:
-                    raw["label_pos"] = [int(round(bb[0])), int(round(bb[1]))]
-                    raw["label_src"] = raw.get("label_src") or "text_layer"
-                    s["raw"] = raw
-                    stat["pos_added"] += 1
         else:
             s["name"] = ""
             s["_miss"] = False
             s["_check"] = False
             todo.append((i, s))
     if not todo:
+        _mark_positions()       # 名字都齐了，但可能缺位置/小框 -> 补上再返回
         return stat
 
     # 1) 候选文字：编号 + 分表名过滤 + 去掉图例/引线名单
@@ -2086,6 +2127,8 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
         if not (s.get("name") or "").strip():
             s["_miss"] = True
             stat["missed"] += 1
+    # 4b) 把"编号印在哪儿"补全：位置 + 小框（画在图上给人核对用）
+    _mark_positions()
     # 5) 位置可疑：同一行里号码跳号 -> 标紫（紫 = 从框内取到号了，但和同排的号对不上，
     #    也可能是框画错/取到了隔壁）；黄 = 按标签表顺序推的，同样要人核一眼。
     stat["sus"] = _flag_suspicious(shapes)
@@ -2507,9 +2550,12 @@ class PageModel:
             if raw.get("label_pos"):
                 rec["label_pos"] = [int(raw["label_pos"][0]), int(raw["label_pos"][1])]
                 rec["label_src"] = raw.get("label_src") or ""
+                if raw.get("label_bbox"):
+                    rec["label_bbox"] = [int(v) for v in raw["label_bbox"]]
             else:
                 rec.pop("label_pos", None)
                 rec.pop("label_src", None)
+                rec.pop("label_bbox", None)
             out.append(rec)
         return out
 
@@ -2868,6 +2914,40 @@ def make_gui_classes():
         def wheelEvent(self, ev):
             self.zoom_step(1.18 if ev.angleDelta().y() > 0 else 1 / 1.18,
                            ev.position().toPoint())
+
+        def drawForeground(self, painter, rect):
+            """把「识别到的编号框」画出来（工具栏「编号框」开关控制）。
+
+            数据来自每个 Node 的 raw.label_pos / raw.label_bbox：
+              · label_bbox 有 -> 画小方框（文字层给的是估算框，OCR 给的是实测框）
+              · 只有 label_pos -> 画一个小十字
+            线宽用 cosmetic，放多大都不变粗；只画当前页，不参与选中/拖动。
+            """
+            win = self.win
+            if not getattr(win, "show_label_boxes", False) or not win.pm:
+                return
+            sc = max(self.transform().m11(), 1e-6)
+            box_pen = QPen(QColor(255, 140, 0), 1.6)
+            box_pen.setCosmetic(True)
+            cross_pen = QPen(QColor(255, 60, 60), 1.6)
+            cross_pen.setCosmetic(True)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for s in win.pm.shapes:
+                if s.get("label") != "Node":
+                    continue
+                raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+                bb = raw.get("label_bbox")
+                if bb and len(bb) == 4:
+                    painter.setPen(box_pen)
+                    painter.drawRect(QRectF(float(bb[0]), float(bb[1]),
+                                            float(bb[2]) - float(bb[0]),
+                                            float(bb[3]) - float(bb[1])))
+                pos = raw.get("label_pos")
+                if pos:
+                    painter.setPen(cross_pen)
+                    r = 7.0 / sc
+                    painter.drawLine(QPointF(pos[0] - r, pos[1]), QPointF(pos[0] + r, pos[1]))
+                    painter.drawLine(QPointF(pos[0], pos[1] - r), QPointF(pos[0], pos[1] + r))
 
         def mousePressEvent(self, ev):
             if ev.button() == Qt.MouseButton.MiddleButton:
@@ -3283,6 +3363,29 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             menu_more.addAction(wa)
             btn_more.setMenu(menu_more)
             tb.addWidget(btn_more)
+            # 把"识别到的编号框"画在图上（核对用）
+            self.act_labelboxes = QAction("编号框", self)
+            self.act_labelboxes.setCheckable(True)
+            self.show_label_boxes = bool(self.settings.get("label_boxes", True))
+            self.act_labelboxes.setChecked(self.show_label_boxes)
+            self.act_labelboxes.setToolTip(
+                "在图上把编号的位置画出来（橙色小方框 + 红色小十字）：\n"
+                "· 方框 = 编号文字的区域（文字层给的是估算框，OCR 给的是实测框）\n"
+                "· 十字 = 编号中心点\n"
+                "数据来自每个 Node 的 raw.label_bbox / raw.label_pos，"
+                "补过编号的框才有；只画当前页。")
+
+            def _toggle_label_boxes(checked):
+                self.show_label_boxes = bool(checked)
+                self.settings["label_boxes"] = bool(checked)
+                save_settings(self.settings)
+                try:
+                    self.canvas.viewport().update()
+                except Exception:
+                    pass
+
+            self.act_labelboxes.toggled.connect(_toggle_label_boxes)
+            tb.addAction(self.act_labelboxes)
             tb.addWidget(QLabel("  名字 "))
             self.cmb_name = QComboBox()
             # (显示方式, 字号, 只画选中的那个)
@@ -5134,6 +5237,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
                         raw["label_pos"] = [int(round(float(bb[0]))),
                                             int(round(float(bb[1])))]
+                        bb2 = r.get("bbox")
+                        if bb2:
+                            raw["label_bbox"] = [int(round(float(x))) for x in bb2]
                         raw["label_src"] = "ocr"
                         s["raw"] = raw
                 pm.dirty = True
@@ -6452,6 +6558,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         if not path:
             print("smoke：没给 JSON 路径")
             return 2
+        # 开发用：LBD_JSON / LBD_PDF 可以指定"用哪个文件跑截图检查"
+        _j = os.environ.get("LBD_JSON")
+        if _j:
+            win.pdf = os.environ.get("LBD_PDF") or win.pdf
+            path = _j
         win.load_file(path)
         print("载入 OK：共 %d 页，第 %d 页 %d 个框"
               % (len(win.dbg.page_numbers()), win.page, len(win.items)))
