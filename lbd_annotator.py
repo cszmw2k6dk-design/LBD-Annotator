@@ -44,7 +44,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.20"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.21"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -190,12 +190,13 @@ for b in cfg["boxes"]:
     x1, y1, x2, y2 = b["bbox"]
     X1, Y1, X2, Y2 = x1 * sx, y1 * sy, x2 * sx, y2 * sy
     w, h = max(1.0, X2 - X1), max(1.0, Y2 - Y1)
-    mx, my = w * 0.15 + 2, h * 0.10 + 2
+    mx, my = w * 0.25 + 3, h * 0.15 + 3        # 外扩多点，别把标签裁断
     box = (max(0, int(X1 - mx)), max(0, int(Y1 - my)),
            min(img.width, int(X2 + mx)), min(img.height, int(Y2 + my)))
     c = img.crop(box)
     if c.width < 8 or c.height < 8:
         continue
+    b["h_raw"] = min(c.size)                   # 原图里这一块有多高（判断分辨率够不够）
     if c.height > c.width * 1.15:            # 竖排：转成横的（180 度交给角度分类器）
         c = c.rotate(90, expand=True)
     if min(c.size) < 40:                     # 太小就放大，OCR 才认得出
@@ -225,6 +226,14 @@ for grp in groups:
         y += c.height + 12
     tmp = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "_ocr_sheet.png")
     sheet.save(tmp)
+    dbg = cfg.get("debug_dir") or ""
+    if dbg:
+        try:
+            os.makedirs(dbg, exist_ok=True)
+            sheet.save(os.path.join(dbg, "sheet_p%s_%d.png"
+                                    % (cfg.get("page", 0), len(out) + 1)))
+        except OSError:
+            pass
     res, _el = eng(tmp)
     try:
         os.remove(tmp)
@@ -238,7 +247,8 @@ for grp in groups:
                 if old is None or float(s) > old[1]:
                     out[ix] = (t, float(s))
                 break
-print("@@" + json.dumps([{"ix": k, "text": v[0], "score": v[1]}
+_hm = {b["ix"]: b.get("h_raw") for b in cfg["boxes"]}
+print("@@" + json.dumps([{"ix": k, "text": v[0], "score": v[1], "h": _hm.get(k)}
                          for k, v in sorted(out.items())], ensure_ascii=False))
 '''
 
@@ -1286,7 +1296,7 @@ def _name_num(name):
     return int(segs[-1]) if segs else None
 
 
-def infer_lbd_names(shapes, max_gap=3):
+def infer_lbd_names(shapes, max_gap=3, only_label=None):
     """给"没读到编号"的框按「位置顺序 + 编号连续」推编号，推出来的标黄（_auto）。
 
     只推能自证的情况，宁可少推也不乱推：
@@ -1299,6 +1309,8 @@ def infer_lbd_names(shapes, max_gap=3):
     rows = []
     for i, s in enumerate(shapes):
         if s.get("label") not in ("Node", "Tracker") or s.get("locked"):
+            continue
+        if only_label and s.get("label") != only_label:
             continue
         m = re.search(r"([A-Z]{2,}\d+[A-Z]?\d*)[-_ ]*LBD[-_ ]*0*(\d{1,3})",
                       (s.get("name") or ""), re.I)
@@ -2977,13 +2989,13 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a.triggered.connect(lambda _c=False: self.on_ai_detect(True))
             tb.addAction(a)
             a = QAction("OCR 读框内文字(本页)", self)
-            a.setToolTip("用 OCR 读每个框（Node/Tracker）里的文字 —— 图纸里的字被转成矢量轮廓、\n"
-                         "没有文字层时用这个；竖排标签也能读。\n"
+            a.setToolTip("用 OCR 读每个 LBD 框（Node）里的文字 —— 图纸里的字被转成矢量轮廓、\n"
+                         "没有文字层时用这个；竖排标签也能读。支架框（Tracker）不读、不写名字。\n"
                          "需要 Python 环境里装 rapidocr-onnxruntime（没装会问你要不要装）。")
             a.triggered.connect(lambda: self.on_ocr_read(False))
             tb.addAction(a)
             a = QAction("OCR 读框内文字(整册)", self)
-            a.setToolTip("同上，整册逐页跑（有进度提示，可直接 Ctrl+Z 撤销）")
+            a.setToolTip("同上，整册逐页跑（有进度提示，可直接 Ctrl+Z 撤销）；同样只写 Node 框")
             a.triggered.connect(lambda: self.on_ocr_read(True))
             tb.addAction(a)
             tb.addWidget(QLabel("  名字 "))
@@ -4398,7 +4410,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     pm.dirty = True
                     self.edited[pg] = pm
                     # 没选标签表时：没取到号的按「位置顺序 + 编号连续」推一把（标黄）
-                    n_tui = infer_lbd_names(pm.shapes) if text_only else 0
+                    n_tui = (infer_lbd_names(pm.shapes, only_label="Node")
+                             if text_only else 0)
                     if pg == self.page:
                         self._rebuild_items()
                     n_ok += st["filled"]
@@ -4539,9 +4552,44 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 import traceback
                 QMessageBox.critical(self, "识别面板出错（把这段发我）", traceback.format_exc())
 
-        # ---------------- OCR：读框里的文字（图纸里那些字是矢量轮廓时的兜底）
+        # ---------------- OCR：读 LBD 框里的文字（图纸里那些字是矢量轮廓时的兜底）
+        def clear_tracker_lbd_names(self, pages):
+            """把旧版 OCR 写到支架框（Tracker）上的 LBD 编号清掉。
+
+            只动"名字里有 LBD 字样"的支架框：锁定的、以及分档写的「3串」那种不动。
+            整册算"一步"，Ctrl+Z 一次能全撤回来。返回清掉的个数。
+            """
+            undone, n = [], 0
+            for pg in pages:
+                pm = self._pm_of(pg)
+                if pm is None:
+                    continue
+                hit = [i for i, s in enumerate(pm.shapes)
+                       if s.get("label") != "Node" and not s.get("locked")
+                       and re.search(r"LBD", s.get("name") or "", re.I)]
+                if not hit:
+                    continue
+                undone.append((pg, [(i, dict(s)) for i, s in enumerate(pm.shapes)]))
+                for i in hit:
+                    pm.shapes[i]["name"] = ""
+                    pm.shapes[i]["_auto"] = False
+                    pm.shapes[i]["_miss"] = False
+                    pm.shapes[i]["_check"] = False
+                    n += 1
+                pm.dirty = True
+                self.edited[pg] = pm
+            if undone:
+                self.undo.append(undone)
+                del self.undo[:-200]
+                self.redo.clear()
+                if any(pg == self.page for pg, _s in undone):
+                    self._rebuild_items()
+                self.mark_dirty()
+                self.on_selection()
+            return n
+
         def on_ocr_read(self, whole=False):
-            """用 OCR 读每个框（Node/Tracker）里的文字 —— 竖排也能读。"""
+            """用 OCR 读每个 LBD 框（Node）里的文字 —— 竖排也能读；支架框不读。"""
             try:
                 self._ocr_read_impl(whole)
             except Exception:
@@ -4586,26 +4634,53 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             script = os.path.join(tempfile.gettempdir(), "lbd_ocr.py")
             with open(script, "w", encoding="utf-8") as f:
                 f.write(OCR_BOX_SCRIPT)
-            dpi = self.dpi if self.dpi > 0 else 333
+            # OCR 分辨率：至少 300 DPI（标签字高至少要 25px 左右才稳）
+            dpi = max(self.dpi, 300) if self.dpi > 0 else 300
+            dbg_dir = os.path.join(work_dir(), "ocr_debug")
             order = self._page_order() or [self.page]
             todo = order if whole else [self.page]
+            # 只读 LBD 框（Node）里的字，支架框（Tracker）一个都不写。
+            # v0.20 及以前的 OCR 是 Node+Tracker 一起读的，支架上因此留下了编号
+            #（用户反馈"支架也被填上名字了"就是这条路径）—— 先问一句要不要清掉。
+            stale = 0
+            for _pg in todo:
+                _pm0 = self._pm_of(_pg)
+                if _pm0 is None:
+                    continue
+                stale += sum(1 for s in _pm0.shapes
+                             if s.get("label") != "Node" and not s.get("locked")
+                             and re.search(r"LBD", s.get("name") or "", re.I))
+            if stale and QMessageBox.question(
+                    self, "支架上还留着旧版写的编号",
+                    "扫到 %d 个支架框（Tracker）上写着 LBD 编号 —— 那是 v0.21 之前的 OCR"
+                    "连支架一起读留下的。\n\n"
+                    "· 是 —— 现在把这些名字清掉（Ctrl+Z 能撤销）\n"
+                    "· 否 —— 留着不动。这次 OCR 只会写 LBD 框（Node），支架不会再被写"
+                    % stale,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes) == QMessageBox.StandardButton.Yes:
+                n_clr = self.clear_tracker_lbd_names(todo)
+                self.statusBar().showMessage("已清掉支架上 %d 个旧编号" % n_clr, 6000)
             stat = {"boxes": 0, "filled": 0, "raw": 0, "missed": 0, "pages": 0}
+            heights = []
             for n, pg in enumerate(todo):
                 self.statusBar().showMessage("OCR 第 %s 页（%d/%d）…"
                                              % (pg, n + 1, len(todo)), 0)
                 QApplication.processEvents()
                 pm = self.pm if pg == self.page else (self.edited.get(pg)
                                                       or PageModel(self.dbg, pg))
+                # 只读 LBD 框（Node）里的文字；支架（Tracker）不读
                 boxes = [{"ix": i, "label": s.get("label"), "bbox": s["bbox"]}
                          for i, s in enumerate(pm.shapes)
-                         if s.get("label") in ("Node", "Tracker") and not s.get("locked")]
+                         if s.get("label") == "Node" and not s.get("locked")]
                 if not boxes:
                     continue
                 img = self.renderer.render(self.pdf, pg, dpi)
                 cfgp = os.path.join(tempfile.gettempdir(), "lbd_ocr_cfg.json")
                 with open(cfgp, "w", encoding="utf-8") as f:
                     _json.dump({"img": img, "page_w": pm.width, "page_h": pm.height,
-                                "boxes": boxes}, f, ensure_ascii=False)
+                                "page": pg, "debug_dir": dbg_dir, "boxes": boxes},
+                               f, ensure_ascii=False)
                 pr = subprocess.run([pyp, script, cfgp], capture_output=True, text=True,
                                     encoding="utf-8", errors="replace", timeout=7200,
                                     creationflags=_NO_WINDOW)
@@ -4618,6 +4693,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                                  % (pg, (pr.stderr or "")[-200:]), 8000)
                     continue
                 got = {int(r["ix"]): r for r in data}
+                for r in data:
+                    if r.get("h"):
+                        heights.append(float(r["h"]))
                 self.begin_change()
                 for i, s in enumerate(pm.shapes):
                     r = got.get(i)
@@ -4643,26 +4721,34 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 self.edited[pg] = pm
                 stat["pages"] += 1
                 # 没读到的：按「位置顺序 + 编号连续」推一把（推出来的标黄，要人核）
-                stat["inferred"] = stat.get("inferred", 0) + infer_lbd_names(pm.shapes)
+                stat["inferred"] = stat.get("inferred", 0) + infer_lbd_names(pm.shapes,
+                                                                            only_label="Node")
                 if pg == self.page:
                     self._rebuild_items()
             self.mark_dirty()
             self.on_selection()
             self.statusBar().showMessage(
-                "OCR 完成：%d 页 / %d 个框，认出编号 %d 个，读到别的文字 %d 个，没读到 %d 个"
+                "OCR 完成：%d 页 / %d 个 LBD 框，认出编号 %d 个，读到别的文字 %d 个，没读到 %d 个"
                 % (stat["pages"], stat["boxes"], stat["filled"], stat["raw"],
                    stat["missed"]), 0)
+            hmed = sorted(heights)[len(heights) // 2] if heights else 0
+            hint = ""
+            if hmed:
+                hint = ("\n\n标签在原图里约 %.0f px 高 —— %s"
+                        % (hmed, "够用" if hmed >= 25 else
+                           "偏小，建议把底图 DPI 调到 400 再跑一遍"))
             QMessageBox.information(
                 self, "OCR 读框内文字",
-                "跑完 %d 页、%d 个框：\n"
+                "跑完 %d 页、%d 个 LBD 框（Node）：\n"
                 "  · 认出标准编号：%d 个（绿）\n"
                 "  · 读到别的文字：%d 个（紫，写成名字了，请核一下）\n"
                 "  · 没读到、但按位置+编号连续性推出来的：%d 个（黄，请核一下）\n"
-                "  · 没读到也推不出来的：%d 个（红，等人手填）\n\n"
-                "锁定的框一个没动；可以直接 Ctrl+Z 撤销。"
+                "  · 没读到也推不出来的：%d 个（红，等人手填）%s\n\n"
+                "裁好的小图存在：%s\n"
+                "支架框（Tracker）一个没读、没写名字；锁定的框也没动。可以直接 Ctrl+Z 撤销。"
                 % (stat["pages"], stat["boxes"], stat["filled"], stat["raw"],
                    stat.get("inferred", 0),
-                   max(0, stat["missed"] - stat.get("inferred", 0))))
+                   max(0, stat["missed"] - stat.get("inferred", 0)), hint, dbg_dir))
 
         def _ai_detect_impl(self, whole=False):
             from PySide6.QtWidgets import (QDialog, QPlainTextEdit, QVBoxLayout, QHBoxLayout,
