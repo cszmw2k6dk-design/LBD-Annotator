@@ -44,7 +44,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.21"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.22"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -177,61 +177,67 @@ def update_token(settings=None):
 
 
 OCR_BOX_SCRIPT = r'''
-import json, os, sys
+import json, os, re, sys
 from PIL import Image
 from rapidocr_onnxruntime import RapidOCR
+
+# 一张图最多拼几块。拼太多会读乱 —— 实测（Steel River 第 1 页，20 个 LBD 框）：
+#   每张 30 块：20 个框只读对 2 个（读出来是一堆不相干的字，用户看到的就是这个）
+#   每张 5 块 ：20 个框全对
+# 原因：拼成一张 2000x7000 的超长图后，检出/识别出来的框会串行、串块，认出来的字就跑了。
+GROUP = 5
+GAP = 12
+LBD_RE = re.compile(r"INV\s*\d+\s*[A-Z]\s*\d+\s*[-_ ]?\s*LBD\s*[-_ ]?\s*\d+", re.I)
 
 cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 img = Image.open(cfg["img"]).convert("RGB")
 sx = img.width / float(cfg.get("page_w") or img.width)
 sy = img.height / float(cfg.get("page_h") or img.height)
-crops = []
-for b in cfg["boxes"]:
+
+
+def crop_of(b, mw, mh):
+    """按框裁一块。mw/mh 是外扩比例，0 就是"就按这个框裁"（实测最准：
+    框挨着框时，往外扩会把隔壁框的编号一起吃进来）。"""
     x1, y1, x2, y2 = b["bbox"]
     X1, Y1, X2, Y2 = x1 * sx, y1 * sy, x2 * sx, y2 * sy
     w, h = max(1.0, X2 - X1), max(1.0, Y2 - Y1)
-    mx, my = w * 0.25 + 3, h * 0.15 + 3        # 外扩多点，别把标签裁断
+    mx, my = w * mw + 3, h * mh + 3
     box = (max(0, int(X1 - mx)), max(0, int(Y1 - my)),
            min(img.width, int(X2 + mx)), min(img.height, int(Y2 + my)))
     c = img.crop(box)
     if c.width < 8 or c.height < 8:
-        continue
+        return None
     b["h_raw"] = min(c.size)                   # 原图里这一块有多高（判断分辨率够不够）
     if c.height > c.width * 1.15:            # 竖排：转成横的（180 度交给角度分类器）
         c = c.rotate(90, expand=True)
     if min(c.size) < 40:                     # 太小就放大，OCR 才认得出
         z = max(2, int(40 / max(1, min(c.size))) + 1)
         c = c.resize((c.width * z, c.height * z), Image.LANCZOS)
-    crops.append((b, c))
+    return c
 
-groups, cur = [], []
-for b, c in crops:                           # 每 30 块拼一条长图，一次 OCR 全读
-    cur.append((b, c))
-    if len(cur) >= 30:
-        groups.append(cur)
-        cur = []
-if cur:
-    groups.append(cur)
 
 eng = RapidOCR()
-out = {}
-for grp in groups:
-    W = max(c.width for _b, c in grp) + 24
-    H = sum(c.height + 12 for _b, c in grp) + 12
+
+
+def ocr_items(items, dbg_name=""):
+    """items = [(框, 裁好的图)] -> {ix: (文字, 置信度)}。竖着拼一张图，一次识别。"""
+    if not items:
+        return {}
+    W = max(c.width for _b, c in items) + 24
+    H = sum(c.height + GAP for _b, c in items) + GAP
     sheet = Image.new("RGB", (W, H), (255, 255, 255))
-    ys, y = {}, 12
-    for b, c in grp:
+    ys, y = {}, GAP
+    for b, c in items:
         sheet.paste(c, (12, y))
         ys[b["ix"]] = (y, y + c.height)
-        y += c.height + 12
+        y += c.height + GAP
     tmp = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "_ocr_sheet.png")
     sheet.save(tmp)
     dbg = cfg.get("debug_dir") or ""
-    if dbg:
+    if dbg and dbg_name:
         try:
             os.makedirs(dbg, exist_ok=True)
-            sheet.save(os.path.join(dbg, "sheet_p%s_%d.png"
-                                    % (cfg.get("page", 0), len(out) + 1)))
+            sheet.save(os.path.join(dbg, "sheet_p%s_%s.png" % (cfg.get("page", 0), dbg_name)))
         except OSError:
             pass
     res, _el = eng(tmp)
@@ -239,14 +245,43 @@ for grp in groups:
         os.remove(tmp)
     except OSError:
         pass
+    got = {}
     for box, t, s in (res or []):
         yy = (min(p[1] for p in box) + max(p[1] for p in box)) / 2.0
         for ix, (a, b2) in ys.items():
             if a - 4 <= yy <= b2 + 4:
-                old = out.get(ix)
+                old = got.get(ix)
                 if old is None or float(s) > old[1]:
-                    out[ix] = (t, float(s))
+                    got[ix] = (t, float(s))
                 break
+    return got
+
+
+# 1) 主跑：按框本身裁，5 块拼一张
+crops = []
+for b in cfg["boxes"]:
+    c = crop_of(b, 0.0, 0.0)
+    if c is not None:
+        crops.append((b, c))
+out = {}
+for gi in range(0, len(crops), GROUP):
+    out.update(ocr_items(crops[gi:gi + GROUP], "g%d" % (gi // GROUP + 1)))
+
+# 2) 补救：没读到标准编号的框单独再跑一次；还不行就把框往外扩 25%/15% 再单独跑一次
+#    （标签压在框线上、或者框裁得太紧把字切掉的情况，靠这一步捞回来）
+bad = [b for b in cfg["boxes"]
+       if not (out.get(b["ix"]) and LBD_RE.search((out[b["ix"]][0] or "").replace(" ", "")))]
+for n, b in enumerate(bad[:80]):
+    for mw, mh, tag in ((0.0, 0.0, "r1"), (0.25, 0.15, "r2")):
+        c = crop_of(b, mw, mh)
+        if c is None:
+            continue
+        got2 = ocr_items([(b, c)], "p%s_%s_%d" % (cfg.get("page", 0), tag, n))
+        v = got2.get(b["ix"])
+        if v and LBD_RE.search((v[0] or "").replace(" ", "")):
+            out[b["ix"]] = v
+            break
+
 _hm = {b["ix"]: b.get("h_raw") for b in cfg["boxes"]}
 print("@@" + json.dumps([{"ix": k, "text": v[0], "score": v[1], "h": _hm.get(k)}
                          for k, v in sorted(out.items())], ensure_ascii=False))
@@ -1288,6 +1323,34 @@ def _clean_lbd_label(txt):
         t = m.group(1)
     t = re.split(r"[()\[\]{}]", t)[0]          # 后面跟的 "(2)" 这种注解不要
     return t.strip("-_ .|()[]#")
+
+
+LBD_LABEL_RE = re.compile(r"INV\s*\d+\s*[A-Z]\s*\d+\s*[-_ ]?LBD[-_ ]?\s*\d+", re.I)
+LBDISH_RE = re.compile(r"LBD|INV\s*\d+\s*[A-Z]\s*\d+", re.I)
+
+
+def ocr_text_to_name(txt):
+    """OCR 读到的一行字 -> 要不要写成名字。返回 (名字, 状态)。
+
+    状态：'ok'    框里就是标准编号（INV..-LBD-..）
+          'check' 像编号但不是标准写法（少了前缀、被截断…）-> 写成名字，标紫让人核
+          'noise' 读出来的是别的字（旁注、比例尺、图号…）-> **不写名字**，标红等人填
+          'miss'  什么都没读到
+
+    为什么要分 noise：OCR 读错时最容易吐出来的就是框边上那些旁注（"LBD CLUSTER, TYP."、
+    "MV1A"、"TCH, TYP."）。以前一律写进名字，用户看到的就是"识别到的和里面的内容完全
+    没有关系"。
+    """
+    t = str(txt or "").strip()
+    if not t:
+        return "", "miss"
+    up = t.upper().replace(" ", "")
+    if LBD_LABEL_RE.search(up):
+        # 名字用原文（保留 1.01.1.C.5 这种整段），只砍掉尾巴上的 "(2)" 之类注解
+        return re.split(r"[()\[\]{}]", t)[0].strip().replace(" ", "").upper(), "ok"
+    if LBDISH_RE.search(up):
+        return t[:40], "check"
+    return "", "noise"
 
 
 def _name_num(name):
@@ -4634,8 +4697,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             script = os.path.join(tempfile.gettempdir(), "lbd_ocr.py")
             with open(script, "w", encoding="utf-8") as f:
                 f.write(OCR_BOX_SCRIPT)
-            # OCR 分辨率：至少 300 DPI（标签字高至少要 25px 左右才稳）
-            dpi = max(self.dpi, 300) if self.dpi > 0 else 300
+            # OCR 用当前渲染的底图就行（250 DPI 实测字高 ~30px，读得稳）
+            dpi = self.dpi if self.dpi > 0 else 250
             dbg_dir = os.path.join(work_dir(), "ocr_debug")
             order = self._page_order() or [self.page]
             todo = order if whole else [self.page]
@@ -4703,18 +4766,30 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         continue
                     txt = (r.get("text") or "").strip()
                     stat["boxes"] += 1
-                    if not txt:
+                    name, kind = ocr_text_to_name(txt)
+                    if kind == "miss":
                         s["_miss"] = True
                         stat["missed"] += 1
                         continue
+                    if kind == "noise":
+                        # 读出来的是别的字：不写进名字（免得名字和框里的东西没关系），
+                        # 只留个底，标红等人手填/等推理补号
+                        s["name"] = ""
+                        s["_check"] = False
+                        s["_miss"] = True
+                        raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+                        raw["ocr_text"] = txt[:60]
+                        s["raw"] = raw
+                        stat["missed"] += 1
+                        stat["noise"] = stat.get("noise", 0) + 1
+                        continue
                     s["_miss"] = False
-                    up = txt.upper().replace(" ", "")
-                    if re.search(r"INV\s*\d+\s*[A-Z]\s*\d+\s*[-_]?\s*LBD\s*[-_]?\s*\d+", up, re.I):
-                        s["name"] = up                       # 标签本身就带 INV..-LBD-..
+                    if kind == "ok":
+                        s["name"] = name                     # 标签本身就是 INV..-LBD-..
                         s["_check"] = False
                         stat["filled"] += 1
                     else:
-                        s["name"] = txt[:40]                 # 读到了但不是标准编号 -> 标紫要人核
+                        s["name"] = name                     # 像编号但不标准 -> 标紫要人核
                         s["_check"] = True
                         stat["raw"] += 1
                 pm.dirty = True
@@ -4734,19 +4809,22 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             hmed = sorted(heights)[len(heights) // 2] if heights else 0
             hint = ""
             if hmed:
-                hint = ("\n\n标签在原图里约 %.0f px 高 —— %s"
+                hint = ("\n标签在原图里约 %.0f px 高 —— %s"
                         % (hmed, "够用" if hmed >= 25 else
-                           "偏小，建议把底图 DPI 调到 400 再跑一遍"))
+                           "偏小（认不出来多半是这个原因），可以把底图 DPI 调高再跑"))
             QMessageBox.information(
                 self, "OCR 读框内文字",
                 "跑完 %d 页、%d 个 LBD 框（Node）：\n"
                 "  · 认出标准编号：%d 个（绿）\n"
-                "  · 读到别的文字：%d 个（紫，写成名字了，请核一下）\n"
+                "  · 像编号但不标准：%d 个（紫，写成名字了，请核一下）\n"
+                "  · 框里读到的是别的字（旁注之类）：%d 个（没写进名字，标红等人填）\n"
                 "  · 没读到、但按位置+编号连续性推出来的：%d 个（黄，请核一下）\n"
                 "  · 没读到也推不出来的：%d 个（红，等人手填）%s\n\n"
+                "按框本身裁图、每 5 个框拼一张识别；没读到标准编号的框会自动单独重试一次。\n"
                 "裁好的小图存在：%s\n"
                 "支架框（Tracker）一个没读、没写名字；锁定的框也没动。可以直接 Ctrl+Z 撤销。"
                 % (stat["pages"], stat["boxes"], stat["filled"], stat["raw"],
+                   stat.get("noise", 0),
                    stat.get("inferred", 0),
                    max(0, stat["missed"] - stat.get("inferred", 0)), hint, dbg_dir))
 
@@ -6359,3 +6437,7 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+LBD_LABEL_RE = re.compile(r"INV\s*\d+\s*[A-Z]\s*\d+\s*[-_ ]?LBD[-_ ]?\s*\d+", re.I)
+# "像编号"的：LBD 后面跟着数字（LBD-8 / LBD 1.01.1.C.5），或者只有 INV 前缀没 LBD 字样。
+# 注意不能写成"只要出现 LBD 就算" —— 图纸上到处都是 "LBD CLUSTER, TYP." 这种旁注。
+LBDISH_RE = re.compile(r"LBD\s*[-_.#]?\s*\d|INV\s*\d+\s*[A-Z]\s*\d+", re.I)
