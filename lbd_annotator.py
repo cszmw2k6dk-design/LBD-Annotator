@@ -44,7 +44,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.19"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.20"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -1284,6 +1284,74 @@ def _name_num(name):
     """名字里的"号"：取最后一段数字。'…-LBD-1.01.1.C.5' -> 5，'…-LBD-07' -> 7。"""
     segs = re.findall(r"\d+", str(name or ""))
     return int(segs[-1]) if segs else None
+
+
+def infer_lbd_names(shapes, max_gap=3):
+    """给"没读到编号"的框按「位置顺序 + 编号连续」推编号，推出来的标黄（_auto）。
+
+    只推能自证的情况，宁可少推也不乱推：
+      ① 同一分表里已读到的编号，沿"位置顺序"（一排排、行内从左到右）单调递增或递减；
+      ② 两个已知编号之间缺几个，正好等于这一段里没读到号的框的个数；
+      ③ 缺的个数 ≤ max_gap（默认 3），且两头的编号本身是相邻段里的（不跨大空档）。
+    推出来的名字沿用已读到的那种写法（INV10A06-LBD-07），前缀取自已读到的多数派。
+    返回推出来几个。
+    """
+    rows = []
+    for i, s in enumerate(shapes):
+        if s.get("label") not in ("Node", "Tracker") or s.get("locked"):
+            continue
+        m = re.search(r"([A-Z]{2,}\d+[A-Z]?\d*)[-_ ]*LBD[-_ ]*0*(\d{1,3})",
+                      (s.get("name") or ""), re.I)
+        cx, cy = _box_center(s["bbox"])
+        rows.append({"i": i, "s": s, "key": m.group(1).upper() if m else "",
+                     "num": int(m.group(2)) if m else None,
+                     "cy": cy, "cx": cx, "known": bool(m)})
+    known = [r for r in rows if r["known"]]
+    todo = [r for r in rows if not r["known"] and not (r["s"].get("name") or "").strip()]
+    if len(known) < 2 or not todo:
+        return 0
+    cnt = {}
+    for r in known:
+        cnt[r["key"]] = cnt.get(r["key"], 0) + 1
+    key = max(cnt, key=lambda k: cnt[k])
+    known = [r for r in known if r["key"] == key]
+    if len(known) < 2 or not todo:
+        return 0
+    seq = sorted(known + todo, key=lambda r: (round(r["cy"], 1), round(r["cx"], 1)))
+    knums = [r["num"] for r in known]
+    if len(set(knums)) != len(knums):
+        return 0                          # 有重号，说明读得不准，别推
+    if all(knums[i] < knums[i + 1] for i in range(len(knums) - 1)):
+        inc = True
+    elif all(knums[i] > knums[i + 1] for i in range(len(knums) - 1)):
+        inc = False
+    else:
+        return 0                          # 位置顺序和编号顺序对不上，别推
+    got = 0
+    for a in range(len(seq)):
+        if seq[a]["known"]:
+            continue
+        # 往左、往右各找一个已知编号，中间全是没读到的
+        l = a - 1
+        while l >= 0 and not seq[l]["known"]:
+            l -= 1
+        r = a + 1
+        while r < len(seq) and not seq[r]["known"]:
+            r += 1
+        if l < 0 or r >= len(seq):
+            continue                      # 缺在开头/结尾：两头没有参照，不推
+        num_l, num_r = seq[l]["num"], seq[r]["num"]
+        span = abs(num_r - num_l) - 1
+        misses = r - l - 1
+        if span <= 0 or span > max_gap or span != misses:
+            continue                      # 缺的个数对不上（可能真跳号/漏图），不推
+        step = 1 if num_r > num_l else -1
+        seq[a]["s"]["name"] = _lbd_name(key, "", num_l + step * (a - l))
+        seq[a]["s"]["_auto"] = True
+        seq[a]["s"]["_miss"] = False
+        seq[a]["s"]["_check"] = False
+        got += 1
+    return got
 
 
 def _lbd_name(sheet, label, num):
@@ -4329,10 +4397,12 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                          pm.width, pm.height)
                     pm.dirty = True
                     self.edited[pg] = pm
+                    # 没选标签表时：没取到号的按「位置顺序 + 编号连续」推一把（标黄）
+                    n_tui = infer_lbd_names(pm.shapes) if text_only else 0
                     if pg == self.page:
                         self._rebuild_items()
                     n_ok += st["filled"]
-                    n_auto += st["auto"]
+                    n_auto += st["auto"] + n_tui
                     n_miss += st["missed"]
                     n_skip += st["kept"]
                     n_locked += st.get("locked", 0)
@@ -4340,6 +4410,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     if hit and sheet and _clean_key(hit) != _clean_key(sheet):
                         note = "；⚠页面文字里印的是 %s（按顺序推的是 %s）" % (hit, sheet)
                     details = ""
+                    if n_tui:
+                        details += "，按位置+编号连续性推 %d（黄色）" % n_tui
                     if st["auto"]:
                         details += "，其中按标签表顺序推 %d（黄色）" % st["auto"]
                     if st["missed"]:
@@ -4570,6 +4642,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 pm.dirty = True
                 self.edited[pg] = pm
                 stat["pages"] += 1
+                # 没读到的：按「位置顺序 + 编号连续」推一把（推出来的标黄，要人核）
+                stat["inferred"] = stat.get("inferred", 0) + infer_lbd_names(pm.shapes)
                 if pg == self.page:
                     self._rebuild_items()
             self.mark_dirty()
@@ -4583,10 +4657,12 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 "跑完 %d 页、%d 个框：\n"
                 "  · 认出标准编号：%d 个（绿）\n"
                 "  · 读到别的文字：%d 个（紫，写成名字了，请核一下）\n"
-                "  · 没读到：%d 个（红，等人手填）\n\n"
+                "  · 没读到、但按位置+编号连续性推出来的：%d 个（黄，请核一下）\n"
+                "  · 没读到也推不出来的：%d 个（红，等人手填）\n\n"
                 "锁定的框一个没动；可以直接 Ctrl+Z 撤销。"
                 % (stat["pages"], stat["boxes"], stat["filled"], stat["raw"],
-                   stat["missed"]))
+                   stat.get("inferred", 0),
+                   max(0, stat["missed"] - stat.get("inferred", 0))))
 
         def _ai_detect_impl(self, whole=False):
             from PySide6.QtWidgets import (QDialog, QPlainTextEdit, QVBoxLayout, QHBoxLayout,
