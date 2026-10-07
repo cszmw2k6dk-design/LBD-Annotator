@@ -25,6 +25,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default="补标建议")
     ap.add_argument("--out", default="补标结果")
+    ap.add_argument("--roots", default=None,
+                    help="原始标注目录（逗号分隔）。不传就用内置默认值；"
+                         "本机默认值指向公司电脑的路径，所以要在这台机器上合并时必须显式传。")
     args = ap.parse_args()
 
     src_root = Path(args.src)
@@ -34,14 +37,16 @@ def main() -> int:
     if not out_root.is_absolute():
         out_root = HERE / out_root
 
+    roots = [r.strip() for r in args.roots.split(",") if r.strip()] if args.roots else None
     pairs = {}
-    for p in collect_pairs():
+    for p in collect_pairs(roots):
         old = pairs.get(p["stem"])
         if old is None or p["image"].stat().st_size > old["image"].stat().st_size:
             pairs[p["stem"]] = p
 
     rows = []
     kept_total = dropped_total = 0
+    stray_total = 0
     files = sorted(f for f in src_root.rglob("*.json") if f.name != "补标清单.csv")
     for f in files:
         stem = f.stem
@@ -60,8 +65,9 @@ def main() -> int:
                 stray += 1
                 continue
             sug.append(s)
-        if stray:
-            print(f"[提醒] {f.parent.name}/{f.name}：有 {stray} 个框既不是建议框也没标记，已跳过")
+        # 建议包里现在会自带一份"原始标注"（方便在标注工具里对照，实线显示），
+        # 那些框本来就不该再并一次 —— 跳过即可，别每页都刷一行提醒。
+        stray_total += stray
         for s in sug:                      # 去掉问号，变成正式类别
             lab = (s.get("label") or "").strip()
             if lab.endswith("?"):
@@ -90,6 +96,8 @@ def main() -> int:
         w.writerows(rows)
 
     print(f"[完成] 处理 {len(rows)} 份，留下的建议框共 {kept_total} 个")
+    if stray_total:
+        print(f"       （另有 {stray_total} 个框是包自带的原始标注，已按规则跳过，不会重复合并）")
     print(f"       输出目录：{out_root}")
     print(f"       清单：{out_root / '合并清单.csv'}")
     print("\n下一步：确认无误后，把这些 json 拷回原始标注目录覆盖同名文件（先备份原始 json）。")

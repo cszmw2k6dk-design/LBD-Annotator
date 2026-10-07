@@ -96,6 +96,7 @@ def health_snapshot() -> str:
 
 def supervise(proc: subprocess.Popen, reason: list[str], watch: list[Path]) -> None:
     """一边等训练、一边体检 + 看暂停标志。要停就把训练进程收掉。"""
+    t_start = time.time()   # stall check must only count time since THIS run started
     last_snap = 0.0
     hard_streak = 0
     power_streak = 0
@@ -130,8 +131,10 @@ def supervise(proc: subprocess.Popen, reason: list[str], watch: list[Path]) -> N
                 last_snap = now
                 health(health_snapshot())
         # 卡死判定：指标文件（每轮更新）和训练日志都超过 45 分钟没动
+        now = time.time()
         mt = [p.stat().st_mtime for p in watch if p.exists()]
-        if mt and (time.time() - max(mt)) > STALL_MINUTES * 60:
+        if (mt and (now - max(mt)) > STALL_MINUTES * 60
+                and (now - t_start) > STALL_MINUTES * 60):
             reason.append(f"训练日志和指标已经 {STALL_MINUTES} 分钟没有任何更新，疑似卡死")
             break
         time.sleep(CHECK_INTERVAL)
@@ -191,7 +194,12 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--patience", type=int, default=10)
+    ap.add_argument("--lr0", default="0.0005",
+                    help="初始学习率。微调已收敛的模型要调小（0.0005 会把旧能力覆盖掉，建议 0.0001）")
     ap.add_argument("--max-restarts", type=int, default=20)
+    ap.add_argument("--extra", default="",
+                    help="额外的 key=value，逗号分隔，直接透传给 ultralytics。"
+                         "例：--extra \"mosaic=0.0,mixup=0.0,lr0=0.0001\"（微调时关掉马赛克用）")
     ap.add_argument("--status", action="store_true")
     args = ap.parse_args()
 
@@ -206,7 +214,7 @@ def main() -> int:
 
     log("=" * 60)
     log(f"启动长跑：name={args.name} imgsz={args.imgsz} epochs={args.epochs} "
-        f"batch={args.batch} patience={args.patience}")
+        f"batch={args.batch} patience={args.patience} lr0={args.lr0}")
     log(f"数据 {data}")
     if STOP_FILE.exists():          # 上次是手动暂停的，这次重新拉起来就把标志清掉
         STOP_FILE.unlink()
@@ -237,8 +245,12 @@ def main() -> int:
                 "--patience", str(args.patience),
                 "--name", args.name,
                 "rect=True", "amp=False", "cos_lr=True", "seed=0",
-                "lr0=0.0005", "save_period=5",
+                f"lr0={args.lr0}", "save_period=5",
             ]
+            for item in str(args.extra or "").split(","):
+                item = item.strip()
+                if item:
+                    cmd.append(item)
 
         t0 = time.time()
         reason: list[str] = []

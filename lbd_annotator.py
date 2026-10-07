@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.38"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.39"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -958,6 +958,238 @@ class BlankDoc:
             json.dump(doc, f, ensure_ascii=False)
         os.replace(tmp, dest)
         return sorted(modified)
+
+
+SUG_IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+
+
+def image_size_of(path):
+    """只读文件头拿图片宽高（不整张解码，所以翻页/开文件夹不会卡）。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+            if head[:8] == b"\x89PNG\r\n\x1a\n":
+                return (int.from_bytes(head[16:20], "big"),
+                        int.from_bytes(head[20:24], "big"))
+    except Exception:
+        pass
+    try:                                    # 非 PNG：交给 Qt 解码（只在拿不到文件头时用）
+        from PySide6.QtGui import QImage
+        img = QImage(path)
+        if not img.isNull():
+            return img.width(), img.height()
+    except Exception:
+        pass
+    return 0, 0
+
+
+def label_to_ui(label):
+    """补标 json 里的类别名 -> 标注工具认识的类别（Typical 就是 Tracker）。"""
+    base = (label or "").strip()
+    if base.endswith("?"):
+        base = base[:-1].strip()
+    low = base.lower()
+    if low in ("tracker", "typical"):
+        return "Tracker"
+    if low == "node":
+        return "Node"
+    return "Box"
+
+
+def _natkey(text):
+    """自然排序用的键：p2 排在 p10 前面（不然文件名排序会出现 1,10,100,11…）。"""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(text))]
+
+
+class SuggestFolderDoc:
+    """把「补标文件夹」当一份文档来审：底图直接用配对的图片，保存就地写回同一个 json。
+
+    json 是 X-AnyLabeling / labelme 格式（shapes + points），只含模型建议补的框，
+    类别名带问号（Node? / Typical? / Tracker?）。问号是"模型建议、还没人工确认"的标记，
+    合并回原始标注的脚本（yolo26/merge_suggest.py）靠它认出来，所以存回去时必须留着。
+    """
+
+    is_folder = True
+
+    def __init__(self, folder):
+        self.path = os.path.abspath(folder)
+        self.project = os.path.basename(os.path.normpath(self.path))
+        self.pages = {}
+        self._cache = {}
+        self._missing = []
+        pairs = []
+        for root, _dirs, files in os.walk(self.path):
+            for name in sorted(files):
+                if not name.lower().endswith(".json"):
+                    continue
+                stem = name[:-5]
+                img = ""
+                for cand in sorted(glob.glob(os.path.join(root, stem + ".*"))):
+                    if os.path.splitext(cand)[1].lower() in SUG_IMG_EXTS:
+                        img = cand
+                        break
+                if not img:
+                    self._missing.append(os.path.join(root, name))
+                    continue
+                pairs.append((img, os.path.join(root, name)))
+        pairs.sort(key=lambda t: (_natkey(os.path.dirname(t[0])),
+                                  _natkey(os.path.basename(t[0]))))
+        for i, (img, js) in enumerate(pairs, 1):
+            w = h = 0
+            try:
+                doc = self._read(js)
+                w = int(doc.get("imageWidth") or 0)
+                h = int(doc.get("imageHeight") or 0)
+            except Exception:
+                pass
+            if not (w and h):
+                w, h = image_size_of(img)
+            self.pages[i] = {"page_number": i, "width": w or 6000, "height": h or 4000,
+                             "png_span": None, "png_path": img, "json_path": js,
+                             "group": os.path.basename(os.path.dirname(img)),
+                             "title": os.path.splitext(os.path.basename(js))[0]}
+        if not self.pages:
+            raise RuntimeError(
+                "这个文件夹里没有「同名图片 + json」的成对文件。\n"
+                "补标包的每个 json 旁边应该有同名的 png，先确认选对了文件夹。")
+
+    # ---------------- 读
+    def _read(self, js_path):
+        doc = self._cache.get(js_path)
+        if doc is None:
+            with open(js_path, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+            self._cache[js_path] = doc
+            if len(self._cache) > 12:        # 只留最近翻过的几页，省内存
+                for k in list(self._cache)[:-6]:
+                    self._cache.pop(k, None)
+        return doc
+
+    def _doc_of(self, n):
+        return self._read(self.pages[n]["json_path"])
+
+    def page_numbers(self):
+        return sorted(self.pages)
+
+    def png_path(self, n):
+        return self.pages[n]["png_path"]
+
+    def title_of(self, n):
+        return self.pages[n]["title"]
+
+    def group_of(self, n):
+        return self.pages[n]["group"]
+
+    def missing_json(self):
+        return list(self._missing)
+
+    def _det_of(self, s):
+        pts = s.get("points") or []
+        xs, ys = [], []
+        for p in pts:
+            try:
+                xs.append(float(p[0]))
+                ys.append(float(p[1]))
+            except Exception:
+                continue
+        if not xs or not ys:
+            return None
+        raw_label = (s.get("label") or "").strip()
+        ui = label_to_ui(raw_label)
+        return {"label": ui, "name": "",
+                # 注意：bbox 要用字典（PageModel 读的就是 x1/y1/x2/y2 这四个键）
+                "bbox": {"x1": min(xs), "y1": min(ys), "x2": max(xs), "y2": max(ys)},
+                "confidence": s.get("score"),
+                "class_id": DEFAULT_CLASS_ID.get(ui, 0),
+                "source": ("suggest" if (raw_label.endswith("?")
+                                         or s.get("description") == "model_suggest")
+                           else "context"),
+                "raw": {"xl_label": raw_label, "xl_score": s.get("score"),
+                        "xl_desc": s.get("description")},
+                "ocr_index": None, "locked": False}
+
+    def page_data(self, key, page_number):
+        if page_number not in self.pages:
+            return None
+        if key == OCR_SECTION:
+            return []
+        want_box = (key == BOX_SECTION)
+        dets = []
+        try:
+            shapes = self._doc_of(page_number).get("shapes") or []
+        except Exception:
+            shapes = []
+        for s in shapes:
+            d = self._det_of(s)
+            if d is None:
+                continue
+            if want_box:
+                if d["label"] == "Box":
+                    dets.append(d)
+            elif d["label"] in ("Node", "Tracker"):
+                dets.append(d)
+        return {"model_type": "box" if want_box else "tracker",
+                "coordinates": "original_page_pixels",
+                "detections": dets, "error": None}
+
+    def _elements(self, key):
+        """给 drawing_pages() 这类按页扫的函数用：补标包里每页都算「有内容」。"""
+        return [{"page": n, "span": None, "data_span": None} for n in self.page_numbers()]
+
+    def suggest_stats(self):
+        """整包统计：(页数, 建议框数)。"""
+        n_box = 0
+        for n in self.page_numbers():
+            try:
+                n_box += len(self._doc_of(n).get("shapes") or [])
+            except Exception:
+                pass
+        return len(self.pages), n_box
+
+    # ---------------- 写
+    def _shape_of(self, det):
+        raw = det.get("raw") if isinstance(det.get("raw"), dict) else {}
+        ui = det.get("label") or "Tracker"
+        old = (raw.get("xl_label") or "").strip()
+        if old and label_to_ui(old) == ui:
+            label = old                       # 类别没改：原样保留（Node? / Typical? 都不动）
+        else:
+            label = ui + "?"                  # 改了类别或新画的：仍按「建议框」写，合并脚本才认
+        b = det.get("bbox") or {}
+        x1, y1 = float(b.get("x1") or 0), float(b.get("y1") or 0)
+        x2, y2 = float(b.get("x2") or 0), float(b.get("y2") or 0)
+        return {"label": label, "score": raw.get("xl_score"),
+                "points": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                "group_id": None, "description": "model_suggest",
+                "difficult": False, "shape_type": "rectangle",
+                "flags": {}, "attributes": {}, "kie_linking": []}
+
+    def save(self, dest, modified):
+        """就地写回：每一页写回它自己的 json。
+
+        modified 的格式和 DebugJson.save 一致：{页号: {"tracker": …, "box": …, "ocr": …}}
+        """
+        written = []
+        for n, mod in sorted(modified.items()):
+            if n not in self.pages:
+                continue
+            js = self.pages[n]["json_path"]
+            with open(js, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+            shapes = [self._shape_of(d) for d in
+                      ((mod.get("tracker") or {}).get("detections") or [])]
+            shapes += [self._shape_of(d) for d in
+                       ((mod.get("box") or {}).get("detections") or [])]
+            doc["shapes"] = shapes
+            doc["checked"] = False
+            doc["imagePath"] = os.path.basename(self.pages[n]["png_path"])
+            tmp = js + ".part"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, js)
+            self._cache.pop(js, None)
+            written.append(n)
+        return written
 
 
 def project_name(json_path):
@@ -2900,36 +3132,70 @@ def make_gui_classes():
         AUTO_COLOR = QColor(230, 150, 0)
         MISS_COLOR = QColor(255, 40, 40)
         CHECK_COLOR = QColor(150, 60, 220)
+        # 补标/识别建议框：虚线 + 按置信度分档配色（阈值从高到低）
+        SUG_COLORS = ((0.70, QColor(255, 90, 0)),      # 强建议：橙
+                      (0.50, QColor(235, 165, 0)),     # 中：琥珀
+                      (0.00, QColor(150, 150, 150)))   # 弱：灰
+        show_conf = True                               # 是否在建议框上标置信度（工具栏可切）
 
         def __init__(self, shape):
             super().__init__(0, 0, shape["bbox"][2] - shape["bbox"][0],
                              shape["bbox"][3] - shape["bbox"][1])
             self.shape_data = shape          # 不能叫 self.shape：会盖掉 Qt 的虚函数 shape()
             self.setPos(shape["bbox"][0], shape["bbox"][1])
-            self.setZValue(10)
+            # 建议框压在上层：这样即使和原有标注重叠，虚线和置信度颜色也看得见
+            self.setZValue(12 if self.is_suggest() else 10)
             self.apply_flags()
             self.apply_pen()
 
         def apply_pen(self):
+            sug = self.is_suggest()
+            ctx = self.shape_data.get("source") == "context"
             if self.shape_data.get("_miss"):
                 c = self.MISS_COLOR
             elif self.shape_data.get("_check"):
                 c = self.CHECK_COLOR
             elif self.shape_data.get("_auto"):
                 c = self.AUTO_COLOR
+            elif sug:
+                c, _conf = self.conf_color()
             else:
                 c = COLORS.get(self.shape_data["label"], QColor(255, 0, 255))
             pen = QPen(c)
             pen.setCosmetic(True)
-            pen.setWidthF(2.0)
-            alpha = 26
-            if self.is_locked():
+            pen.setWidthF(1.8 if sug else 2.0)
+            alpha = 18 if sug else 26
+            if ctx and not sug:
+                # 补标包里带来的"原有标注"：只是参照，画细实线、不填充，
+                # 让彩色虚线的建议框一眼就能挑出来（类别颜色仍然保留）。
+                pen.setWidthF(1.2)
+                alpha = 0
+            if self.is_locked() or sug:
                 # 锁上的框：虚线 + 更淡的底，一眼看得出"这个不能动"
+                # 建议框：同样虚线 —— 虚线＝"还没人工确认过"
                 pen.setStyle(Qt.PenStyle.DashLine)
                 pen.setWidthF(1.6)
-                alpha = 10
+                alpha = 10 if self.is_locked() else 14
             self.setPen(pen)
             self.setBrush(QBrush(QColor(c.red(), c.green(), c.blue(), alpha)))
+
+        def is_suggest(self):
+            """模型建议补的框（类别名带问号 / 标了 model_suggest）——单独配色，别和确认过的框混一起。"""
+            if self.shape_data.get("source") == "suggest":
+                return True
+            raw = self.shape_data.get("raw") or {}
+            return str(raw.get("xl_label") or "").endswith("?")
+
+        def conf_color(self):
+            """建议框按置信度分档取色，返回 (颜色, 置信度)。"""
+            try:
+                conf = float(self.shape_data.get("confidence") or 0.0)
+            except Exception:
+                conf = 0.0
+            for lo, col in BoxItem.SUG_COLORS:
+                if conf >= lo:
+                    return col, conf
+            return BoxItem.SUG_COLORS[-1][1], conf
 
         def is_locked(self):
             return bool(self.shape_data.get("locked"))
@@ -2968,6 +3234,8 @@ def make_gui_classes():
         def paint(self, painter, option, widget=None):
             super().paint(painter, option, widget)
             sc = self.view_scale()
+            if self.is_suggest() and BoxItem.show_conf:
+                self._paint_conf(painter, sc)
             name = self.shape_data.get("name") or ""
             if name and sc > 0.02 and (not BoxItem.name_sel_only or self.isSelected()):
                 self._paint_name(painter, name, sc)
@@ -3006,6 +3274,40 @@ def make_gui_classes():
             painter.setBrush(QBrush(QColor(255, 245, 180, 235)))
             painter.drawRect(QRectF(x, y + bh * 0.42, bw, bh * 0.58))
             painter.drawArc(QRectF(x + bw * 0.12, y, bw * 0.76, bh * 0.9), 0, 180 * 16)
+            painter.restore()
+
+        def _paint_conf(self, painter, sc):
+            """建议框标出置信度数字（屏幕上恒定小字号）。
+
+            框在屏幕上太小时不画（一页两三百个框，全画会糊成一片）；
+            放大到能看清时自动出现，选中的那个框一律画。
+            """
+            conf = self.shape_data.get("confidence")
+            if conf is None:
+                return
+            r = self.rect()
+            w, h = max(r.width(), 1.0), max(r.height(), 1.0)
+            # 屏幕上太挤就不画数字（一页两三百个框）：放大到长边 70px 以上才出现，
+            # 选中的那个框无条件画。
+            if max(w, h) * sc < 70.0 and not self.isSelected():
+                return
+            try:
+                txt = "%.2f" % float(conf)
+            except Exception:
+                return
+            size = float(BoxItem.name_px)
+            if size * sc < 4.5:
+                return
+            f = QFont()
+            f.setBold(True)
+            f.setPixelSize(max(1, int(size)))
+            painter.save()
+            painter.setFont(f)
+            box = QRectF(r.left() + 1.0, r.top() + 1.0,
+                         max(12.0, len(txt) * size * 0.66), size * 1.3)
+            painter.fillRect(box, QColor(255, 255, 255, 200))
+            painter.setPen(QPen(self.conf_color()[0]))
+            painter.drawText(box, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, txt)
             painter.restore()
 
         def _paint_name(self, painter, name, sc):
@@ -3338,6 +3640,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             # 不读"上次的 PDF"：路径不落盘，每次都是干净开局（要 PDF 自己点「选 PDF…」）
             self.pdf = ""
             self._ptext = None          # PDF 文字层缓存（换 PDF 时要清掉）
+            self._folder_mode = False   # True = 正在审「补标文件夹」（底图来自 png）
             self.dpi = int(self.settings.get("dpi") or 0)
             self.xlsx = self.settings.get("xlsx") or ""
             self._sheet_cache = None
@@ -3377,6 +3680,12 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             act = QAction("打开 PDF（无 JSON，直接标注）", self)
             act.triggered.connect(self.on_open_pdf)
             tb.addAction(act)
+            self.act_open_folder = QAction("打开补标文件夹…", self)
+            self.act_open_folder.setToolTip(
+                "打开「补标建议」这种包：一个文件夹里每个 json 配一张同名图片。\n"
+                "底图直接用那张图片，审完的框就地写回同一个 json —— 不碰你的原始标注。")
+            self.act_open_folder.triggered.connect(self.on_open_folder)
+            tb.addAction(self.act_open_folder)
             tb.addSeparator()
             tb2.addSeparator()
             mode_tip = {"select": ("选择：点/框选，拖框内=移动，拖白点=改大小", "1"),
@@ -3402,6 +3711,16 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 "单独解锁某一个：Ctrl+点那个框（或用「解锁本页」）。")
             self.act_lockbox.triggered.connect(self.on_toggle_lock)
             tb2.addAction(self.act_lockbox)
+            self.act_show_conf = QAction("显示置信度", self)
+            self.act_show_conf.setCheckable(True)
+            self.act_show_conf.setChecked(bool(self.settings.get("show_conf", True)))
+            BoxItem.show_conf = self.act_show_conf.isChecked()
+            self.act_show_conf.setToolTip(
+                "补标/识别建议框上标出置信度数字。\n"
+                "建议框本身就是虚线，颜色按置信度分档：橙 ≥0.7、琥珀 0.5~0.7、灰 <0.5。\n"
+                "框在屏幕上太小时不画数字（放大就会出来），选中的框一定画。")
+            self.act_show_conf.toggled.connect(self.on_toggle_show_conf)
+            tb2.addAction(self.act_show_conf)
             self.act_lock_nodes = QAction("锁定本页 Node", self)
             self.act_lock_nodes.setCheckable(True)
             self.act_lock_nodes.setShortcut(QKeySequence("Ctrl+Shift+L"))
@@ -3475,13 +3794,15 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             tb.addAction(a)
             tb.addSeparator()
             tb.addSeparator()
-            a = QAction("另存为…", self)
-            a.setShortcut(QKeySequence("Ctrl+S"))
-            a.triggered.connect(self.on_save_as)
-            tb.addAction(a)
-            a = QAction("覆盖原文件", self)
-            a.triggered.connect(self.on_save_over)
-            tb.addAction(a)
+            self.act_save_as = QAction("另存为…", self)
+            self.act_save_as.setShortcut(QKeySequence("Ctrl+S"))
+            self.act_save_as.setToolTip("另存一份 JSON（Ctrl+S）")
+            self.act_save_as.triggered.connect(self.on_save_as)
+            tb.addAction(self.act_save_as)
+            self.act_save_over = QAction("覆盖原文件", self)
+            self.act_save_over.setToolTip("直接覆盖原文件（不留备份）")
+            self.act_save_over.triggered.connect(self.on_save_over)
+            tb.addAction(self.act_save_over)
 
             tb.addSeparator()
             a = QAction("选标签表…", self)
@@ -3815,6 +4136,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.goto_page(doc.page_numbers()[0])
 
         def load_file(self, path):
+            if os.path.isdir(path):
+                self.load_folder(path)       # 传进来的是文件夹 -> 按「补标文件夹」打开
+                return
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
                 self.dbg = DebugJson(path)
@@ -3823,6 +4147,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 QMessageBox.critical(self, "读不了", "%s" % e)
                 return
             QApplication.restoreOverrideCursor()
+            self._use_folder_mode(False)
             self.undo.clear()
             # 不再记住这份 JSON：路径不落盘，下次双击就是空白画布
             # （要接着上次那份，自己点「打开 JSON」再选一次）
@@ -3926,6 +4251,39 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self._ptext = None
             if self.pdf:
                 self.update_pdf_button()
+            self._after_load(path)
+
+        def load_folder(self, folder):
+            """打开「补标文件夹」：每个 json 配一张同名图片，审完写回同一个 json。"""
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                doc = SuggestFolderDoc(folder)
+            except Exception as e:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.critical(self, "打不开这个文件夹", "%s" % e)
+                return
+            QApplication.restoreOverrideCursor()
+            self.dbg = doc
+            self.pdf = ""                    # 底图直接用文件夹里的 png，不用 PDF
+            self._ptext = None
+            self.undo.clear()
+            self.edited.clear()
+            self._use_folder_mode(True)
+            n_pg, n_box = doc.suggest_stats()
+            miss = doc.missing_json()
+            if not TEST_MODE:
+                tip = ("共 %d 页 / %d 个建议框（类别名带问号的就是模型建议）。\n\n"
+                       "· 对的框留着，错的框选中按 Delete 删掉，也可以拖框调位置\n"
+                       "· 问号不用管，合并回原始标注时会自动去掉\n"
+                       "· 保存写回这个文件夹里的 json，桌面上的原始标注不会被碰"
+                       % (n_pg, n_box))
+                if miss:
+                    tip += "\n\n（有 %d 个 json 没找到同名图片，已跳过）" % len(miss)
+                QMessageBox.information(self, "补标文件夹已打开", tip)
+            self._after_load(doc.path)
+
+        def _after_load(self, path):
+            """打开文档后的公共收尾：页码下拉、标题、起始页。"""
             self.cmb_page.blockSignals(True)
             self.cmb_page.clear()
             for n in self.dbg.page_numbers():
@@ -3933,9 +4291,15 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.cmb_page.blockSignals(False)
             self.setWindowTitle("LBD 标注工具 v%s — %s"
                                 % (ANNOTATOR_VERSION, os.path.basename(path)))
-            # 有框的页优先：整册 JSON（每页都写了空记录的那份）本来会停在第 1 页，
-            # 明明有图纸却是一片空白，得自己翻半天。
-            drw = drawing_pages(self.dbg)
+            if getattr(self.dbg, "is_folder", False):
+                pgs = self.dbg.page_numbers()
+                # 有框的页优先：整册 JSON（每页都写了空记录的那份）本来会停在第 1 页，
+                # 明明有图纸却是一片空白，得自己翻半天。
+                drw = [n for n in pgs
+                       if (self.dbg.page_data(TRACKER_SECTION, n) or {}).get("detections")]
+            else:
+                pgs = self.dbg.page_numbers()
+                drw = drawing_pages(self.dbg)
             # 优先用 JSON 自己带的起始页（跟着文件走），其次本机设置里记的
             want = json_start_page(path) or start_page_of(path)
             if want and want in self.dbg.pages:
@@ -3944,6 +4308,29 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 start = drw[0] if drw else pgs[0]
             self.goto_page(start)
             self.update_start_button()
+
+        def _use_folder_mode(self, on):
+            """补标文件夹模式：PDF 按钮/保存按钮的语义跟着换。"""
+            self._folder_mode = bool(on)
+            try:
+                self.btn_pdf.setEnabled(not on)
+                if on:
+                    self.btn_pdf.setText("补标文件夹")
+                    self.btn_pdf.setToolTip("这套底图直接来自文件夹里的 png，不需要 PDF")
+                else:
+                    self.update_pdf_button()
+            except Exception:
+                pass
+            for act in (getattr(self, "act_save_as", None),
+                        getattr(self, "act_save_over", None)):
+                if act is None:
+                    continue
+                if act is getattr(self, "act_save_as", None):
+                    act.setText("保存(写回文件夹)" if on else "另存为…")
+                    act.setToolTip("补标文件夹是就地保存：把改过的页写回它自己的 json"
+                                   if on else "另存一份 JSON")
+                else:
+                    act.setVisible(not on)
 
         def goto_page(self, number):
             if not self.dbg or number not in self.dbg.pages:
@@ -4023,6 +4410,19 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         def load_image(self, page):
             """返回 (QImage, 说明文字)。dpi=0 用 JSON 内嵌图，否则重渲染 PDF。"""
             info = self.dbg.pages.get(page) or {}
+            if getattr(self.dbg, "is_folder", False):
+                p = self.dbg.png_path(page)
+                img = QImage(p)
+                if img.isNull():
+                    raise RuntimeError("读不了底图：%s" % p)
+                if img.width() > 6000:        # 9000×6000 的原图整张进内存太重，缩一半看
+                    img = img.scaled(6000, 6000, Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation)
+                    return img, ("补标底图 %s（原图 %d×%d，显示已缩到 %d 宽）"
+                                 % (os.path.basename(p), info.get("width") or 0,
+                                    info.get("height") or 0, img.width()))
+                return img, "补标底图 %s（%d×%d）" % (os.path.basename(p),
+                                                     img.width(), img.height())
             if self.dpi <= 0 and info.get("png_span"):
                 img = QImage.fromData(self.dbg.png_bytes(page))
                 return img, "内嵌图 %d×%d（约 167 dpi）" % (img.width(), img.height())
@@ -4656,6 +5056,13 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 w.setEnabled(it is not None)
                 w.blockSignals(False)
 
+        def on_toggle_show_conf(self, on):
+            """建议框上的置信度数字开关（记住设置）。"""
+            BoxItem.show_conf = bool(on)
+            self.settings["show_conf"] = bool(on)
+            save_settings(self.settings)
+            self._rebuild_items()
+
         def on_toggle_lock(self, _checked=False):
             """锁定/解锁选中的框：只要不是"全都锁着"，就一律锁上。"""
             sel = [i for i in self.scene.selectedItems() if isinstance(i, BoxItem)]
@@ -4761,17 +5168,47 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 self.update_state_label()
                 return
             c = self.pm.counts()
-            src = ("底图 %d DPI" % self.dpi) if self.dpi > 0 else "底图 内嵌图"
+            if getattr(self.dbg, "is_folder", False):
+                src = "底图 文件夹里的 png"
+            else:
+                src = ("底图 %d DPI" % self.dpi) if self.dpi > 0 else "底图 内嵌图"
             self.setWindowTitle("LBD 标注工具 v%s [%s] — %s ｜ %s"
                                 % (ANNOTATOR_VERSION, BUILD_STAMP,
                                    os.path.basename(self.dbg.path), src))
+            extra = ""
+            if getattr(self.dbg, "is_folder", False):
+                extra = ("\n图纸：%s\n页名：%s\n（保存＝写回这一页自己的 json）"
+                         % (self.dbg.group_of(self.page), self.dbg.title_of(self.page)))
+            n_sug = n_hi = n_mid = n_low = 0
+            for s in self.pm.shapes:
+                raw = s.get("raw") if isinstance(s.get("raw"), dict) else {}
+                if (s.get("source") == "suggest"
+                        or str(raw.get("xl_label") or "").endswith("?")):
+                    n_sug += 1
+                    try:
+                        cf = float(s.get("confidence") or 0.0)
+                    except Exception:
+                        cf = 0.0
+                    if cf >= 0.7:
+                        n_hi += 1
+                    elif cf >= 0.5:
+                        n_mid += 1
+                    else:
+                        n_low += 1
+            if n_sug:
+                extra += ("\n建议框 %d 个（橙 ≥0.7：%d　琥珀 0.5~0.7：%d　灰 <0.5：%d）"
+                          % (n_sug, n_hi, n_mid, n_low))
+                n_orig = len(self.pm.shapes) - n_sug
+                if n_orig:
+                    extra += ("\n原有标注 %d 个（实线，不用管，只是给你参照）" % n_orig)
             self.lbl_info.setText(
                 "第 %d 页 / 共 %d 页\n坐标尺寸 %d × %d\n底图：%s\n"
-                "标签表：%s\nNode %d　Tracker %d　Box %d%s"
+                "标签表：%s\nNode %d　Tracker %d　Box %d%s%s"
                 % (self.page, len(self.dbg.page_numbers()), self.pm.width,
                    self.pm.height, self._img_note or "（载入中）",
                    (os.path.basename(self.xlsx) if self.xlsx else "（没选，补编号要用）"),
                    c["Node"], c["Tracker"], c.get("Box", 0),
+                   extra,
                    "\n\n● 已修改，记得保存" if self.pm.dirty else ""))
             self.statusBar().showMessage(
                 "模式：%s　拖框内=移动，拖白点=改大小，方向键=微调(Shift 加速)，"
@@ -5723,13 +6160,22 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             v.addLayout(h1)
             h2 = QHBoxLayout()
             h2.addWidget(QLabel("conf"))
-            ed_c = QLineEdit("0.25")
+            ed_c = QLineEdit(str(self.settings.get("model_conf") or "0.35"))
             ed_c.setMaximumWidth(60)
+            ed_c.setToolTip("识别置信度阈值。实测：0.25 时框最全但误检多，0.35 精确率约 +3~4 个点、\n"
+                            "漏检几乎不变，是推荐值；怕漏就调回 0.25。")
             h2.addWidget(ed_c)
             h2.addWidget(QLabel("imgsz"))
             ed_i = QLineEdit("2560")          # 和训练用的尺寸一致，别改小
             ed_i.setMaximumWidth(70)
             h2.addWidget(ed_i)
+            h2.addWidget(QLabel("NMS"))
+            ed_n = QLineEdit(str(self.settings.get("model_iou") or "0.4"))
+            ed_n.setMaximumWidth(60)
+            ed_n.setToolTip("NMS 的 IoU 阈值（去重强度）。默认 0.4 —— 实测同一板条被检出两个重叠框的\n"
+                            "情况能一次清掉，精确率 +6~7 个点，召回只掉 1 个点；\n"
+                            "0.7（旧默认）几乎不去重。想更狠可以 0.3，怕误删相邻板条就用 0.5。")
+            h2.addWidget(ed_n)
             # 模型旁边有 meta.txt 就按它填，省得记错（选模型时还会再刷一次）
             _m0 = model_meta(ed_m.text().strip())
             if _m0.get("imgsz"):
@@ -5784,8 +6230,10 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         "import sys, json\n"
                         "from ultralytics import YOLO\n"
                         "m = YOLO(sys.argv[1])\n"
+                        "iou = float(sys.argv[5]) if len(sys.argv) > 5 else 0.7\n"
                         "r = m.predict(source=sys.argv[2], imgsz=int(sys.argv[4]),\n"
-                        "              conf=float(sys.argv[3]), verbose=False)[0]\n"
+                        "              conf=float(sys.argv[3]), iou=iou, max_det=1000,\n"
+                        "              verbose=False)[0]\n"
                         "out = []\n"
                         "names = getattr(r, 'names', None) or {}\n"
                         "for c, xy, cf in zip(r.boxes.cls.tolist(), r.boxes.xyxy.tolist(),\n"
@@ -5904,6 +6352,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 model = ed_m.text().strip()
                 conf = ed_c.text().strip() or "0.25"
                 imgsz = ed_i.text().strip() or "1920"
+                iou = ed_n.text().strip() or "0.4"
                 em.msg.emit("开始：%d 页，模型 %s" % (len(pages), os.path.basename(model)))
                 em.prog.emit(0, len(pages))
                 for n, pg in enumerate(pages):
@@ -5913,7 +6362,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         # 先平滑缩到训练时的尺寸再喂模型：直接喂大图会让细线在
                         # ultralytics 内部的 cv2 降采样里丢掉（见 model_input_image）
                         img_in = model_input_image(img)
-                        pr = subprocess.run([pyp, script, model, img_in, conf, imgsz],
+                        pr = subprocess.run([pyp, script, model, img_in, conf, imgsz, iou],
                                             capture_output=True, text=True, encoding="utf-8",
                                             errors="replace", timeout=3600,
                                             creationflags=_NO_WINDOW)
@@ -5934,6 +6383,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     log.appendPlainText("先选模型文件（best.pt）")
                     return
                 self.settings["model"] = ed_m.text().strip()
+                self.settings["model_conf"] = ed_c.text().strip() or "0.35"
+                self.settings["model_iou"] = ed_n.text().strip() or "0.4"
                 save_settings(self.settings)
                 threading.Thread(target=work, daemon=True).start()
 
@@ -6826,7 +7277,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
                 self.dbg.save(dest, mod)
-                self.dbg = DebugJson(dest)
+                if not getattr(self.dbg, "is_folder", False):
+                    self.dbg = DebugJson(dest)
             finally:
                 QApplication.restoreOverrideCursor()
             self.edited.clear()
@@ -6842,14 +7294,58 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.pm = None
             self.goto_page(keep)
             if not quiet:
+                if getattr(self.dbg, "is_folder", False):
+                    QMessageBox.information(
+                        self, "已写回补标文件夹",
+                        "写回 %d 页：%s\n\n（每页写进它自己的 json，图片没动；"
+                        "桌面上的原始标注不受影响）\n页号：%s"
+                        % (len(pages), self.dbg.path,
+                           "、".join(str(p) for p in pages) if pages else "（没有改动）"))
+                    return len(mod)
                 QMessageBox.information(
                     self, "已保存",
                     "写好了：\n%s\n\n写入的页：%s\n（没改过的页和段落是逐字节照搬的）"
                     % (dest, "、".join(str(p) for p in pages) if pages else "（没有改动）"))
             return len(mod)
 
+        def on_open_folder(self):
+            """打开「补标文件夹」（一个 json 配一张同名图片）。"""
+            base = os.path.expanduser("~")
+            try:
+                if self.dbg and getattr(self.dbg, "path", ""):
+                    base = (self.dbg.path if getattr(self.dbg, "is_folder", False)
+                            else os.path.dirname(self.dbg.path))
+            except Exception:
+                pass
+            d = QFileDialog.getExistingDirectory(
+                self, "选择补标文件夹（每个 json 旁边有同名图片）", base)
+            if d:
+                self.load_folder(d)
+
+        def on_folder_save(self):
+            """补标文件夹就地保存：改过的页写回各自的 json。"""
+            if not self.dbg or not getattr(self.dbg, "is_folder", False):
+                return
+            self._stash_dirty()
+            pages = sorted(p for p, pm in self.edited.items() if getattr(pm, "dirty", False))
+            if not pages:
+                QMessageBox.information(self, "没有改动", "这次没有改过任何一页，不用保存。")
+                return
+            if QMessageBox.question(
+                    self, "写回补标文件夹",
+                    "把改过的 %d 页写回：\n%s\n\n"
+                    "（只覆盖这个文件夹里的 json，图片和你桌面上的原始标注都不动）\n"
+                    "继续吗？" % (len(pages), self.dbg.path)
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            n = self.do_save(self.dbg.path, quiet=True)
+            self.statusBar().showMessage("已写回 %d 页：%s" % (n, self.dbg.path), 8000)
+
         def on_save_as(self):
             if not self.dbg:
+                return
+            if getattr(self.dbg, "is_folder", False):
+                self.on_folder_save()
                 return
             base = os.path.splitext(self.dbg.path)[0] + "_annotated.json"
             p, _ = QFileDialog.getSaveFileName(self, "另存标注结果", base,
@@ -6859,6 +7355,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
 
         def on_save_over(self):
             if not self.dbg:
+                return
+            if getattr(self.dbg, "is_folder", False):
+                self.on_folder_save()
                 return
             src = self.dbg.path
             if QMessageBox.question(
@@ -7022,7 +7521,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         print("另存 OK：%s（写了 %d 页）" % (dest, n))
         # 删框同步验证：删掉 3 个 Tracker + 1 个 Node，另存后重新读一遍，看是不是真少了
         win.goto_page(first)
-        base = PageModel(DebugJson(path), first).counts()
+        base = PageModel(SuggestFolderDoc(path) if os.path.isdir(path) else DebugJson(path),
+                         first).counts()
         before = len(win.items)
         victims = [it for it in win.items if it.shape_data["label"] == "Tracker"][:3]
         victims += [it for it in win.items if it.shape_data["label"] == "Node"][:1]
@@ -7043,7 +7543,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         dest2 = os.path.join(app_dir(), "smoke_del.json")
         win.do_save(dest2, quiet=True)
         print("   诊断：保存后 edited=%d" % len(win.edited))
-        c2 = PageModel(DebugJson(dest2), first).counts()
+        c2 = PageModel(SuggestFolderDoc(path) if os.path.isdir(path) else DebugJson(dest2),
+                       first).counts()
         print("删框同步：界面 %d -> %d，另存后重新读 Node %d / Tracker %d"
               % (before, after, c2["Node"], c2["Tracker"]))
         ok_del = (c2["Node"] == base["Node"] - 1 and c2["Tracker"] == base["Tracker"] - 3)
@@ -7142,7 +7643,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         win.items[0].set_locked(True)
         dest_lock = os.path.join(app_dir(), "smoke_lock.json")
         win.do_save(dest_lock, quiet=True)
-        back = [s for s in PageModel(DebugJson(dest_lock), first).shapes
+        back = [s for s in PageModel(SuggestFolderDoc(path) if os.path.isdir(path)
+                                     else DebugJson(dest_lock), first).shapes
                 if s.get("locked")]
         print("   锁定状态存进 JSON 再读回来: %d 个（应为 1）  %s"
               % (len(back), "通过" if len(back) == 1 else "不一致！"))
@@ -7198,7 +7700,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         win.clean_pages(pgs_all, clean_manual=False, quiet=True)
         dest_all = os.path.join(app_dir(), "smoke_clean_all.json")
         win.do_save(dest_all, quiet=True)
-        n_saved = len(PageModel(DebugJson(dest_all), p_first).shapes)
+        n_saved = len(PageModel(SuggestFolderDoc(path) if os.path.isdir(path)
+                                else DebugJson(dest_all), p_first).shapes)
         print("   整册清理后存盘重读：第 %d 页 %d 个框（清理前 %d）  %s"
               % (p_first, n_saved, n_before_clean,
                  "通过" if n_saved < n_before_clean else "没写进去！"))

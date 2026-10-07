@@ -34,6 +34,10 @@ def main() -> int:
                     help="默认只导出建议框（打开就只看问号）；加这个把原有标注也带上")
     ap.add_argument("--ratio", type=float, default=0.0,
                     help="只导出置信度 >= 这个值的建议（0 = 全导）")
+    ap.add_argument("--roots", default=None,
+                    help="原始标注根目录（逗号分隔）。不传就用默认值——注意默认值已被改成公司电脑的路径，"
+                         "在本机跑必须显式传，例如 "
+                         "\"C:\\Users\\szk\\Desktop\\batch_003,...,C:\\Users\\szk\\Desktop\\G-Mhalf\"")
     args = ap.parse_args()
 
     src = HERE / "runs" / "diag" / "hard_boxes.csv"
@@ -52,7 +56,8 @@ def main() -> int:
 
     # 数据集里的图 -> 原图（取同名里最大的那张，和训练用的一致）
     pairs = {}
-    for p in collect_pairs():
+    roots = [r.strip() for r in args.roots.split(",") if r.strip()] if args.roots else None
+    for p in collect_pairs(roots):
         old = pairs.get(p["stem"])
         if old is None or p["image"].stat().st_size > old["image"].stat().st_size:
             pairs[p["stem"]] = p

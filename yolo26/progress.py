@@ -142,17 +142,30 @@ def main() -> int:
             eta = f"，本轮还要 {hms(to_sec(rem))}" if rem else ""
             print(f"  当前: 第 {ep}/{eps} 轮  {pct}%  ({it}/{its} batch, {shown}){eta}")
 
-        blocks = []
+        # 每次验证都是 "all" 打头，后面可能跟 Node/Tracker 行（有些 ultralytics 版本不打印分类别）。
+        # 所以按 "all" 切块，只显示最后一块，别把历次的 all 混在一起。
+        blocks: list[list] = []
+        cur: list = []
         for ln in lines:
             m = CLSROW.match(ln)
             if m and m.group(1) in ("all", "Node", "Tracker", "Typical", "Box"):
-                blocks.append(m.groups())
-            elif blocks and ln.strip() == "":
-                blocks = blocks
+                if cur and m.group(1) == "all":
+                    blocks.append(cur)
+                    cur = []
+                cur.append(m.groups())
+            elif not ln.strip() and cur:
+                blocks.append(cur)
+                cur = []
+        if cur:
+            blocks.append(cur)
         if blocks:
-            print("  最近一次验证（按类别）:")
+            last = blocks[-1]
+            has_cls = any(b[0] in ("Node", "Tracker", "Typical", "Box") for b in last)
+            title = "最近一次验证（按类别）" if has_cls else \
+                "最近一次验证（整体；这一版 ultralytics 的日志没打印分类别行）"
+            print(f"  {title}:")
             print(f"    {'类别':<10}{'框数':>7}{'P':>9}{'R':>9}{'mAP50':>9}{'mAP50-95':>11}")
-            for name, _imgs, n, p, r, m50, m5095 in blocks[-3:]:
+            for name, _imgs, n, p, r, m50, m5095 in last:
                 print(f"    {name:<10}{n:>7}{float(p):>9.3f}{float(r):>9.3f}"
                       f"{float(m50):>9.3f}{float(m5095):>11.3f}")
         elif not stopped:

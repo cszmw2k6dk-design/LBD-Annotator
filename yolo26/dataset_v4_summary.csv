@@ -1,0 +1,9 @@
+﻿source,split,pages,Node_boxes,Tracker_boxes
+dataset_v2,train,952,19349,126859
+dataset_v2,val,248,4825,32011
+steelriver+(train),train,120,2054,15443
+steelriver+(val),val,24,373,2724
+bigway+(train),train,96,1701,9591
+bigway+(val),val,19,339,1886
+highland+(train),train,72,1139,6445
+highland+(val),val,14,222,1250

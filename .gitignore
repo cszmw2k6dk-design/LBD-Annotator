@@ -31,6 +31,21 @@ yolo26/*.part
 # 客户图纸/标注数据：绝不入库（补标建议里是原图 + 标注，2.3 GB）
 yolo26/补标建议/
 yolo26/补标结果/
+# 补标交付包（原图 + 标注）：同样绝不入库
+yolo26/补标建议_v4c/
+yolo26/补标重点_v4c/
+yolo26/_已剔除_低分辨率_a-f_g-mhalf/
+# 数据集 v3/v4 及其预览图（客户图纸）
+yolo26/dataset_v3/
+yolo26/dataset_v4/
+yolo26/dataset_v3_preview/
+yolo26/dataset_v4_preview/
+# 从 agent3 转出来的新数据（客户图纸）
+yolo26/agent3_src/
+yolo26/agent3_check/
+# 3200 分辨率探针产物 / ultralytics 默认输出目录
+yolo26/probe3200/
+Ultralytics/
 # 补标交付打包（里面是原图 + 标注的 zip），同样不入库
 补标打包/
 
