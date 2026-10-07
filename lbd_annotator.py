@@ -3161,13 +3161,22 @@ def make_gui_classes():
                 c = COLORS.get(self.shape_data["label"], QColor(255, 0, 255))
             pen = QPen(c)
             pen.setCosmetic(True)
-            pen.setWidthF(2.4 if sug else 2.0)
-            alpha = 24 if sug else 26
+            pen.setWidthF(3.2 if sug else 2.0)
+            alpha = 55 if sug else 26
             if ctx and not sug:
                 # 补标包里带来的"原有标注"：只是参照，画细实线、不填充，
                 # 让彩色虚线的建议框一眼就能挑出来（类别颜色仍然保留）。
+                # 颜色再往白里调淡一档 —— 屏幕上只留建议框一个"重颜色"。
+                base = COLORS.get(self.shape_data["label"], QColor(170, 170, 170))
+                c = QColor((base.red() * 2 + 255 * 3) // 5,
+                           (base.green() * 2 + 255 * 3) // 5,
+                           (base.blue() * 2 + 255 * 3) // 5)
+                pen.setColor(c)
                 pen.setWidthF(1.2)
                 alpha = 0
+                self.setPen(pen)
+                self.setBrush(QBrush(QColor(c.red(), c.green(), c.blue(), 0)))
+                return
             if self.is_locked() or sug:
                 # 锁上的框：虚线 + 更淡的底，一眼看得出"这个不能动"
                 # 建议框：同样虚线 —— 虚线＝"还没人工确认过"
@@ -7457,6 +7466,13 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                                   if not a.isSeparator())))
             win.show()
             QApplication.processEvents()
+            _zoom = os.environ.get("LBD_ZOOM")       # 开发用：截图前先放大几档
+            if _zoom:
+                try:
+                    win.zoom_by(float(_zoom))
+                    QApplication.processEvents()
+                except Exception:
+                    pass
             win.grab().save(_shot)
             _p("截图：%s（%dx%d）" % (_shot, win.width(), win.height()))
         print("内存：载入后 %.0f MB（%s）"
