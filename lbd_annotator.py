@@ -3132,10 +3132,8 @@ def make_gui_classes():
         AUTO_COLOR = QColor(230, 150, 0)
         MISS_COLOR = QColor(255, 40, 40)
         CHECK_COLOR = QColor(150, 60, 220)
-        # 补标/识别建议框：虚线 + 按置信度分档配色（阈值从高到低）
-        SUG_COLORS = ((0.70, QColor(255, 90, 0)),      # 强建议：橙
-                      (0.50, QColor(235, 165, 0)),     # 中：琥珀
-                      (0.00, QColor(150, 150, 150)))   # 弱：灰
+        # 补标/识别建议框：统一橙色 + 虚线（一眼就能和原有标注区分），强弱看框上的置信度数字
+        SUG_COLOR = QColor(255, 120, 0)
         show_conf = True                               # 是否在建议框上标置信度（工具栏可切）
 
         def __init__(self, shape):
@@ -3158,13 +3156,13 @@ def make_gui_classes():
             elif self.shape_data.get("_auto"):
                 c = self.AUTO_COLOR
             elif sug:
-                c, _conf = self.conf_color()
+                c = BoxItem.SUG_COLOR
             else:
                 c = COLORS.get(self.shape_data["label"], QColor(255, 0, 255))
             pen = QPen(c)
             pen.setCosmetic(True)
-            pen.setWidthF(1.8 if sug else 2.0)
-            alpha = 18 if sug else 26
+            pen.setWidthF(2.4 if sug else 2.0)
+            alpha = 24 if sug else 26
             if ctx and not sug:
                 # 补标包里带来的"原有标注"：只是参照，画细实线、不填充，
                 # 让彩色虚线的建议框一眼就能挑出来（类别颜色仍然保留）。
@@ -3186,16 +3184,12 @@ def make_gui_classes():
             raw = self.shape_data.get("raw") or {}
             return str(raw.get("xl_label") or "").endswith("?")
 
-        def conf_color(self):
-            """建议框按置信度分档取色，返回 (颜色, 置信度)。"""
+        def conf_value(self):
+            """建议框的置信度数值（拿不到算 0）。"""
             try:
-                conf = float(self.shape_data.get("confidence") or 0.0)
+                return float(self.shape_data.get("confidence") or 0.0)
             except Exception:
-                conf = 0.0
-            for lo, col in BoxItem.SUG_COLORS:
-                if conf >= lo:
-                    return col, conf
-            return BoxItem.SUG_COLORS[-1][1], conf
+                return 0.0
 
         def is_locked(self):
             return bool(self.shape_data.get("locked"))
@@ -3306,7 +3300,7 @@ def make_gui_classes():
             box = QRectF(r.left() + 1.0, r.top() + 1.0,
                          max(12.0, len(txt) * size * 0.66), size * 1.3)
             painter.fillRect(box, QColor(255, 255, 255, 200))
-            painter.setPen(QPen(self.conf_color()[0]))
+            painter.setPen(QPen(BoxItem.SUG_COLOR))     # 统一橙色（强弱看数字就行）
             painter.drawText(box, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, txt)
             painter.restore()
 
@@ -3717,7 +3711,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             BoxItem.show_conf = self.act_show_conf.isChecked()
             self.act_show_conf.setToolTip(
                 "补标/识别建议框上标出置信度数字。\n"
-                "建议框本身就是虚线，颜色按置信度分档：橙 ≥0.7、琥珀 0.5~0.7、灰 <0.5。\n"
+                "建议框统一是橙色虚线（一眼就能和原有标注区分），强弱看框上的数字：\n"
+                "≥0.7 基本可信、0.5~0.7 看一眼、<0.5 重点核。\n"
                 "框在屏幕上太小时不画数字（放大就会出来），选中的框一定画。")
             self.act_show_conf.toggled.connect(self.on_toggle_show_conf)
             tb2.addAction(self.act_show_conf)
@@ -5196,7 +5191,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     else:
                         n_low += 1
             if n_sug:
-                extra += ("\n建议框 %d 个（橙 ≥0.7：%d　琥珀 0.5~0.7：%d　灰 <0.5：%d）"
+                extra += ("\n建议框 %d 个（≥0.7：%d　0.5~0.7：%d　<0.5 要重点核：%d）"
                           % (n_sug, n_hi, n_mid, n_low))
                 n_orig = len(self.pm.shapes) - n_sug
                 if n_orig:
