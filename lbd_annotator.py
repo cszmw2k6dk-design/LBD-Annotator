@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.47"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.48"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -100,6 +100,31 @@ def fetch_json_curl(url, token="", timeout=12, proxy=""):
             p.returncode, (p.stderr.decode("utf-8", "replace") or "").strip()[:200])
     except Exception as e:                     # noqa: BLE001
         return None, "curl 调用失败：%s" % e
+
+
+def _urllib_get(url, token="", timeout=15, proxy="", method="GET"):
+    """**纯 urllib 发请求，不启任何子进程** —— 和主程序 Voltage-CAD MAP 的
+    `http_get` 一模一样。这是关键：用户机器上"从标注工具 exe 里 spawn 子进程
+    （git.exe / curl.exe）"会卡住（第一步 git ls-remote 就卡死），而主程序
+    纯 urllib 一直是好的。所以在线更新这条路**只用 urllib**。
+
+    返回 (响应对象, 错误文本)。
+    """
+    import urllib.request
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "LBD-Annotator/%s" % ANNOTATOR_VERSION,
+                      "Accept": "application/vnd.github+json"},
+        method=method)
+    if (token or "").strip():
+        req.add_header("Authorization", "Bearer %s" % token.strip())
+    try:
+        handlers = []
+        if (proxy or "").strip():
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        opener = urllib.request.build_opener(*handlers) if handlers else urllib.request
+        return opener.urlopen(req, timeout=timeout), ""
+    except Exception as e:                     # noqa: BLE001
+        return None, "%s" % e
 
 
 def _github_json(url, token="", timeout=6, proxy=""):
@@ -201,11 +226,10 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, pro
     """查 GitHub 的 release，返回 (info, 错误文本)。不写任何文件。
 
     顺序很讲究（实测按这个来最快也最稳，几秒出结果）：
-      ① **git ls-remote** 拿最新 tag —— 和你 clone 同一条通道，实测 2 秒；
-      ② 直接 **HEAD 那个 tag 的安装包**（github.com 域名，公开仓库地址可拼）——
-         有的话当场就能给"下载到程序目录"，完全绕开 api.github.com；
-      ③ 前面拿不到才回退 **api.github.com**（curl.exe 优先 + 匿名优先），
-         它知道"哪些版本真的挂了 exe"，能把没挂包的版本跳过。
+      **纯 urllib，不启任何子进程**（和主程序 Voltage-CAD MAP 的更新同一条路）：
+      ① api.github.com/repos/<repo>/releases/latest（匿名优先，再带本机凭据；
+         同时列最近 10 个 release，挑"最新一个挂着 exe 的"）；
+      ② api 不通时用 urllib 打开 github.com/<repo>/releases/latest，跟着 302 取 tag。
     """
     import queue as _queue
     import threading as _threading
@@ -224,8 +248,14 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, pro
                 pass
 
     def worker_git():
-        """① git ls-remote 拿 tag（和 clone 同一条通道，实测 2 秒）
-           ② 从新到旧 HEAD 探测"哪个版本挂了安装包"（github.com，公开仓库地址可拼）。"""
+        """**不再使用 git/curl 子进程。**
+
+        用户机器上实测：从标注工具 exe 里 spawn 子进程（git.exe / curl.exe）会卡死
+        （检查一直停在"① git ls-remote"），而主程序 Voltage-CAD MAP 纯 urllib 一直是好的。
+        所以在线更新这条路**只用 urllib**（见下面的 worker_api），这里保留空实现。
+        """
+        return
+        # ---- 以下为旧实现（git + HEAD），保留备查，不再执行 ----
         try:
             _step("① 问 github.com：有哪些版本（git ls-remote）")
             tags = git_remote_tags(repo)
@@ -249,12 +279,86 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, pro
             _say("git 通道：%s" % e)
 
     def worker_api():
-        """api.github.com —— **不再使用**。
+        """**纯 urllib** 查版本 —— 和主程序 Voltage-CAD MAP 的更新完全同一条路。
 
-        用户机器上实测：github.com / git 都通，但 api.github.com 被网络挡住（诊断就停在这一步）。
-        而"哪个版本挂了安装包"用 HEAD 探测就能得到，够用了，所以干脆不碰 api，
-        免得再因为它卡住整条检查。留这个空函数只是为了让 diff 小、逻辑位置清楚。
+        ① 先问 api.github.com/repos/<repo>/releases/latest（匿名；不行再带本机 git 凭据；
+           还会列出最近 10 个 release，挑"最新一个挂着 exe 的"）；
+        ② api 不通时，用 urllib 打开 github.com/<repo>/releases/latest，
+           跟着 302 走到 .../releases/tag/<tag>，从**地址**里取版本号。
+        全程用 urllib，**不 spawn 任何子进程**（git/curl 会卡，见 worker_git 的说明）。
         """
+        def _pick(rels):
+            rels = [x for x in rels if isinstance(x, dict) and not x.get("draft")]
+            if not rels:
+                return None, None
+            with_exe = []
+            for x in rels:
+                hit = None
+                for a in (x.get("assets") or []):
+                    if str(a.get("name") or "").lower().endswith(".exe"):
+                        hit = a
+                        break
+                x["_lbd_asset"] = hit
+                if hit:
+                    with_exe.append(x)
+            if with_exe:
+                with_exe.sort(key=lambda x: (parse_version(x.get("tag_name")),
+                                             str(x.get("published_at") or "")),
+                              reverse=True)
+                return with_exe[0], True
+            return rels[0], False
+
+        urls = ["https://api.github.com/repos/%s/releases?per_page=10" % repo,
+                "https://api.github.com/repos/%s/releases/latest" % repo]
+        for rd in range(max(1, int(rounds))):
+            if on_round:
+                try:
+                    on_round(rd + 1)
+                except Exception:
+                    pass
+            tok_try = "" if rd == 0 else token
+            _step("① 问 api.github.com（urllib，%s）"
+                  % ("匿名" if not tok_try else "带凭据"))
+            for url in urls:
+                r, err = _urllib_get(url, tok_try, timeout + 6, proxy)
+                if r is None:
+                    _say("api：%s" % err)
+                    continue
+                try:
+                    data = json.loads(r.read().decode("utf-8", "replace"))
+                except Exception as e:          # noqa: BLE001
+                    _say("api 返回读不出 JSON：%s" % e)
+                    continue
+                rel = data if isinstance(data, list) else [data]
+                hit, has_exe = _pick(rel)
+                if hit is not None:
+                    q.put(hit)
+                    return
+                _say("api：没有可用的 release")
+        # ② api 不通 -> 走网页（同样纯 urllib，跟着 302 取 tag）
+        _step("② 问 github.com 网页（urllib，跟着跳转取版本号）")
+        r, err = _urllib_get("https://github.com/%s/releases/latest" % repo,
+                             "", timeout, proxy)
+        if r is None:
+            _say("网页：%s" % err)
+            return
+        tag = ""
+        m = re.search(r"/releases/tag/(v[\d.]+)", r.geturl() or "")
+        if m:
+            tag = m.group(1)
+        if not tag:
+            try:
+                m = re.search(r"/releases/tag/(v[\d.]+)",
+                              r.read().decode("utf-8", "replace"))
+                tag = m.group(1) if m else ""
+            except Exception:                  # noqa: BLE001
+                tag = ""
+        if not tag:
+            _say("网页里没取到版本号")
+            return
+        dl = "https://github.com/%s/releases/download/%s/LBD.exe" % (repo, tag)
+        asset = {"name": "LBD.exe", "size": 0, "browser_download_url": dl}
+        q.put({"tag_name": tag, "assets": [asset], "_lbd_asset": asset, "_from": "web"})
         return
         # ---- 以下为旧实现，保留备查，不再执行 ----
         _step("③ 问 api.github.com（可能慢，①② 好就不用等它）")
@@ -323,9 +427,8 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, pro
     got = _drain(1.0)
     if got is not None:
         return got, ""                       # ①② 就搞定了
-    # 走到这儿说明①②没给出可下载的结果（最新几个版本都没挂包）——
-    # 现在不再去问 api（那域名在用户机器上被挡），直接把手上的 tag 报上去
-    _threading.Thread(target=worker_api, daemon=True).start()    # 空函数，立即返回
+    # 走纯 urllib 那条（和主程序同一条路）
+    _threading.Thread(target=worker_api, daemon=True).start()
     while time.time() < deadline:
         try:
             info = q.get(timeout=min(deadline - time.time(), 3.0))
@@ -482,48 +585,31 @@ def update_diagnose(repo=None, settings=None, on_step=None):
 
     step("DNS 解析 github.com", _dns, limit=15)
 
-    def _curlver():
-        exe = shutil.which("curl") or shutil.which("curl.exe")
-        if not exe:
-            return "系统里没有 curl.exe"
-        try:
-            p = subprocess.run([exe, "--version"], capture_output=True, text=True,
-                               timeout=10, creationflags=_NO_WINDOW)
-            return (p.stdout or "").splitlines()[0] if p.stdout else "（没输出）"
-        except Exception as e:                 # noqa: BLE001
-            return "调不动 curl.exe：%r" % e
-
-    step("系统 curl.exe 可用性", _curlver, limit=15)
-
-    def _gitver():
-        exe = shutil.which("git") or shutil.which("git.exe")
-        if not exe:
-            return "系统里没有 git（更新会用 API 那条路）"
-        try:
-            p = subprocess.run([exe, "--version"], capture_output=True, text=True,
-                               timeout=10, creationflags=_NO_WINDOW)
-            return (p.stdout or "").strip() or "（没输出）"
-        except Exception as e:                 # noqa: BLE001
-            return "调不动 git.exe：%r" % e
-
-    step("系统 git.exe 可用性", _gitver, limit=15)
-
-    tag = [""]
-
-    def _gitremote():
+    def _api_latest():
         t = time.time()
-        tag[0] = git_remote_latest_tag(repo)
-        return ("最新 tag = %s" % tag[0]) if tag[0] else "没拿到 tag（通道不通）"
+        r, err = _urllib_get("https://api.github.com/repos/%s/releases/latest" % repo,
+                             "", 20)
+        if r is None:
+            return "失败：%s" % err
+        data = json.loads(r.read().decode("utf-8", "replace"))
+        a = [x for x in (data.get("assets") or [])
+             if str(x.get("name") or "").lower().endswith(".exe")]
+        return "OK，tag=%s，安装包 %s（%.1fs）" % (
+            data.get("tag_name"), (a[0].get("name") if a else "（这版没挂）"),
+            time.time() - t)
 
-    step("① git ls-remote 问 tag", _gitremote, limit=25)
+    step("① api.github.com（urllib，和主程序同一条路）", _api_latest, limit=30)
 
-    def _head():
-        if not tag[0]:
-            return "跳过（不知道 tag）"
-        ok, size = head_release_asset(repo, tag[0], timeout=8)
-        return ("安装包在，%.1f MB" % (size / 1048576.0)) if ok else "那个 tag 没挂 LBD.exe"
+    def _web_latest():
+        t = time.time()
+        r, err = _urllib_get("https://github.com/%s/releases/latest" % repo, "", 20)
+        if r is None:
+            return "失败：%s" % err
+        m = re.search(r"/releases/tag/(v[\d.]+)", r.geturl() or "")
+        return ("OK，跳转到 %s（%.1fs）" % (m.group(1), time.time() - t)) if m \
+            else "打开了但没取到版本号"
 
-    step("② HEAD 安装包（github.com）", _head, limit=20)
+    step("② github.com 网页（urllib，跟着跳转取 tag）", _web_latest, limit=30)
 
     def _final():
         info, err = fetch_latest_release(repo, windows_git_credential(), timeout=6, rounds=1)
@@ -533,10 +619,11 @@ def update_diagnose(repo=None, settings=None, on_step=None):
                                                     info.get("_from", "api"))
         return "失败：%s" % str(err)[:200]
 
-    step("③ 整体检查（工具实际用的）", _final, limit=40)
+    step("③ 整体检查（工具实际用的）", _final, limit=45)
     out.append("")
-    out.append("说明：检查更新**只用 github.com 和 git**（api.github.com 那个域名在不少网络里被挡，")
-    out.append("     所以工具从 v0.47 起完全不碰它）。上面哪一步不通，就是哪一层被防火墙/杀软拦了。")
+    out.append("说明：检查更新**只用 urllib**（和主程序 Voltage-CAD MAP 完全同一条路），")
+    out.append("     不再 spawn git.exe / curl.exe 那种子进程（实测从 exe 里调子进程会卡死）。")
+    out.append("     上面哪一步不通，就是哪一层被网络/防火墙/杀软拦了。")
     return "\n".join(out)
 
 
