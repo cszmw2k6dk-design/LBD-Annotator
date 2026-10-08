@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.46"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.47"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -128,16 +128,12 @@ def _github_json(url, token="", timeout=6, proxy=""):
         return None, "curl：%s；urllib：%s" % (err_curl, e)
 
 
-def git_remote_latest_tag(repo, timeout=15):
-    """兜底：用 git ls-remote 问 GitHub 有哪些 tag（这条通道和你 clone 用的是同一条，
-    国内网络经常"api.github.com 不通、github.com 能通"）。
-
-    返回最新版本 tag（如 "v0.41"）；失败返回空串。
-    """
+def git_remote_tags(repo, timeout=15, limit=0):
+    """用 git ls-remote 问 GitHub 有哪些版本 tag，**按版本从新到旧**返回（limit=0 全要）。"""
     import subprocess as _sp
     exe = shutil.which("git") or shutil.which("git.exe")
     if not exe:
-        return ""
+        return []
     url = "https://github.com/%s.git" % repo
     try:
         env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
@@ -145,18 +141,26 @@ def git_remote_latest_tag(repo, timeout=15):
                     encoding="utf-8", errors="replace", timeout=timeout, env=env,
                     creationflags=_NO_WINDOW)
         if p.returncode != 0:
-            return ""
-        tags = []
+            return []
+        tags = set()
         for line in (p.stdout or "").splitlines():
             m = re.search(r"refs/tags/(v[\d.]+)\s*$", line.strip())
-            if m and not m.group(1).endswith("^{}"):
-                tags.append(m.group(1))
-        if not tags:
-            return ""
-        tags.sort(key=parse_version)
-        return tags[-1]
+            if m:
+                tags.add(m.group(1))
+        out = sorted(tags, key=parse_version, reverse=True)
+        return out[:limit] if limit else out
     except Exception:                          # noqa: BLE001
-        return ""
+        return []
+
+
+def git_remote_latest_tag(repo, timeout=15):
+    """兜底：用 git ls-remote 问 GitHub 有哪些 tag（这条通道和你 clone 用的是同一条，
+    国内网络经常"api.github.com 不通、github.com 能通"）。
+
+    返回最新版本 tag（如 "v0.41"）；失败返回空串。
+    """
+    tags = git_remote_tags(repo, timeout=timeout, limit=1)
+    return tags[0] if tags else ""
 
 
 def head_release_asset(repo, tag, name="LBD.exe", timeout=8, proxy=""):
@@ -221,28 +225,38 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, pro
 
     def worker_git():
         """① git ls-remote 拿 tag（和 clone 同一条通道，实测 2 秒）
-           ② 直接 HEAD 那个 tag 的安装包（github.com，公开仓库地址可拼）。"""
+           ② 从新到旧 HEAD 探测"哪个版本挂了安装包"（github.com，公开仓库地址可拼）。"""
         try:
-            _step("① git ls-remote 问最新版本")
-            tag = git_remote_latest_tag(repo)
-            if not tag:
+            _step("① 问 github.com：有哪些版本（git ls-remote）")
+            tags = git_remote_tags(repo)
+            if not tags:
                 _say("git ls-remote 没拿到 tag")
                 return
-            _step("② 问 github.com 这个版本有没有安装包")
-            ok, size = head_release_asset(repo, tag, timeout=8, proxy=proxy)
-            if ok:
-                dl = ("https://github.com/%s/releases/download/%s/LBD.exe" % (repo, tag))
-                asset = {"name": "LBD.exe", "size": size, "browser_download_url": dl}
-                q.put({"tag_name": tag, "assets": [asset], "_lbd_asset": asset,
-                       "_from": "git"})
-            else:
-                _say("git 查到 %s，但那个版本没挂 LBD.exe" % tag)
-                q.put({"tag_name": tag, "assets": [], "_lbd_asset": None, "_from": "git"})
+            _step("② 问 github.com：哪个版本挂了安装包（HEAD 探测）")
+            # 最新那个可能还没挂包（上传中断之类）-> 往前找几个，最多试 6 个
+            for tag in tags[:6]:
+                ok, size = head_release_asset(repo, tag, timeout=8, proxy=proxy)
+                if ok:
+                    dl = ("https://github.com/%s/releases/download/%s/LBD.exe"
+                          % (repo, tag))
+                    asset = {"name": "LBD.exe", "size": size, "browser_download_url": dl}
+                    q.put({"tag_name": tag, "assets": [asset], "_lbd_asset": asset,
+                           "_from": "git"})
+                    return
+                _say("%s 没挂 LBD.exe" % tag)
+            q.put({"tag_name": tags[0], "assets": [], "_lbd_asset": None, "_from": "git"})
         except Exception as e:                 # noqa: BLE001
             _say("git 通道：%s" % e)
 
     def worker_api():
-        """③ api.github.com：知道"哪些版本真的挂了包"，但要它通才行。"""
+        """api.github.com —— **不再使用**。
+
+        用户机器上实测：github.com / git 都通，但 api.github.com 被网络挡住（诊断就停在这一步）。
+        而"哪个版本挂了安装包"用 HEAD 探测就能得到，够用了，所以干脆不碰 api，
+        免得再因为它卡住整条检查。留这个空函数只是为了让 diff 小、逻辑位置清楚。
+        """
+        return
+        # ---- 以下为旧实现，保留备查，不再执行 ----
         _step("③ 问 api.github.com（可能慢，①② 好就不用等它）")
         urls = ["https://api.github.com/repos/%s/releases?per_page=10" % repo,
                 "https://api.github.com/repos/%s/releases/latest" % repo]
@@ -284,11 +298,34 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, pro
                     q.put(rels[0])
                 return
 
-    for fn in (worker_git, worker_api):
-        _threading.Thread(target=fn, daemon=True).start()
-
-    # 谁先给出"带着安装包"的结果就用谁；只拿到 tag（没安装包信息）就再等 2 秒看有没有更好的
+    # 只跑 ①②（git + github.com），**完全不碰 api.github.com**：
+    # 用户机器上 api 那个域名被挡（诊断停在第 3 步），而 github.com 是通的。
+    worker_git()
     deadline, best, t_first = time.time() + 30.0, None, 0.0
+
+    def _drain(max_wait=0.5):
+        """把队列里已有的结果收下来（快通道最多等 max_wait 秒）。"""
+        nonlocal best, t_first
+        end = time.time() + max_wait
+        while time.time() < end:
+            try:
+                info = q.get(timeout=min(end - time.time(), 0.2))
+            except _queue.Empty:
+                continue
+            if not isinstance(info, dict):
+                continue
+            if info.get("_lbd_asset"):
+                return info
+            if best is None:
+                best, t_first = info, time.time()
+        return None
+
+    got = _drain(1.0)
+    if got is not None:
+        return got, ""                       # ①② 就搞定了
+    # 走到这儿说明①②没给出可下载的结果（最新几个版本都没挂包）——
+    # 现在不再去问 api（那域名在用户机器上被挡），直接把手上的 tag 报上去
+    _threading.Thread(target=worker_api, daemon=True).start()    # 空函数，立即返回
     while time.time() < deadline:
         try:
             info = q.get(timeout=min(deadline - time.time(), 3.0))
@@ -488,28 +525,6 @@ def update_diagnose(repo=None, settings=None, on_step=None):
 
     step("② HEAD 安装包（github.com）", _head, limit=20)
 
-    def _api_anon():
-        t = time.time()
-        data, err = _github_json("https://api.github.com/repos/%s/releases/latest" % repo,
-                                 "", 8)
-        if data:
-            return "OK，tag=%s（%.1fs）" % (data.get("tag_name"), time.time() - t)
-        return "失败：%s" % str(err)[:200]
-
-    step("③ api.github.com（匿名）", _api_anon, limit=25)
-
-    def _api_tok():
-        tok = windows_git_credential()
-        if not tok:
-            return "本机 git 凭据里没有 token"
-        data, err = _github_json("https://api.github.com/repos/%s/releases/latest" % repo,
-                                 tok, 8)
-        if data:
-            return "OK，tag=%s（token 长度 %d）" % (data.get("tag_name"), len(tok))
-        return "失败：%s" % str(err)[:200]
-
-    step("④ api.github.com（带凭据）", _api_tok, limit=25)
-
     def _final():
         info, err = fetch_latest_release(repo, windows_git_credential(), timeout=6, rounds=1)
         if info:
@@ -518,10 +533,10 @@ def update_diagnose(repo=None, settings=None, on_step=None):
                                                     info.get("_from", "api"))
         return "失败：%s" % str(err)[:200]
 
-    step("⑤ 整体检查（工具实际用的）", _final, limit=40)
+    step("③ 整体检查（工具实际用的）", _final, limit=40)
     out.append("")
-    out.append("提示：① ② 通、③ ④ 不通 = github.com 能连但 api.github.com 被挡（正常，工具会用 ①②）；")
-    out.append("     ① ② ③ ④ 全不通 = 这台机器到 github.com 的外连被防火墙/杀软拦了。")
+    out.append("说明：检查更新**只用 github.com 和 git**（api.github.com 那个域名在不少网络里被挡，")
+    out.append("     所以工具从 v0.47 起完全不碰它）。上面哪一步不通，就是哪一层被防火墙/杀软拦了。")
     return "\n".join(out)
 
 
