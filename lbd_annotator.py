@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.40"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.41"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -6758,6 +6758,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             hard.timeout.connect(on_timeout)
             # curl 8s + urllib 8s = 最多 ~16s，硬超时给到 25s（以前 15s 会把 curl 那条路
             # 直接掐掉，表现就是"一直卡着检查、最后什么也没更新"）
+            # 单次请求 6s × 最多 4 次（两个 URL × curl/urllib）= 24s，硬超时留 30s 余量
             hard.start(30000)
 
             from PySide6.QtCore import QObject as _QO2, Signal as _SIG2
@@ -6770,7 +6771,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             def worker():
                 try:
                     tok = update_token(self.settings)      # CredRead 也可能慢，别放主线程
-                    info, err = fetch_latest_release(repo, tok, timeout=8)
+                    info, err = fetch_latest_release(repo, tok, timeout=6)
                 except Exception as e:                     # noqa: BLE001
                     info, err = None, "%s" % e
                 sig.done.emit((info, err))
