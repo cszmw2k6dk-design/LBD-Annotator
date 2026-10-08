@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.48"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.50"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -222,7 +222,7 @@ def head_release_asset(repo, tag, name="LBD.exe", timeout=8, proxy=""):
 
 
 def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, proxy="",
-                         on_step=None):
+                         on_step=None, prefer=""):
     """查 GitHub 的 release，返回 (info, 错误文本)。不写任何文件。
 
     顺序很讲究（实测按这个来最快也最稳，几秒出结果）：
@@ -320,7 +320,8 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, pro
             _step("① 问 api.github.com（urllib，%s）"
                   % ("匿名" if not tok_try else "带凭据"))
             for url in urls:
-                r, err = _urllib_get(url, tok_try, timeout + 6, proxy)
+                # 单次给足 18 秒：国内直连 api.github.com 经常要十几秒才回
+                r, err = _urllib_get(url, tok_try, max(timeout, 18), proxy)
                 if r is None:
                     _say("api：%s" % err)
                     continue
@@ -332,13 +333,16 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, pro
                 rel = data if isinstance(data, list) else [data]
                 hit, has_exe = _pick(rel)
                 if hit is not None:
+                    hit["_from"] = "api"
                     q.put(hit)
                     return
                 _say("api：没有可用的 release")
-        # ② api 不通 -> 走网页（同样纯 urllib，跟着 302 取 tag）
+
+    def worker_web():
+        """② 网页那条（纯 urllib，跟着 302 取 tag）——和 ① 并行跑，谁快用谁。"""
         _step("② 问 github.com 网页（urllib，跟着跳转取版本号）")
         r, err = _urllib_get("https://github.com/%s/releases/latest" % repo,
-                             "", timeout, proxy)
+                             "", max(timeout, 18), proxy)
         if r is None:
             _say("网页：%s" % err)
             return
@@ -360,87 +364,38 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, pro
         asset = {"name": "LBD.exe", "size": 0, "browser_download_url": dl}
         q.put({"tag_name": tag, "assets": [asset], "_lbd_asset": asset, "_from": "web"})
         return
-        # ---- 以下为旧实现，保留备查，不再执行 ----
-        _step("③ 问 api.github.com（可能慢，①② 好就不用等它）")
-        urls = ["https://api.github.com/repos/%s/releases?per_page=10" % repo,
-                "https://api.github.com/repos/%s/releases/latest" % repo]
-        for rd in range(max(1, int(rounds))):
-            if on_round:
-                try:
-                    on_round(rd + 1)
-                except Exception:
-                    pass
-            # 第 1 轮**不带 token**（和主程序 Voltage-CAD MAP 同一条通道：仓库公开，
-            # 匿名就能读；带 token 反而多一层可能出问题的地方），第 2 轮才带。
-            tok_try = "" if rd == 0 else token
-            for url in urls:
-                data, err = _github_json(url, tok_try, timeout, proxy)
-                if data is None:
-                    _say(err)
-                    continue
-                rels = data if isinstance(data, list) else [data]
-                rels = [r for r in rels if isinstance(r, dict) and not r.get("draft")]
-                if not rels:
-                    _say("这个仓库还没有 Release")
-                    continue
-                with_exe = []
-                for r in rels:
-                    hit = None
-                    for a in (r.get("assets") or []):
-                        if str(a.get("name") or "").lower().endswith(".exe"):
-                            hit = a
-                            break
-                    r["_lbd_asset"] = hit
-                    if hit:
-                        with_exe.append(r)
-                if with_exe:
-                    with_exe.sort(key=lambda r: (parse_version(r.get("tag_name")),
-                                                 str(r.get("published_at") or "")),
-                                  reverse=True)
-                    q.put(with_exe[0])
-                else:
-                    q.put(rels[0])
-                return
 
-    # 只跑 ①②（git + github.com），**完全不碰 api.github.com**：
-    # 用户机器上 api 那个域名被挡（诊断停在第 3 步），而 github.com 是通的。
-    worker_git()
-    deadline, best, t_first = time.time() + 30.0, None, 0.0
-
-    def _drain(max_wait=0.5):
-        """把队列里已有的结果收下来（快通道最多等 max_wait 秒）。"""
-        nonlocal best, t_first
-        end = time.time() + max_wait
-        while time.time() < end:
-            try:
-                info = q.get(timeout=min(end - time.time(), 0.2))
-            except _queue.Empty:
-                continue
-            if not isinstance(info, dict):
-                continue
-            if info.get("_lbd_asset"):
-                return info
-            if best is None:
-                best, t_first = info, time.time()
-        return None
-
-    got = _drain(1.0)
-    if got is not None:
-        return got, ""                       # ①② 就搞定了
-    # 走纯 urllib 那条（和主程序同一条路）
-    _threading.Thread(target=worker_api, daemon=True).start()
+    # **谁通用谁**：prefer 是上次成功的那条通道（存在设置里）。
+    #   · 有记录 -> 只先跑那一条，8 秒没结果再把另一条放出来（平时只发一个请求）
+    #   · 没记录 -> 两条并行，谁先给出"带安装包"的结果用谁
+    # 两边都是 urllib、都不启子进程（和主程序同一条路）；整体最多等 20 秒。
+    workers = {"api": worker_api, "web": worker_web}
+    want = str(prefer or "").strip().lower()
+    if want in workers:
+        _threading.Thread(target=workers[want], daemon=True).start()
+        started_other, other_at = False, time.time() + 8.0
+    else:
+        for _fn in workers.values():
+            _threading.Thread(target=_fn, daemon=True).start()
+        started_other, other_at = True, time.time()
+    deadline, best, t_first = time.time() + 20.0, None, 0.0
     while time.time() < deadline:
         try:
             info = q.get(timeout=min(deadline - time.time(), 3.0))
         except _queue.Empty:
-            if best is not None and time.time() - t_first > 2.0:
-                return best, ""
-            continue
+            info = None
         if isinstance(info, dict):
             if info.get("_lbd_asset"):
-                return info, ""
+                return info, ""                      # 有版本 + 有安装包 -> 直接用
             if best is None:
                 best, t_first = info, time.time()
+        if not started_other and time.time() >= other_at:
+            for _k, _fn in workers.items():           # 首选那条太久没动静 -> 另一条也放出来
+                if _k != want:
+                    _threading.Thread(target=_fn, daemon=True).start()
+            started_other = True
+        if best is not None and time.time() - t_first > 2.0:
+            return best, ""                          # 只有版本号（没安装包信息）也别让人干等
     if best is not None:
         return best, ""
     return None, "；".join(errs)[:400]
@@ -7210,7 +7165,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     info, err = fetch_latest_release(
                         repo, tok, timeout=6, rounds=2,
                         on_round=lambda rd: sig.round.emit(rd), proxy=px,
-                        on_step=lambda s: sig.step.emit(s))
+                        on_step=lambda s: sig.step.emit(s),
+                        prefer=str(self.settings.get("update_channel") or ""))
                 except Exception as e:                     # noqa: BLE001
                     info, err = None, "%s" % e
                 sig.done.emit((info, err))
@@ -7223,6 +7179,14 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 stop_busy()
                 self.statusBar().showMessage("", 0)
                 info, err = res if isinstance(res, tuple) else (None, "未知错误")
+                # 记住这次是哪条通道成的：下次只走那条，不再去碰不通的那条
+                try:
+                    ch = str((info or {}).get("_from") or "")
+                    if ch and self.settings.get("update_channel") != ch:
+                        self.settings["update_channel"] = ch
+                        save_settings(self.settings)
+                except Exception:
+                    pass
                 self._show_update_result(info, err, repo, time.time() - t0)
 
             sig.done.connect(back)
