@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.44"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.45"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -362,6 +362,130 @@ def update_proxy(settings=None):
             if p:
                 break
     return p
+
+
+def update_diagnose(repo=None, settings=None):
+    """把「检查更新」的每一步都跑一遍并记下来，返回一份可以直接发给人的报告文本。
+
+    为什么要有这个：用户机器上"一直等 / 卡住"时，光看界面分不清到底是
+    DNS 慢、防火墙拦、杀毒软件拦、代理没配还是凭据有问题 —— 这份报告里
+    每一步都有**耗时**和**原始错误**，对照着看一目了然。
+    """
+    import platform
+    import socket
+    repo = repo or UPDATE_REPO
+    out = ["LBD 标注工具 — 更新诊断",
+           "时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+           "工具版本：v%s" % ANNOTATOR_VERSION,
+           "仓库：%s" % repo,
+           "系统：%s" % platform.platform(),
+           "打包成 exe：%s" % bool(getattr(sys, "frozen", False)),
+           "程序路径：%s" % (os.path.abspath(sys.executable) if getattr(sys, "frozen", False)
+                            else os.path.abspath(__file__)),
+           "代理设置：%r（环境变量 %r）"
+           % (str((settings or {}).get("update_proxy") or ""),
+              os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""),
+           ""]
+
+    def step(name, fn):
+        t0 = time.time()
+        try:
+            msg = fn()
+        except Exception as e:                 # noqa: BLE001
+            msg = "异常：%r" % e
+        out.append("[%s] %-30s %6.1f 秒  %s"
+                   % (time.strftime("%H:%M:%S"), name, time.time() - t0, msg))
+        return msg
+
+    def _dns():
+        t = time.time()
+        try:
+            infos = socket.getaddrinfo("github.com", 443, proto=socket.IPPROTO_TCP)
+            ips = sorted({i[4][0] for i in infos})[:3]
+            return "github.com -> %s（%.1fs）" % (", ".join(ips), time.time() - t)
+        except Exception as e:                 # noqa: BLE001
+            return "DNS 失败：%r" % e
+
+    step("DNS 解析 github.com", _dns)
+
+    def _curlver():
+        exe = shutil.which("curl") or shutil.which("curl.exe")
+        if not exe:
+            return "系统里没有 curl.exe"
+        try:
+            p = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                               timeout=10, creationflags=_NO_WINDOW)
+            return (p.stdout or "").splitlines()[0] if p.stdout else "（没输出）"
+        except Exception as e:                 # noqa: BLE001
+            return "调不动 curl.exe：%r" % e
+
+    step("系统 curl.exe 可用性", _curlver)
+
+    def _gitver():
+        exe = shutil.which("git") or shutil.which("git.exe")
+        if not exe:
+            return "系统里没有 git（更新会用 API 那条路）"
+        try:
+            p = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                               timeout=10, creationflags=_NO_WINDOW)
+            return (p.stdout or "").strip() or "（没输出）"
+        except Exception as e:                 # noqa: BLE001
+            return "调不动 git.exe：%r" % e
+
+    step("系统 git.exe 可用性", _gitver)
+
+    tag = [""]
+
+    def _gitremote():
+        t = time.time()
+        tag[0] = git_remote_latest_tag(repo)
+        return ("最新 tag = %s" % tag[0]) if tag[0] else "没拿到 tag（通道不通）"
+
+    step("① git ls-remote 问 tag", _gitremote)
+
+    def _head():
+        if not tag[0]:
+            return "跳过（不知道 tag）"
+        ok, size = head_release_asset(repo, tag[0], timeout=8)
+        return ("安装包在，%.1f MB" % (size / 1048576.0)) if ok else "那个 tag 没挂 LBD.exe"
+
+    step("② HEAD 安装包（github.com）", _head)
+
+    def _api_anon():
+        t = time.time()
+        data, err = _github_json("https://api.github.com/repos/%s/releases/latest" % repo,
+                                 "", 8)
+        if data:
+            return "OK，tag=%s（%.1fs）" % (data.get("tag_name"), time.time() - t)
+        return "失败：%s" % str(err)[:200]
+
+    step("③ api.github.com（匿名）", _api_anon)
+
+    def _api_tok():
+        tok = windows_git_credential()
+        if not tok:
+            return "本机 git 凭据里没有 token"
+        data, err = _github_json("https://api.github.com/repos/%s/releases/latest" % repo,
+                                 tok, 8)
+        if data:
+            return "OK，tag=%s（token 长度 %d）" % (data.get("tag_name"), len(tok))
+        return "失败：%s" % str(err)[:200]
+
+    step("④ api.github.com（带凭据）", _api_tok)
+
+    def _final():
+        info, err = fetch_latest_release(repo, windows_git_credential(), timeout=6, rounds=1)
+        if info:
+            a = info.get("_lbd_asset") or {}
+            return "成功：tag=%s 资产=%s（来自 %s）" % (info.get("tag_name"), a.get("name"),
+                                                    info.get("_from", "api"))
+        return "失败：%s" % str(err)[:200]
+
+    step("⑤ 整体检查（工具实际用的）", _final)
+    out.append("")
+    out.append("提示：① ② 通、③ ④ 不通 = github.com 能连但 api.github.com 被挡（正常，工具会用 ①②）；")
+    out.append("     ① ② ③ ④ 全不通 = 这台机器到 github.com 的外连被防火墙/杀软拦了。")
+    return "\n".join(out)
 
 
 OCR_BOX_SCRIPT = r'''
@@ -4014,6 +4138,10 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a = menu_more.addAction("训练环境…")
             a.setToolTip("检测 Python / 一键装 ultralytics（CPU 版）+ 一键训练")
             a.triggered.connect(self.on_train_panel)
+            a = menu_more.addAction("更新诊断…")
+            a.setToolTip("更新检查卡住/失败时点这个：DNS、curl、git、安装包地址、api 各测一遍，\n"
+                         "把结果发我就能看出是哪一层被防火墙/杀毒软件挡了")
+            a.triggered.connect(self.on_update_diagnose)
             btn_more.setMenu(menu_more)
             tb.addWidget(btn_more)
             a = QAction("检查更新", self)
@@ -6899,8 +7027,13 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 b.setDetailedText("下载页：%s" % page)
                 b_open = b.addButton("用浏览器打开下载页",
                                      QMessageBox.ButtonRole.AcceptRole)
+                b_diag = b.addButton("运行诊断（把结果发我）",
+                                     QMessageBox.ButtonRole.ActionRole)
                 b.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
                 b.exec()
+                if b.clickedButton() is b_diag:
+                    self.on_update_diagnose()
+                    return
                 if b.clickedButton() is b_open:
                     self._open_url(page)
 
@@ -6969,8 +7102,13 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 b.setDetailedText("错误：%s\n\n下载页：%s" % (err, page))
                 b_open = b.addButton("用浏览器打开下载页",
                                      QMessageBox.ButtonRole.AcceptRole)
+                b_diag = b.addButton("运行诊断（把结果发我）",
+                                     QMessageBox.ButtonRole.ActionRole)
                 b.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
                 b.exec()
+                if b.clickedButton() is b_diag:
+                    self.on_update_diagnose()
+                    return
                 if b.clickedButton() is b_open:
                     self._open_url(page)
                 return
@@ -7030,6 +7168,54 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 self, "已是最新版本",
                 "当前 v%s 就是最新版本（远端 %s，%s）。\n\n（检查用时 %.1f 秒）"
                 % (ANNOTATOR_VERSION, tag, date, elapsed))
+
+        def on_update_diagnose(self):
+            """一键跑「更新诊断」：DNS / curl / git / 安装包地址 / api 各测一次，
+            结果显示出来（可一键复制）并存到程序目录的 update_check_report.txt。"""
+            from PySide6.QtWidgets import QProgressDialog
+            import threading
+            from PySide6.QtCore import QObject as _QOd, Signal as _SIGd
+            prog = QProgressDialog("正在跑更新诊断（DNS / curl / git / 安装包地址 / api）…",
+                                   "取消", 0, 0, self)
+            prog.setWindowTitle("更新诊断（本工具 v%s）" % ANNOTATOR_VERSION)
+            prog.setMinimumDuration(0)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+
+            class _Sigd(_QOd):
+                done = _SIGd(object)
+
+            sg = _Sigd()
+
+            def worker():
+                try:
+                    rep = update_diagnose(settings=self.settings)
+                except Exception as e:                 # noqa: BLE001
+                    rep = "诊断本身出错：%r" % e
+                sg.done.emit(rep)
+
+            def back(rep):
+                prog.close()
+                path = os.path.join(app_dir(), "update_check_report.txt")
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(rep)
+                except Exception:
+                    path = "（写不进程序目录）"
+                box = QMessageBox(self)
+                box.setWindowTitle("更新诊断（把这段发我）")
+                box.setIcon(QMessageBox.Icon.Information)
+                box.setText(rep)
+                box.setDetailedText(rep + "\n\n（也写到了：%s）" % path)
+                b_copy = box.addButton("复制到剪贴板", QMessageBox.ButtonRole.ActionRole)
+                box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+                box.exec()
+                if box.clickedButton() is b_copy:
+                    QApplication.clipboard().setText(rep)
+                    self.statusBar().showMessage("诊断报告已复制到剪贴板", 5000)
+
+            sg.done.connect(back)
+            prog.show()
+            threading.Thread(target=worker, daemon=True).start()
 
         def _open_url(self, url):
             try:
@@ -8146,6 +8332,9 @@ def main():
     ap.add_argument("--start-page", type=int, default=None,
                     help="把这份 JSON 的起始页记下来（打开时直接停在这一页；0=清除）。"
                          "不启动界面，写完就退出")
+    ap.add_argument("--update-check", action="store_true",
+                    help="跑一遍在线更新诊断（DNS/curl/git/HEAD/api 各测一次），"
+                         "把报告写到程序目录的 update_check_report.txt，不启动界面")
     ap.add_argument("--force", action="store_true",
                     help="--autofill 时把已有的 Node 名字也重算一遍")
     ap.add_argument("--csv", default=None,
@@ -8155,6 +8344,23 @@ def main():
     a = ap.parse_args()
     global TEST_MODE
     TEST_MODE = bool(a.smoke or a.memtest or a.roundtrip)   # 自检不碰用户的设置/缓存
+    if a.update_check:
+        rep = update_diagnose(settings=load_settings())
+        path = os.path.join(app_dir(), "update_check_report.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(rep)
+        except Exception:
+            path = "（写不进程序目录）"
+        print(rep)
+        try:                                    # 打包成 exe 后没有控制台，弹个框给人看
+            from PySide6.QtWidgets import QApplication, QMessageBox
+            QApplication.instance() or QApplication([])
+            QMessageBox.information(None, "更新诊断（把这段发我）",
+                                    rep + "\n\n（也写到了：%s）" % path)
+        except Exception:
+            pass
+        return 0
     if a.start_page is not None:
         src = a.json or DEFAULT_JSON
         if not (src and os.path.exists(src)):
