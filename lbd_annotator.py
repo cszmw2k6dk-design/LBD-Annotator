@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.45"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.46"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -192,7 +192,8 @@ def head_release_asset(repo, tag, name="LBD.exe", timeout=8, proxy=""):
         return False, 0
 
 
-def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, proxy=""):
+def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, proxy="",
+                         on_step=None):
     """查 GitHub 的 release，返回 (info, 错误文本)。不写任何文件。
 
     顺序很讲究（实测按这个来最快也最稳，几秒出结果）：
@@ -211,14 +212,23 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, pro
         with lock:
             errs.append(str(msg))
 
+    def _step(name):
+        if on_step:
+            try:
+                on_step(name)
+            except Exception:
+                pass
+
     def worker_git():
         """① git ls-remote 拿 tag（和 clone 同一条通道，实测 2 秒）
            ② 直接 HEAD 那个 tag 的安装包（github.com，公开仓库地址可拼）。"""
         try:
+            _step("① git ls-remote 问最新版本")
             tag = git_remote_latest_tag(repo)
             if not tag:
                 _say("git ls-remote 没拿到 tag")
                 return
+            _step("② 问 github.com 这个版本有没有安装包")
             ok, size = head_release_asset(repo, tag, timeout=8, proxy=proxy)
             if ok:
                 dl = ("https://github.com/%s/releases/download/%s/LBD.exe" % (repo, tag))
@@ -233,6 +243,7 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, pro
 
     def worker_api():
         """③ api.github.com：知道"哪些版本真的挂了包"，但要它通才行。"""
+        _step("③ 问 api.github.com（可能慢，①② 好就不用等它）")
         urls = ["https://api.github.com/repos/%s/releases?per_page=10" % repo,
                 "https://api.github.com/repos/%s/releases/latest" % repo]
         for rd in range(max(1, int(rounds))):
@@ -364,7 +375,31 @@ def update_proxy(settings=None):
     return p
 
 
-def update_diagnose(repo=None, settings=None):
+def _run_with_timeout(fn, timeout):
+    """在子线程里跑 fn，最多等 timeout 秒；超时就返回一句"超时"，绝不无限等。
+
+    为什么每一步都要这样包一层：用户机器上"卡在界面"到底是什么卡住了，
+    光看错误看不出来（DNS、spawn 子进程、TLS 握手都可能卡），包一层之后
+    报告里会明确写"（这步超时）"。
+    """
+    import threading as _th
+    box = {}
+
+    def run():
+        try:
+            box["v"] = fn()
+        except Exception as e:                 # noqa: BLE001
+            box["v"] = "异常：%r" % e
+
+    t = _th.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return "⚠ 这一步超过 %ds 没反应（卡在这里）" % int(timeout)
+    return box.get("v", "（没结果）")
+
+
+def update_diagnose(repo=None, settings=None, on_step=None):
     """把「检查更新」的每一步都跑一遍并记下来，返回一份可以直接发给人的报告文本。
 
     为什么要有这个：用户机器上"一直等 / 卡住"时，光看界面分不清到底是
@@ -387,12 +422,14 @@ def update_diagnose(repo=None, settings=None):
               os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""),
            ""]
 
-    def step(name, fn):
+    def step(name, fn, limit=20):
+        if on_step:
+            try:
+                on_step(name)
+            except Exception:
+                pass
         t0 = time.time()
-        try:
-            msg = fn()
-        except Exception as e:                 # noqa: BLE001
-            msg = "异常：%r" % e
+        msg = _run_with_timeout(fn, limit)
         out.append("[%s] %-30s %6.1f 秒  %s"
                    % (time.strftime("%H:%M:%S"), name, time.time() - t0, msg))
         return msg
@@ -406,7 +443,7 @@ def update_diagnose(repo=None, settings=None):
         except Exception as e:                 # noqa: BLE001
             return "DNS 失败：%r" % e
 
-    step("DNS 解析 github.com", _dns)
+    step("DNS 解析 github.com", _dns, limit=15)
 
     def _curlver():
         exe = shutil.which("curl") or shutil.which("curl.exe")
@@ -419,7 +456,7 @@ def update_diagnose(repo=None, settings=None):
         except Exception as e:                 # noqa: BLE001
             return "调不动 curl.exe：%r" % e
 
-    step("系统 curl.exe 可用性", _curlver)
+    step("系统 curl.exe 可用性", _curlver, limit=15)
 
     def _gitver():
         exe = shutil.which("git") or shutil.which("git.exe")
@@ -432,7 +469,7 @@ def update_diagnose(repo=None, settings=None):
         except Exception as e:                 # noqa: BLE001
             return "调不动 git.exe：%r" % e
 
-    step("系统 git.exe 可用性", _gitver)
+    step("系统 git.exe 可用性", _gitver, limit=15)
 
     tag = [""]
 
@@ -441,7 +478,7 @@ def update_diagnose(repo=None, settings=None):
         tag[0] = git_remote_latest_tag(repo)
         return ("最新 tag = %s" % tag[0]) if tag[0] else "没拿到 tag（通道不通）"
 
-    step("① git ls-remote 问 tag", _gitremote)
+    step("① git ls-remote 问 tag", _gitremote, limit=25)
 
     def _head():
         if not tag[0]:
@@ -449,7 +486,7 @@ def update_diagnose(repo=None, settings=None):
         ok, size = head_release_asset(repo, tag[0], timeout=8)
         return ("安装包在，%.1f MB" % (size / 1048576.0)) if ok else "那个 tag 没挂 LBD.exe"
 
-    step("② HEAD 安装包（github.com）", _head)
+    step("② HEAD 安装包（github.com）", _head, limit=20)
 
     def _api_anon():
         t = time.time()
@@ -459,7 +496,7 @@ def update_diagnose(repo=None, settings=None):
             return "OK，tag=%s（%.1fs）" % (data.get("tag_name"), time.time() - t)
         return "失败：%s" % str(err)[:200]
 
-    step("③ api.github.com（匿名）", _api_anon)
+    step("③ api.github.com（匿名）", _api_anon, limit=25)
 
     def _api_tok():
         tok = windows_git_credential()
@@ -471,7 +508,7 @@ def update_diagnose(repo=None, settings=None):
             return "OK，tag=%s（token 长度 %d）" % (data.get("tag_name"), len(tok))
         return "失败：%s" % str(err)[:200]
 
-    step("④ api.github.com（带凭据）", _api_tok)
+    step("④ api.github.com（带凭据）", _api_tok, limit=25)
 
     def _final():
         info, err = fetch_latest_release(repo, windows_git_credential(), timeout=6, rounds=1)
@@ -481,7 +518,7 @@ def update_diagnose(repo=None, settings=None):
                                                     info.get("_from", "api"))
         return "失败：%s" % str(err)[:200]
 
-    step("⑤ 整体检查（工具实际用的）", _final)
+    step("⑤ 整体检查（工具实际用的）", _final, limit=40)
     out.append("")
     out.append("提示：① ② 通、③ ④ 不通 = github.com 能连但 api.github.com 被挡（正常，工具会用 ①②）；")
     out.append("     ① ② ③ ④ 全不通 = 这台机器到 github.com 的外连被防火墙/杀软拦了。")
@@ -6992,7 +7029,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 lambda: prog.setLabelText(
                     "正在检查更新（%s）…\n本工具 v%s    已等 %.0f 秒%s"
                     % (repo, ANNOTATOR_VERSION, time.time() - t0,
-                       ("（第 %d 轮重试）" % state["round"]) if state["round"] > 1 else "")))
+                       ("（第 %d 轮重试）" % state["round"]) if state["round"] > 1 else "")
+                    + "\n" + (state["step"] or "正在选通道…")))
             tick.start()
 
             def stop_busy():
@@ -7051,14 +7089,17 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             class _Sig(_QO2):
                 done = _SIG2(object)
                 round = _SIG2(int)              # 第几轮重试（网络不通时让人看到在重试）
+                step = _SIG2(str)               # 正在试哪条通道（git / HEAD / api）
 
             sig = _Sig()
             state = {"round": 1}
+            state["step"] = ""
 
             def _on_round(rd):
                 state["round"] = rd
 
             sig.round.connect(_on_round)
+            sig.step.connect(lambda s: state.__setitem__("step", s))
 
             def worker():
                 try:
@@ -7066,7 +7107,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     px = update_proxy(self.settings)
                     info, err = fetch_latest_release(
                         repo, tok, timeout=6, rounds=2,
-                        on_round=lambda rd: sig.round.emit(rd), proxy=px)
+                        on_round=lambda rd: sig.round.emit(rd), proxy=px,
+                        on_step=lambda s: sig.step.emit(s))
                 except Exception as e:                     # noqa: BLE001
                     info, err = None, "%s" % e
                 sig.done.emit((info, err))
@@ -7175,20 +7217,33 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             from PySide6.QtWidgets import QProgressDialog
             import threading
             from PySide6.QtCore import QObject as _QOd, Signal as _SIGd
-            prog = QProgressDialog("正在跑更新诊断（DNS / curl / git / 安装包地址 / api）…",
-                                   "取消", 0, 0, self)
+            prog = QProgressDialog("正在跑更新诊断…（每一步都会写在这里）",
+                                   "取消", 0, 7, self)
             prog.setWindowTitle("更新诊断（本工具 v%s）" % ANNOTATOR_VERSION)
             prog.setMinimumDuration(0)
             prog.setWindowModality(Qt.WindowModality.WindowModal)
 
             class _Sigd(_QOd):
                 done = _SIGd(object)
+                step = _SIGd(str, int)
 
             sg = _Sigd()
+            _n = {"i": 0}
+
+            def on_step(name):
+                _n["i"] += 1
+                sg.step.emit(str(name), _n["i"])
+
+            def _show_step(name, i):
+                prog.setLabelText("正在跑更新诊断…\n第 %d 步：%s\n（卡住的话就是这一步）"
+                                  % (i, name))
+                prog.setValue(i - 1)
+
+            sg.step.connect(_show_step)
 
             def worker():
                 try:
-                    rep = update_diagnose(settings=self.settings)
+                    rep = update_diagnose(settings=self.settings, on_step=on_step)
                 except Exception as e:                 # noqa: BLE001
                     rep = "诊断本身出错：%r" % e
                 sg.done.emit(rep)
@@ -7202,16 +7257,27 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 except Exception:
                     path = "（写不进程序目录）"
                 box = QMessageBox(self)
-                box.setWindowTitle("更新诊断（把这段发我）")
-                box.setIcon(QMessageBox.Icon.Information)
-                box.setText(rep)
-                box.setDetailedText(rep + "\n\n（也写到了：%s）" % path)
-                b_copy = box.addButton("复制到剪贴板", QMessageBox.ButtonRole.ActionRole)
-                box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
-                box.exec()
-                if box.clickedButton() is b_copy:
-                    QApplication.clipboard().setText(rep)
-                    self.statusBar().showMessage("诊断报告已复制到剪贴板", 5000)
+                # 直接拿记事本打开报告文件（比弹一个大文本框友好，也不会让人以为卡住），
+                # 打不开才退回弹窗
+                opened = False
+                try:
+                    os.startfile(path)                 # noqa: S606
+                    opened = True
+                    self.statusBar().showMessage("诊断报告已打开（文件：%s）" % path, 12000)
+                except Exception:
+                    opened = False
+                if not opened:
+                    box = QMessageBox(self)
+                    box.setWindowTitle("更新诊断（把这段发我）")
+                    box.setIcon(QMessageBox.Icon.Information)
+                    box.setText(rep)
+                    box.setDetailedText(rep + "\n\n（也写到了：%s）" % path)
+                    b_copy = box.addButton("复制到剪贴板", QMessageBox.ButtonRole.ActionRole)
+                    box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+                    box.exec()
+                    if box.clickedButton() is b_copy:
+                        QApplication.clipboard().setText(rep)
+                        self.statusBar().showMessage("诊断报告已复制到剪贴板", 5000)
 
             sg.done.connect(back)
             prog.show()
