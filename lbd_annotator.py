@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.41"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.42"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -70,7 +70,7 @@ def parse_version(tag):
     return tuple(int(n) for n in nums[:3]) if nums else ()
 
 
-def fetch_json_curl(url, token="", timeout=12):
+def fetch_json_curl(url, token="", timeout=12, proxy=""):
     """用系统自带的 curl.exe 取 JSON。
 
     为什么要这个：打包成 exe 之后，防火墙/杀软经常把"未签名 exe 的外连"静默丢掉，
@@ -88,7 +88,10 @@ def fetch_json_curl(url, token="", timeout=12):
         cfg += 'header = "Authorization: Bearer %s"\n' % token.strip()
     cfg += 'url = "%s"\n' % url
     try:
-        p = _sp.run([exe, "-sS", "-L", "--max-time", str(int(timeout)), "--config", "-"],
+        args = [exe, "-sS", "-L", "--max-time", str(int(timeout)), "--config", "-"]
+        if (proxy or "").strip():
+            args += ["--proxy", proxy.strip()]
+        p = _sp.run(args,
                     input=cfg.encode("utf-8"), capture_output=True,
                     timeout=timeout + 8, creationflags=_NO_WINDOW)
         if p.returncode == 0 and p.stdout.strip():
@@ -99,7 +102,7 @@ def fetch_json_curl(url, token="", timeout=12):
         return None, "curl 调用失败：%s" % e
 
 
-def _github_json(url, token="", timeout=6):
+def _github_json(url, token="", timeout=6, proxy=""):
     """取 GitHub API 的 JSON：**先 curl.exe**，失败再 urllib。
 
     为什么 curl 优先：打包成 exe 之后，防火墙/杀软常把"未签名 exe 的外连"静默丢掉，
@@ -107,7 +110,7 @@ def _github_json(url, token="", timeout=6):
     实测：先 urllib 要 21 秒才拿到结果，curl 优先后 10 秒左右就有。
     """
     import urllib.request
-    info, err_curl = fetch_json_curl(url, token, timeout)
+    info, err_curl = fetch_json_curl(url, token, timeout, proxy)
     if info is not None:
         return info, ""
     try:
@@ -116,13 +119,47 @@ def _github_json(url, token="", timeout=6):
                           "Accept": "application/vnd.github+json"})
         if (token or "").strip():
             req.add_header("Authorization", "Bearer %s" % token.strip())
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        opener = (urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+            if (proxy or "").strip() else urllib.request)
+        with opener.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8")), ""
     except Exception as e:                     # noqa: BLE001
         return None, "curl：%s；urllib：%s" % (err_curl, e)
 
 
-def fetch_latest_release(repo, token="", timeout=6):
+def git_remote_latest_tag(repo, timeout=25):
+    """兜底：用 git ls-remote 问 GitHub 有哪些 tag（这条通道和你 clone 用的是同一条，
+    国内网络经常"api.github.com 不通、github.com 能通"）。
+
+    返回最新版本 tag（如 "v0.41"）；失败返回空串。
+    """
+    import subprocess as _sp
+    exe = shutil.which("git") or shutil.which("git.exe")
+    if not exe:
+        return ""
+    url = "https://github.com/%s.git" % repo
+    try:
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        p = _sp.run([exe, "ls-remote", "--tags", url], capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=timeout, env=env,
+                    creationflags=_NO_WINDOW)
+        if p.returncode != 0:
+            return ""
+        tags = []
+        for line in (p.stdout or "").splitlines():
+            m = re.search(r"refs/tags/(v[\d.]+)\s*$", line.strip())
+            if m and not m.group(1).endswith("^{}"):
+                tags.append(m.group(1))
+        if not tags:
+            return ""
+        tags.sort(key=parse_version)
+        return tags[-1]
+    except Exception:                          # noqa: BLE001
+        return ""
+
+
+def fetch_latest_release(repo, token="", timeout=6, rounds=2, on_round=None, proxy=""):
     """查 GitHub 的 release，返回 (info, 错误文本)。不写任何文件。
 
     两个讲究：
@@ -130,37 +167,51 @@ def fetch_latest_release(repo, token="", timeout=6):
       2) 遍历最近的 release，**挑最新一个"挂着 exe 资产"的** —— 新版有时候资产还没传完
          （这次 v0.39.2 就是这样，检查成功但没东西可下），不该让它挡着更新。
          实在一个都没挂 exe，就返回最新那个，让上层提示"走浏览器下载页"。
+
+    外加两条保命：
+      · 整轮失败就**重试**（国内直连 api.github.com 时通时不通，实测重试经常能成）；
+      · API 全都拿不到时，退回 **git ls-remote** 只看 tag（给你版本号 + 下载页链接，
+        不至于"卡了半天什么都不知道"）。
     """
     urls = ["https://api.github.com/repos/%s/releases?per_page=10" % repo,
             "https://api.github.com/repos/%s/releases/latest" % repo]
     errs = []
-    for url in urls:
-        data, err = _github_json(url, token, timeout)
-        if data is None:
-            errs.append(err)
-            continue
-        rels = data if isinstance(data, list) else [data]
-        rels = [r for r in rels if isinstance(r, dict) and not r.get("draft")]
-        if not rels:
-            errs.append("这个仓库还没有 Release")
-            continue
-        with_exe = []
-        for r in rels:
-            hit = None
-            for a in (r.get("assets") or []):
-                if str(a.get("name") or "").lower().endswith(".exe"):
-                    hit = a
-                    break
-            r["_lbd_asset"] = hit
-            if hit:
-                with_exe.append(r)
-        if with_exe:
-            with_exe.sort(key=lambda r: (parse_version(r.get("tag_name")),
-                                         str(r.get("published_at") or "")),
-                          reverse=True)
-            return with_exe[0], ""
-        rels[0]["_lbd_asset"] = None
-        return rels[0], ""                     # 有 Release，但都没挂 exe
+    for rd in range(max(1, int(rounds))):
+        if on_round:
+            try:
+                on_round(rd + 1)
+            except Exception:
+                pass
+        for url in urls:
+            data, err = _github_json(url, token, timeout, proxy)
+            if data is None:
+                errs.append(err)
+                continue
+            rels = data if isinstance(data, list) else [data]
+            rels = [r for r in rels if isinstance(r, dict) and not r.get("draft")]
+            if not rels:
+                errs.append("这个仓库还没有 Release")
+                continue
+            with_exe = []
+            for r in rels:
+                hit = None
+                for a in (r.get("assets") or []):
+                    if str(a.get("name") or "").lower().endswith(".exe"):
+                        hit = a
+                        break
+                r["_lbd_asset"] = hit
+                if hit:
+                    with_exe.append(r)
+            if with_exe:
+                with_exe.sort(key=lambda r: (parse_version(r.get("tag_name")),
+                                             str(r.get("published_at") or "")),
+                              reverse=True)
+                return with_exe[0], ""
+            rels[0]["_lbd_asset"] = None
+            return rels[0], ""                 # 有 Release，但都没挂 exe
+    tag = git_remote_latest_tag(repo)
+    if tag:
+        return {"tag_name": tag, "assets": [], "_lbd_asset": None, "_from": "git"}, ""
     return None, "；".join(e for e in errs if e)[:400]
 
 
@@ -214,6 +265,23 @@ def update_token(settings=None):
     if not tok:
         tok = windows_git_credential()
     return tok
+
+
+def update_proxy(settings=None):
+    """更新检查/下载走的代理：设置里的 update_proxy > 环境变量 HTTPS_PROXY/HTTP_PROXY。
+
+    国内直连 api.github.com 常常时通时不通；如果你本机有代理（Clash/V2Ray 之类），
+    在 annotator_settings.json 里写一行 "update_proxy": "http://127.0.0.1:7890" 就行。
+    """
+    p = ""
+    if settings:
+        p = str(settings.get("update_proxy") or "").strip()
+    if not p:
+        for k in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            p = (os.environ.get(k) or "").strip()
+            if p:
+                break
+    return p
 
 
 OCR_BOX_SCRIPT = r'''
@@ -6712,8 +6780,10 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             tick = QTimer(self)
             tick.setInterval(1000)
             tick.timeout.connect(
-                lambda: prog.setLabelText("正在检查更新（%s）…\n已等 %.0f 秒"
-                                          % (repo, time.time() - t0)))
+                lambda: prog.setLabelText(
+                    "正在检查更新（%s）…\n已等 %.0f 秒%s"
+                    % (repo, time.time() - t0,
+                       ("（第 %d 轮重试）" % state["round"]) if state["round"] > 1 else "")))
             tick.start()
 
             def stop_busy():
@@ -6758,20 +6828,31 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             hard.timeout.connect(on_timeout)
             # curl 8s + urllib 8s = 最多 ~16s，硬超时给到 25s（以前 15s 会把 curl 那条路
             # 直接掐掉，表现就是"一直卡着检查、最后什么也没更新"）
-            # 单次请求 6s × 最多 4 次（两个 URL × curl/urllib）= 24s，硬超时留 30s 余量
-            hard.start(30000)
+            # 单次请求 6s × 2 轮 × 2 个 URL × (curl/urllib) 最坏 ~48s，再留 git ls-remote
+            # 兜底 ~25s，所以硬超时给到 90s（框上有"已等 N 秒"和取消按钮，不会白等）
+            hard.start(90000)
 
             from PySide6.QtCore import QObject as _QO2, Signal as _SIG2
 
             class _Sig(_QO2):
                 done = _SIG2(object)
+                round = _SIG2(int)              # 第几轮重试（网络不通时让人看到在重试）
 
             sig = _Sig()
+            state = {"round": 1}
+
+            def _on_round(rd):
+                state["round"] = rd
+
+            sig.round.connect(_on_round)
 
             def worker():
                 try:
                     tok = update_token(self.settings)      # CredRead 也可能慢，别放主线程
-                    info, err = fetch_latest_release(repo, tok, timeout=6)
+                    px = update_proxy(self.settings)
+                    info, err = fetch_latest_release(
+                        repo, tok, timeout=6, rounds=2,
+                        on_round=lambda rd: sig.round.emit(rd), proxy=px)
                 except Exception as e:                     # noqa: BLE001
                     info, err = None, "%s" % e
                 sig.done.emit((info, err))
@@ -6797,11 +6878,14 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 b.setIcon(QMessageBox.Icon.Warning)
                 b.setText("等了 %.0f 秒没拿到结果。" % elapsed)
                 b.setInformativeText(
-                    "· 能正常 clone 这个仓库的机器上，会直接用本机 git 存好的凭据，"
-                    "一般不用管；\n"
-                    "· 也可以在本工具的 annotator_settings.json 里加 "
-                    "\"update_token\"（只读 token）；\n"
-                    "· 或者点下面的按钮用浏览器打开下载页，手动下新版本覆盖旧的 exe。")
+                    "试过了：自己发请求、系统 curl.exe、git ls-remote（和自己发请求一样，"
+                    "都连了 2 轮）。\n"
+                    "多半是这台机器的网络到 api.github.com 不稳（国内直连常见）"
+                    "或被防火墙/杀毒软件拦了本工具的外连。\n"
+                    "· 能正常 clone 这个仓库的机器上会用本机 git 凭据，一般不用管；\n"
+                    "· 也可以在 annotator_settings.json 里加 \"update_token\"（只读 token）"
+                    "或 \"update_proxy\"（如 http://127.0.0.1:7890）；\n"
+                    "· 最稳的是点下面的按钮用浏览器打开下载页手动下（浏览器多半有代理/VPN）。")
                 b.setDetailedText("错误：%s\n\n下载页：%s" % (err, page))
                 b_open = b.addButton("用浏览器打开下载页",
                                      QMessageBox.ButtonRole.AcceptRole)
@@ -6834,8 +6918,12 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                     head += "安装包：%s（%.1f MB）\n" % (
                         exe[0].get("name"), (exe[0].get("size") or 0) / 1048576.0)
                 else:
-                    head += ("⚠ 这个版本还没挂可下载的 exe（可能上传还没完成），\n"
-                             "点「打开下载页」在浏览器里手动下。\n")
+                    if info.get("_from") == "git":
+                        head += ("（GitHub 的 API 这次没通，是用 git 查到的最新 tag ——"
+                                 "拿不到安装包信息）\n")
+                    else:
+                        head += "⚠ 这个版本还没挂可下载的 exe（可能上传还没完成）\n"
+                    head += "点「打开下载页」在浏览器里手动下。\n"
                 head += "\n点「下载到程序目录」会存一份新 exe 到程序旁边（不自动覆盖）；\n" \
                         "点「打开下载页」就是浏览器里手动下。"
                 box.setText(head)
@@ -6894,6 +6982,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             if not url:
                 self._open_url(page)
                 return
+            _proxy = update_proxy(self.settings)
             total = int((asset or {}).get("size") or 0)
             name = "LBD标注工具_%s.exe" % (tag or "new")
             dest = os.path.join(app_dir(), name)
@@ -6956,7 +7045,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                                                   "Authorization": "Bearer %s" % tok})
                         else:
                             req = urllib.request.Request(url, headers={"User-Agent": ua})
-                        opener = urllib.request.build_opener(StripAuthRedirect)
+                        _handlers = [StripAuthRedirect]
+                        if _proxy:
+                            _handlers.append(urllib.request.ProxyHandler(
+                                {"http": _proxy, "https": _proxy}))
+                        opener = urllib.request.build_opener(*_handlers)
                         with opener.open(req, timeout=30) as r:
                             if not total:
                                 total_hint = int(r.headers.get("Content-Length") or 0)
@@ -6990,7 +7083,10 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         cfg += ('location\nfail\n'
                                 'output = "%s"\n'
                                 'url = "%s"\n' % (tmp, api_url if use_api else url))
-                        pr = _sp.Popen([exe, "-sS", "--config", "-"],
+                        _curl_args = [exe, "-sS", "--config", "-"]
+                        if _proxy:
+                            _curl_args += ["--proxy", _proxy]
+                        pr = _sp.Popen(_curl_args,
                                        stdin=_sp.PIPE, stdout=_sp.PIPE,
                                        stderr=_sp.STDOUT, creationflags=_NO_WINDOW)
                         pr.stdin.write(cfg.encode("utf-8"))
