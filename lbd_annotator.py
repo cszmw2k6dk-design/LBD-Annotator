@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.39.2"                    # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.40"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -99,30 +99,69 @@ def fetch_json_curl(url, token="", timeout=12):
         return None, "curl 调用失败：%s" % e
 
 
-def fetch_latest_release(repo, token="", timeout=10):
-    """查 GitHub 的 latest release，返回 (info, 错误文本)。不写任何文件。
+def _github_json(url, token="", timeout=6):
+    """取 GitHub API 的 JSON：**先 curl.exe**，失败再 urllib。
 
-    先自己发请求；被防火墙/杀软拦掉（打包成 exe 后常见）就退回系统 curl.exe 再试一次。
+    为什么 curl 优先：打包成 exe 之后，防火墙/杀软常把"未签名 exe 的外连"静默丢掉，
+    urllib 会一直等到超时（白等一整个 timeout）；curl.exe 是系统程序，一般放行。
+    实测：先 urllib 要 21 秒才拿到结果，curl 优先后 10 秒左右就有。
     """
-    import json as _json
     import urllib.request
-    url = "https://api.github.com/repos/%s/releases/latest" % repo
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "LBD-Annotator/%s" % ANNOTATOR_VERSION,
-                      "Accept": "application/vnd.github+json"})
-    tok = (token or "").strip()
-    if tok:
-        req.add_header("Authorization", "Bearer %s" % tok)
-    err1 = ""
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return _json.loads(r.read().decode("utf-8")), ""
-    except Exception as e:                     # noqa: BLE001
-        err1 = "%s" % e
-    info, err2 = fetch_json_curl(url, tok, timeout)
+    info, err_curl = fetch_json_curl(url, token, timeout)
     if info is not None:
         return info, ""
-    return None, "%s（再试 curl.exe 也不行：%s）" % (err1, err2)
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "LBD-Annotator/%s" % ANNOTATOR_VERSION,
+                          "Accept": "application/vnd.github+json"})
+        if (token or "").strip():
+            req.add_header("Authorization", "Bearer %s" % token.strip())
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8")), ""
+    except Exception as e:                     # noqa: BLE001
+        return None, "curl：%s；urllib：%s" % (err_curl, e)
+
+
+def fetch_latest_release(repo, token="", timeout=6):
+    """查 GitHub 的 release，返回 (info, 错误文本)。不写任何文件。
+
+    两个讲究：
+      1) **curl.exe 优先**（见 _github_json）：避免在不放行 exe 外连的机器上白等；
+      2) 遍历最近的 release，**挑最新一个"挂着 exe 资产"的** —— 新版有时候资产还没传完
+         （这次 v0.39.2 就是这样，检查成功但没东西可下），不该让它挡着更新。
+         实在一个都没挂 exe，就返回最新那个，让上层提示"走浏览器下载页"。
+    """
+    urls = ["https://api.github.com/repos/%s/releases?per_page=10" % repo,
+            "https://api.github.com/repos/%s/releases/latest" % repo]
+    errs = []
+    for url in urls:
+        data, err = _github_json(url, token, timeout)
+        if data is None:
+            errs.append(err)
+            continue
+        rels = data if isinstance(data, list) else [data]
+        rels = [r for r in rels if isinstance(r, dict) and not r.get("draft")]
+        if not rels:
+            errs.append("这个仓库还没有 Release")
+            continue
+        with_exe = []
+        for r in rels:
+            hit = None
+            for a in (r.get("assets") or []):
+                if str(a.get("name") or "").lower().endswith(".exe"):
+                    hit = a
+                    break
+            r["_lbd_asset"] = hit
+            if hit:
+                with_exe.append(r)
+        if with_exe:
+            with_exe.sort(key=lambda r: (parse_version(r.get("tag_name")),
+                                         str(r.get("published_at") or "")),
+                          reverse=True)
+            return with_exe[0], ""
+        rels[0]["_lbd_asset"] = None
+        return rels[0], ""                     # 有 Release，但都没挂 exe
+    return None, "；".join(e for e in errs if e)[:400]
 
 
 def windows_git_credential(host="github.com"):
@@ -1940,7 +1979,7 @@ def infer_lbd_names(shapes, max_gap=3, only_label=None):
     """
     rows = []
     for i, s in enumerate(shapes):
-        if s.get("label") not in ("Node", "Tracker") or s.get("locked"):
+        if s.get("label") not in ("Node", "Tracker"):
             continue
         if only_label and s.get("label") != only_label:
             continue
@@ -2297,11 +2336,11 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
       4) 框里没有可用文字的，按标签表的号（还没被用掉的）按位置顺序补，标黄
       5) 连标签表的号都没有了 -> 标红，等人手填
     """
-    # 锁上的 Node 不参与补编号：不改它的名字，也不占标签表里的号
+    # 锁上的 Node **也补编号**：锁是防"误拖/误删/框选到"的，不是不让补号
+    # （用户反馈：锁定 Node 之后跑「识别框内文字」编号写不进去 —— 就是这里被跳过了）
     locked_n = sum(1 for s in shapes
                    if s.get("label") == "Node" and s.get("locked"))
-    nodes = [(i, s) for i, s in enumerate(shapes)
-             if s.get("label") == "Node" and not s.get("locked")]
+    nodes = [(i, s) for i, s in enumerate(shapes) if s.get("label") == "Node"]
     tol = max(6.0, float(tol_ratio) * max(width, height))
     stat = {"total": len(nodes), "filled": 0, "auto": 0, "missed": 0,
             "wrong_sheet": 0, "kept": 0, "locked": locked_n, "pos_added": 0}
@@ -3709,7 +3748,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.act_lockbox.setShortcut(QKeySequence("Ctrl+L"))
             self.act_lockbox.setToolTip(
                 "把选中的框锁上：点不中、框选框不到、拖不动、Delete 也删不掉，\n"
-                "「清理多余框」和「补全编号」也不会碰它。（Ctrl+L）\n"
+                "「清理多余框」不会删它。\n"
+                "注意：「补全编号 / 自动补编号 / OCR」**照样会**给锁定的 LBD 框写编号\n"
+                "（锁是防误拖误删的，不是不让补号）。（Ctrl+L）\n"
                 "锁定状态存进 JSON，下次打开还在；再点一次＝解锁。\n"
                 "单独解锁某一个：Ctrl+点那个框（或用「解锁本页」）。")
             self.act_lockbox.triggered.connect(self.on_toggle_lock)
@@ -3730,7 +3771,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             self.act_lock_nodes.setShortcut(QKeySequence("Ctrl+Shift+L"))
             self.act_lock_nodes.setToolTip(
                 "一键把本页所有 Node（阵列块）锁上：点不中、框选框不到、拖不动、\n"
-                "Delete 删不掉，「清理多余框」「补全编号」也不会碰它们。（Ctrl+Shift+L）\n"
+                "Delete 删不掉，「清理多余框」不会删它们。\n"
+                "补编号 / OCR 照样会给它们写编号（锁只防误拖误删）。（Ctrl+Shift+L）\n"
                 "本页 Node 全锁着的时候，再点一次＝全部解锁。")
             self.act_lock_nodes.triggered.connect(self.on_lock_page_nodes)
             tb2.addAction(self.act_lock_nodes)
@@ -3769,24 +3811,18 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a.setToolTip("把当前页恢复成上次打开/保存时的样子（画乱了的出口；可用 Ctrl+Z 撤销）")
             a.triggered.connect(self.on_reload_page)
             tb.addAction(a)
-            a = QAction("复制框", self)
-            a.setToolTip("把选中的框复制到剪贴板（Ctrl+C），可以粘到别的页")
-            a.triggered.connect(self.on_copy)
-            tb.addAction(a)
-            a = QAction("粘贴框", self)
-            a.setToolTip("粘贴刚复制的框（Ctrl+V）：原位盖一份，贴出来的框是选中的，直接拖到位置")
-            a.triggered.connect(self.on_paste)
-            tb.addAction(a)
-            a = QAction("放大", self)
-            a.setShortcut(QKeySequence("Ctrl+="))
-            a.setToolTip("放大（Ctrl+= ，滚轮也可以）")
-            a.triggered.connect(lambda: self.zoom_by(1.18))
-            tb.addAction(a)
-            a = QAction("缩小", self)
-            a.setShortcut(QKeySequence("Ctrl+-"))
-            a.setToolTip("缩小（Ctrl+- ，滚轮也可以）")
-            a.triggered.connect(lambda: self.zoom_by(1 / 1.18))
-            tb.addAction(a)
+            # 复制框 / 粘贴框 / 放大 / 缩小 不再占工具栏（Ctrl+C、Ctrl+V、Ctrl+=、Ctrl+-、
+            # 滚轮就够）。动作本身留着挂在窗口上，快捷键才有效。
+            _zi = QAction("放大", self)
+            _zi.setShortcut(QKeySequence("Ctrl+="))
+            _zi.setToolTip("放大（Ctrl+= 或滚轮）")
+            _zi.triggered.connect(lambda: self.zoom_by(1.18))
+            self.addAction(_zi)
+            _zo = QAction("缩小", self)
+            _zo.setShortcut(QKeySequence("Ctrl+-"))
+            _zo.setToolTip("缩小（Ctrl+- 或滚轮）")
+            _zo.triggered.connect(lambda: self.zoom_by(1 / 1.18))
+            self.addAction(_zo)
             a = QAction("适应窗口", self)
             a.setShortcut(QKeySequence("Ctrl+0"))
             a.setToolTip("整页缩放到刚好铺满窗口（Ctrl+0）")
@@ -3817,17 +3853,24 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             a.setToolTip("每个框一行：现有名字 / 框内找到的候选 / 建议名字 —— 导出 CSV 在 Excel 里核")
             a.triggered.connect(self.on_export_check)
             tb.addAction(a)
-            a = QAction("导出 YOLO 数据集…", self)
+            # 用得不多的两个收进「更多…」，工具栏只留日常那几个
+            from PySide6.QtWidgets import QMenu, QToolButton
+            btn_more = QToolButton(self)
+            btn_more.setText("更多…")
+            btn_more.setToolTip("不常用的功能：导出 YOLO 数据集、训练环境")
+            btn_more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            menu_more = QMenu(btn_more)
+            a = menu_more.addAction("导出 YOLO 数据集…")
             a.setToolTip("导出成 YOLO 训练集（images/ + labels/ + data.yaml），可以丢给 yolo26 训练")
             a.triggered.connect(self.on_export_dataset)
-            tb.addAction(a)
+            a = menu_more.addAction("训练环境…")
+            a.setToolTip("检测 Python / 一键装 ultralytics（CPU 版）+ 一键训练")
+            a.triggered.connect(self.on_train_panel)
+            btn_more.setMenu(menu_more)
+            tb.addWidget(btn_more)
             a = QAction("检查更新", self)
             a.setToolTip("看 Release 里有没有新的标注工具包（名字里带 LBD 的那个）")
             a.triggered.connect(self.on_check_update)
-            tb.addAction(a)
-            a = QAction("训练环境…", self)
-            a.setToolTip("检测 Python / 一键装 ultralytics（CPU 版）+ 一键训练")
-            a.triggered.connect(self.on_train_panel)
             tb.addAction(a)
             a = QAction("用模型识别…", self)
             a.setToolTip("用训练好的 YOLO 模型（best.pt）识别图纸，本页/整册自动把框画上来")
@@ -5949,7 +5992,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         # 勾了「重算」-> 已有名字也清掉重填；没勾 -> 只把"不是规范编号"
                         # 的名字清掉（规范名字留着，缺位置的话下面会补上）
                         for si, s in enumerate(pm.shapes):
-                            if s.get("label") != "Node" or s.get("locked"):
+                            if s.get("label") != "Node":
                                 continue
                             nm = (s.get("name") or "").strip()
                             if not (force_names or not _full_lbd_name(nm)):
@@ -5973,7 +6016,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 # ② 文字层没给到号的框（自动补编号时）才送去 OCR；单跑 OCR 时全部重读
                 boxes = [{"ix": i, "label": s.get("label"), "bbox": s["bbox"]}
                          for i, s in enumerate(pm.shapes)
-                         if s.get("label") == "Node" and not s.get("locked")
+                         if s.get("label") == "Node"
                          and not (text_first and _full_lbd_name(s.get("name")))]
                 if not boxes:
                     restore_cleared()
@@ -6009,7 +6052,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         heights.append(float(r["h"]))
                 for i, s in enumerate(pm.shapes):
                     r = got.get(i)
-                    if not r or s.get("locked"):
+                    if not r:            # 锁定的框也照写编号（锁只防误拖/误删）
                         continue
                     touched = True
                     txt = (r.get("text") or "").strip()
@@ -6713,7 +6756,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             hard = QTimer(self)
             hard.setSingleShot(True)
             hard.timeout.connect(on_timeout)
-            hard.start(15000)
+            # curl 8s + urllib 8s = 最多 ~16s，硬超时给到 25s（以前 15s 会把 curl 那条路
+            # 直接掐掉，表现就是"一直卡着检查、最后什么也没更新"）
+            hard.start(30000)
 
             from PySide6.QtCore import QObject as _QO2, Signal as _SIG2
 
@@ -6725,7 +6770,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             def worker():
                 try:
                     tok = update_token(self.settings)      # CredRead 也可能慢，别放主线程
-                    info, err = fetch_latest_release(repo, tok, timeout=10)
+                    info, err = fetch_latest_release(repo, tok, timeout=8)
                 except Exception as e:                     # noqa: BLE001
                     info, err = None, "%s" % e
                 sig.done.emit((info, err))
@@ -6766,10 +6811,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 return
             tag = (info.get("tag_name") or "").strip()
             cur, new = parse_version(ANNOTATOR_VERSION), parse_version(tag)
-            assets = info.get("assets") or []
-            exe = [a for a in assets if (a.get("name") or "").lower().endswith(".exe")]
-            if not exe:
-                exe = [a for a in assets if "lbd" in (a.get("name") or "").lower()]
+            exe = [info.get("_lbd_asset")] if info.get("_lbd_asset") else []
             date = (info.get("published_at") or "")[:10]
             if new and cur and new > cur:
                 lines = ["当前版本：v%s      最新版本：%s（%s）" % (ANNOTATOR_VERSION, tag, date)]
@@ -6790,6 +6832,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 if exe:
                     head += "安装包：%s（%.1f MB）\n" % (
                         exe[0].get("name"), (exe[0].get("size") or 0) / 1048576.0)
+                else:
+                    head += ("⚠ 这个版本还没挂可下载的 exe（可能上传还没完成），\n"
+                             "点「打开下载页」在浏览器里手动下。\n")
                 head += "\n点「下载到程序目录」会存一份新 exe 到程序旁边（不自动覆盖）；\n" \
                         "点「打开下载页」就是浏览器里手动下。"
                 box.setText(head)
