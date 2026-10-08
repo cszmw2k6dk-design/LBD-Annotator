@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.42"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.43"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -182,8 +182,12 @@ def fetch_latest_release(repo, token="", timeout=6, rounds=2, on_round=None, pro
                 on_round(rd + 1)
             except Exception:
                 pass
+        # 第 1 轮**不带 token**（和主程序 Voltage-CAD MAP 走的是同一条通道：
+        # 仓库是公开的，匿名就能读；带 token 反而多一层可能出问题的东西）；
+        # 第 2 轮再带上 token 兜一次（万一以后仓库改回私有）。
+        tok_try = "" if rd == 0 else token
         for url in urls:
-            data, err = _github_json(url, token, timeout, proxy)
+            data, err = _github_json(url, tok_try, timeout, proxy)
             if data is None:
                 errs.append(err)
                 continue
