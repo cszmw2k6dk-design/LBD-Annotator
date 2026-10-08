@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.43"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.44"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -128,7 +128,7 @@ def _github_json(url, token="", timeout=6, proxy=""):
         return None, "curl：%s；urllib：%s" % (err_curl, e)
 
 
-def git_remote_latest_tag(repo, timeout=25):
+def git_remote_latest_tag(repo, timeout=15):
     """兜底：用 git ls-remote 问 GitHub 有哪些 tag（这条通道和你 clone 用的是同一条，
     国内网络经常"api.github.com 不通、github.com 能通"）。
 
@@ -159,64 +159,140 @@ def git_remote_latest_tag(repo, timeout=25):
         return ""
 
 
-def fetch_latest_release(repo, token="", timeout=6, rounds=2, on_round=None, proxy=""):
+def head_release_asset(repo, tag, name="LBD.exe", timeout=8, proxy=""):
+    """直接 HEAD「github.com/<repo>/releases/download/<tag>/<name>」，看这个版本有没有安装包。
+
+    为什么不用 API：国内直连 api.github.com 时通时不通，而 github.com（网页那个域名）
+    通常好得多。公开仓库的安装包地址是可拼的，HEAD 一下就知道在不在、多大。
+    返回 (在不在, 字节数)。
+    """
+    exe = shutil.which("curl") or shutil.which("curl.exe")
+    if not (exe and tag):
+        return False, 0
+    url = "https://github.com/%s/releases/download/%s/%s" % (repo, tag, name)
+    args = [exe, "-sS", "-I", "-L", "--max-time", str(int(timeout)),
+            "-H", "User-Agent: LBD-Annotator/%s" % ANNOTATOR_VERSION]
+    if (proxy or "").strip():
+        args += ["--proxy", proxy.strip()]
+    args.append(url)
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout + 5,
+                           creationflags=_NO_WINDOW)
+        code, size = 0, 0
+        for line in (p.stdout or "").splitlines():
+            m = re.match(r"HTTP/\S+\s+(\d{3})", line.strip())
+            if m:
+                code = int(m.group(1))
+            m2 = re.match(r"[Cc]ontent-[Ll]ength:\s*(\d+)", line.strip())
+            if m2:
+                size = int(m2.group(1))
+        return (200 <= code < 300), size
+    except Exception:                          # noqa: BLE001
+        return False, 0
+
+
+def fetch_latest_release(repo, token="", timeout=6, rounds=1, on_round=None, proxy=""):
     """查 GitHub 的 release，返回 (info, 错误文本)。不写任何文件。
 
-    两个讲究：
-      1) **curl.exe 优先**（见 _github_json）：避免在不放行 exe 外连的机器上白等；
-      2) 遍历最近的 release，**挑最新一个"挂着 exe 资产"的** —— 新版有时候资产还没传完
-         （这次 v0.39.2 就是这样，检查成功但没东西可下），不该让它挡着更新。
-         实在一个都没挂 exe，就返回最新那个，让上层提示"走浏览器下载页"。
-
-    外加两条保命：
-      · 整轮失败就**重试**（国内直连 api.github.com 时通时不通，实测重试经常能成）；
-      · API 全都拿不到时，退回 **git ls-remote** 只看 tag（给你版本号 + 下载页链接，
-        不至于"卡了半天什么都不知道"）。
+    顺序很讲究（实测按这个来最快也最稳，几秒出结果）：
+      ① **git ls-remote** 拿最新 tag —— 和你 clone 同一条通道，实测 2 秒；
+      ② 直接 **HEAD 那个 tag 的安装包**（github.com 域名，公开仓库地址可拼）——
+         有的话当场就能给"下载到程序目录"，完全绕开 api.github.com；
+      ③ 前面拿不到才回退 **api.github.com**（curl.exe 优先 + 匿名优先），
+         它知道"哪些版本真的挂了 exe"，能把没挂包的版本跳过。
     """
-    urls = ["https://api.github.com/repos/%s/releases?per_page=10" % repo,
-            "https://api.github.com/repos/%s/releases/latest" % repo]
-    errs = []
-    for rd in range(max(1, int(rounds))):
-        if on_round:
-            try:
-                on_round(rd + 1)
-            except Exception:
-                pass
-        # 第 1 轮**不带 token**（和主程序 Voltage-CAD MAP 走的是同一条通道：
-        # 仓库是公开的，匿名就能读；带 token 反而多一层可能出问题的东西）；
-        # 第 2 轮再带上 token 兜一次（万一以后仓库改回私有）。
-        tok_try = "" if rd == 0 else token
-        for url in urls:
-            data, err = _github_json(url, tok_try, timeout, proxy)
-            if data is None:
-                errs.append(err)
-                continue
-            rels = data if isinstance(data, list) else [data]
-            rels = [r for r in rels if isinstance(r, dict) and not r.get("draft")]
-            if not rels:
-                errs.append("这个仓库还没有 Release")
-                continue
-            with_exe = []
-            for r in rels:
-                hit = None
-                for a in (r.get("assets") or []):
-                    if str(a.get("name") or "").lower().endswith(".exe"):
-                        hit = a
-                        break
-                r["_lbd_asset"] = hit
-                if hit:
-                    with_exe.append(r)
-            if with_exe:
-                with_exe.sort(key=lambda r: (parse_version(r.get("tag_name")),
-                                             str(r.get("published_at") or "")),
-                              reverse=True)
-                return with_exe[0], ""
-            rels[0]["_lbd_asset"] = None
-            return rels[0], ""                 # 有 Release，但都没挂 exe
-    tag = git_remote_latest_tag(repo)
-    if tag:
-        return {"tag_name": tag, "assets": [], "_lbd_asset": None, "_from": "git"}, ""
-    return None, "；".join(e for e in errs if e)[:400]
+    import queue as _queue
+    import threading as _threading
+    q = _queue.Queue()
+    errs, lock = [], _threading.Lock()
+
+    def _say(msg):
+        with lock:
+            errs.append(str(msg))
+
+    def worker_git():
+        """① git ls-remote 拿 tag（和 clone 同一条通道，实测 2 秒）
+           ② 直接 HEAD 那个 tag 的安装包（github.com，公开仓库地址可拼）。"""
+        try:
+            tag = git_remote_latest_tag(repo)
+            if not tag:
+                _say("git ls-remote 没拿到 tag")
+                return
+            ok, size = head_release_asset(repo, tag, timeout=8, proxy=proxy)
+            if ok:
+                dl = ("https://github.com/%s/releases/download/%s/LBD.exe" % (repo, tag))
+                asset = {"name": "LBD.exe", "size": size, "browser_download_url": dl}
+                q.put({"tag_name": tag, "assets": [asset], "_lbd_asset": asset,
+                       "_from": "git"})
+            else:
+                _say("git 查到 %s，但那个版本没挂 LBD.exe" % tag)
+                q.put({"tag_name": tag, "assets": [], "_lbd_asset": None, "_from": "git"})
+        except Exception as e:                 # noqa: BLE001
+            _say("git 通道：%s" % e)
+
+    def worker_api():
+        """③ api.github.com：知道"哪些版本真的挂了包"，但要它通才行。"""
+        urls = ["https://api.github.com/repos/%s/releases?per_page=10" % repo,
+                "https://api.github.com/repos/%s/releases/latest" % repo]
+        for rd in range(max(1, int(rounds))):
+            if on_round:
+                try:
+                    on_round(rd + 1)
+                except Exception:
+                    pass
+            # 第 1 轮**不带 token**（和主程序 Voltage-CAD MAP 同一条通道：仓库公开，
+            # 匿名就能读；带 token 反而多一层可能出问题的地方），第 2 轮才带。
+            tok_try = "" if rd == 0 else token
+            for url in urls:
+                data, err = _github_json(url, tok_try, timeout, proxy)
+                if data is None:
+                    _say(err)
+                    continue
+                rels = data if isinstance(data, list) else [data]
+                rels = [r for r in rels if isinstance(r, dict) and not r.get("draft")]
+                if not rels:
+                    _say("这个仓库还没有 Release")
+                    continue
+                with_exe = []
+                for r in rels:
+                    hit = None
+                    for a in (r.get("assets") or []):
+                        if str(a.get("name") or "").lower().endswith(".exe"):
+                            hit = a
+                            break
+                    r["_lbd_asset"] = hit
+                    if hit:
+                        with_exe.append(r)
+                if with_exe:
+                    with_exe.sort(key=lambda r: (parse_version(r.get("tag_name")),
+                                                 str(r.get("published_at") or "")),
+                                  reverse=True)
+                    q.put(with_exe[0])
+                else:
+                    q.put(rels[0])
+                return
+
+    for fn in (worker_git, worker_api):
+        _threading.Thread(target=fn, daemon=True).start()
+
+    # 谁先给出"带着安装包"的结果就用谁；只拿到 tag（没安装包信息）就再等 2 秒看有没有更好的
+    deadline, best, t_first = time.time() + 30.0, None, 0.0
+    while time.time() < deadline:
+        try:
+            info = q.get(timeout=min(deadline - time.time(), 3.0))
+        except _queue.Empty:
+            if best is not None and time.time() - t_first > 2.0:
+                return best, ""
+            continue
+        if isinstance(info, dict):
+            if info.get("_lbd_asset"):
+                return info, ""
+            if best is None:
+                best, t_first = info, time.time()
+    if best is not None:
+        return best, ""
+    return None, "；".join(errs)[:400]
 
 
 def windows_git_credential(host="github.com"):
@@ -6772,8 +6848,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             from PySide6.QtCore import QTimer
             repo = str(self.settings.get("update_repo") or UPDATE_REPO)
             page = "https://github.com/%s/releases/latest" % repo
-            prog = QProgressDialog("正在检查更新（%s）…" % repo, "取消", 0, 0, self)
-            prog.setWindowTitle("检查更新")
+            prog = QProgressDialog("正在检查更新（%s）…\n本工具 v%s"
+                                   % (repo, ANNOTATOR_VERSION), "取消", 0, 0, self)
+            prog.setWindowTitle("检查更新（本工具 v%s）" % ANNOTATOR_VERSION)
             prog.setMinimumDuration(0)
             prog.setWindowModality(Qt.WindowModality.WindowModal)
             self.statusBar().showMessage("正在检查更新（%s）…" % repo, 0)
@@ -6785,8 +6862,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             tick.setInterval(1000)
             tick.timeout.connect(
                 lambda: prog.setLabelText(
-                    "正在检查更新（%s）…\n已等 %.0f 秒%s"
-                    % (repo, time.time() - t0,
+                    "正在检查更新（%s）…\n本工具 v%s    已等 %.0f 秒%s"
+                    % (repo, ANNOTATOR_VERSION, time.time() - t0,
                        ("（第 %d 轮重试）" % state["round"]) if state["round"] > 1 else "")))
             tick.start()
 
@@ -6832,9 +6909,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             hard.timeout.connect(on_timeout)
             # curl 8s + urllib 8s = 最多 ~16s，硬超时给到 25s（以前 15s 会把 curl 那条路
             # 直接掐掉，表现就是"一直卡着检查、最后什么也没更新"）
-            # 单次请求 6s × 2 轮 × 2 个 URL × (curl/urllib) 最坏 ~48s，再留 git ls-remote
-            # 兜底 ~25s，所以硬超时给到 90s（框上有"已等 N 秒"和取消按钮，不会白等）
-            hard.start(90000)
+            # 正常路径（git + HEAD）2~4 秒就回来了；最坏是"git 15s + HEAD 13s +
+            # API 4 次 ×6s"≈52s，所以硬超时给 60s（框上有"已等 N 秒"和取消按钮）
+            hard.start(60000)
 
             from PySide6.QtCore import QObject as _QO2, Signal as _SIG2
 
@@ -6882,10 +6959,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 b.setIcon(QMessageBox.Icon.Warning)
                 b.setText("等了 %.0f 秒没拿到结果。" % elapsed)
                 b.setInformativeText(
-                    "试过了：自己发请求、系统 curl.exe、git ls-remote（和自己发请求一样，"
-                    "都连了 2 轮）。\n"
-                    "多半是这台机器的网络到 api.github.com 不稳（国内直连常见）"
-                    "或被防火墙/杀毒软件拦了本工具的外连。\n"
+                    "试过三条路：① git ls-remote（和自己 clone 同一条通道）、"
+                    "② 直接 HEAD 安装包地址（github.com）、③ api.github.com。\n"
+                    "三条都不通，说明这台机器到 github.com 的网络被拦或不稳。\n"
                     "· 能正常 clone 这个仓库的机器上会用本机 git 凭据，一般不用管；\n"
                     "· 也可以在 annotator_settings.json 里加 \"update_token\"（只读 token）"
                     "或 \"update_proxy\"（如 http://127.0.0.1:7890）；\n"
