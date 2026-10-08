@@ -56,3 +56,6 @@ build_tmp/
 # 系统生成的缩略图缓存
 Thumbs.db
 desktop.ini
+
+# 更新诊断生成在程序目录的报告
+update_check_report.txt
