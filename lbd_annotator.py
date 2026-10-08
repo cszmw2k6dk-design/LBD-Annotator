@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.39"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.39.2"                    # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -7499,6 +7499,11 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
         from PySide6.QtCore import Qt as _Qt
         print("控制点计算检查:", Canvas.apply_handle([0, 0, 100, 100], 7, 50, 50),
               Canvas.apply_handle([0, 0, 100, 100], 0, -20, -20))
+        # 自检本来是给自带样例用的：别的文件/补标文件夹上有的页可能是空的，
+        # 这里先保证当前页至少有一个框，免得后面 win.items[0] 直接 IndexError
+        if not win.items:
+            win.add_shape("Tracker", [200, 200, 600, 300])
+            print("   （本页原本没有框，先补一个再继续自检）")
         win.scene.clearSelection()
         it0 = win.items[0]
         it0.setSelected(True)
@@ -7596,6 +7601,8 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                  "通过" if new_boxes and n_same == len(new_boxes) else "不一致！"))
         # 跨页粘贴：复制 -> 翻到下一页 -> 粘贴
         win.scene.clearSelection()
+        if not win.items:
+            win.add_shape("Tracker", [200, 200, 600, 300])
         win.items[0].setSelected(True)
         win.on_copy()
         win.goto_offset(1)
