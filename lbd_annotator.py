@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.50"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.52"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -1152,7 +1152,9 @@ def clean_shapes(shapes, keep_manual=True, use_number=True, use_shape=True,
                 dropped.add(id(m))
                 stats["by_shape"] += 1
 
-    # 2) 同编号
+    # 2) 同编号：**互不重叠的要保留** —— 图纸被 "MATCH LINE (CONTINUED ON ...)" 切成两半时，
+    #    同一个 LBD 的两段各自印了一遍编号、也是两个独立的框；只有"重叠在一起"的才算真重复。
+    #    （以前这里一律只留一个，会把另一半直接删掉。）
     if use_number:
         groups = {}
         for m in models:
@@ -1165,9 +1167,23 @@ def clean_shapes(shapes, keep_manual=True, use_number=True, use_shape=True,
                 continue
             g.sort(key=lambda s: (-float(s.get("confidence") or 0.0),
                                   _bbox_area(s.get("bbox") or [0, 0, 0, 0])))
-            for extra in g[1:]:
-                dropped.add(id(extra))
-                stats["by_number"] += 1
+            kept = []
+            for s in g:
+                if id(s) in dropped:
+                    continue
+                dup = False
+                for k in kept:
+                    if _bbox_iou(s.get("bbox") or [0, 0, 0, 0],
+                                 k.get("bbox") or [0, 0, 0, 0]) >= DUP_IOU:
+                        dup = True
+                        break
+                if dup:
+                    dropped.add(id(s))
+                    stats["by_number"] += 1
+                else:
+                    kept.append(s)
+                    if len(kept) > 1:
+                        stats["seg_kept"] = stats.get("seg_kept", 0) + 1
 
     # 3) 高重叠
     alive = [m for m in models if id(m) not in dropped and m.get("bbox")]
@@ -2822,16 +2838,42 @@ def autofill_shapes(shapes, text_items, sheet, num_set, width, height,
         got[best] = (bd, num, _ltxt)
         pos_of[best] = (px, py)
 
-    # 3) 抢号：同一个号只留最近的那个框
+    # 3) 抢号：同一个号**默认只留一个框**，但图纸被 "MATCH LINE (CONTINUED ON …)" 切成两半时，
+    #    同一个 LBD 会印两遍号、两段是两个**互不重叠**的框 —— 那种两个都要留，
+    #    并标上 raw.lbd_seg = [第几段, 共几段]，下游一眼能看出"这一个 LBD 分了几段"。
     keep, keep_lab, full_name = {}, {}, {}
+    first_of = {}                          # 编号 -> 第一个拿到它的框下标（用来判重叠）
     for i, (d, num, txt) in sorted(got.items(), key=lambda kv: kv[1][0]):
-        if num in keep:
-            continue
+        j = first_of.get(num)
+        if j is not None:
+            a = shapes[i].get("bbox") or [0, 0, 0, 0]
+            b = shapes[j].get("bbox") or [0, 0, 0, 0]
+            if _bbox_iou(a, b) >= DUP_IOU:
+                continue                   # 叠在一起 -> 真重复，只留最近的那个
+            # 不重叠 -> 同一 LBD 的另一段，留着
+        else:
+            first_of[num] = i
         keep[i] = num
         keep_lab[i] = _clean_lbd_label(txt)
         nm = _full_lbd_name(txt)          # 整段编号（INV01A01-LBD-01）就原样用
         if nm:
             full_name[i] = nm
+
+    # 同一个编号拿到多个框的 -> 标成"第 k 段 / 共 n 段"
+    seg_of = {}
+    for _i, _num in keep.items():
+        seg_of.setdefault(_num, []).append(_i)
+    stat["seg_lbd"] = 0
+    for _num, idxs in seg_of.items():
+        if len(idxs) < 2:
+            continue
+        idxs.sort(key=lambda k: (_box_center(shapes[k]["bbox"])[1],
+                                 _box_center(shapes[k]["bbox"])[0]))
+        stat["seg_lbd"] += 1
+        for _k, _i in enumerate(idxs, 1):
+            _raw = shapes[_i].get("raw") if isinstance(shapes[_i].get("raw"), dict) else {}
+            _raw["lbd_seg"] = [_k, len(idxs)]
+            shapes[_i]["raw"] = _raw
 
     used = set(keep.values())
     for i, s in todo:
@@ -3537,8 +3579,9 @@ def make_gui_classes():
         AUTO_COLOR = QColor(230, 150, 0)
         MISS_COLOR = QColor(255, 40, 40)
         CHECK_COLOR = QColor(150, 60, 220)
-        # 补标/识别建议框：统一橙色 + 虚线（一眼就能和原有标注区分），强弱看框上的置信度数字
-        SUG_COLOR = QColor(255, 120, 0)
+        # 补标/识别建议框：和普通框同色（Node 蓝 / Tracker 红 / Box 绿）+ 虚线，
+        # 区分靠"框上有没有置信度数字"（有＝模型建议还没人工确认，没有＝原有/确认过的标注）。
+        SUG_COLOR = QColor(255, 80, 0)                 # 旧版遗留（现在框和数字都用类别颜色）
         show_conf = True                               # 是否在建议框上标置信度（工具栏可切）
 
         def __init__(self, shape):
@@ -3561,7 +3604,8 @@ def make_gui_classes():
             elif self.shape_data.get("_auto"):
                 c = self.AUTO_COLOR
             elif sug:
-                c = BoxItem.SUG_COLOR
+                # 建议框：**和普通框同色**（类别颜色），区分看框上有没有置信度数字
+                c = COLORS.get(self.shape_data["label"], QColor(255, 0, 255))
             else:
                 c = COLORS.get(self.shape_data["label"], QColor(255, 0, 255))
             pen = QPen(c)
@@ -3583,11 +3627,17 @@ def make_gui_classes():
                 self.setBrush(QBrush(QColor(c.red(), c.green(), c.blue(), 0)))
                 return
             if self.is_locked() or sug:
-                # 锁上的框：虚线 + 更淡的底，一眼看得出"这个不能动"
-                # 建议框：同样虚线 —— 虚线＝"还没人工确认过"
+                # 锁上的框：虚线 + 很淡的底，一眼看得出"这个不能动"
+                # 建议框：颜色和普通框一样（类别颜色），只**保留虚线**当"还没人工确认"的标记，
+                #   线宽/填充也和普通框一致，不再另搞一套颜色。
                 pen.setStyle(Qt.PenStyle.DashLine)
-                pen.setWidthF(1.6)
-                alpha = 10 if self.is_locked() else 14
+                if sug:
+                    pen.setDashPattern([5.0, 2.0])     # 虚线画密一点，别显得"浅"
+                    pen.setWidthF(2.0)                 # 和普通框一样粗
+                    alpha = 26                         # 和普通框一样的淡填色
+                else:
+                    pen.setWidthF(1.6)
+                    alpha = 10
             self.setPen(pen)
             self.setBrush(QBrush(QColor(c.red(), c.green(), c.blue(), alpha)))
 
@@ -3714,7 +3764,13 @@ def make_gui_classes():
             box = QRectF(r.left() + 1.0, r.top() + 1.0,
                          max(12.0, len(txt) * size * 0.66), size * 1.3)
             painter.fillRect(box, QColor(255, 255, 255, 200))
-            painter.setPen(QPen(BoxItem.SUG_COLOR))     # 统一橙色（强弱看数字就行）
+            # 数字用框自己的类别颜色（再压深一点，白底上看得清）——
+            # 建议框和普通框"同色"，唯一的区别就是这张框上有没有这个数字。
+            base = self.pen().color()
+            tc = QColor(max(0, int(base.red() * 0.75)),
+                        max(0, int(base.green() * 0.75)),
+                        max(0, int(base.blue() * 0.75)))
+            painter.setPen(QPen(tc))
             painter.drawText(box, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, txt)
             painter.restore()
 
@@ -4127,8 +4183,9 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             BoxItem.show_conf = self.act_show_conf.isChecked()
             self.act_show_conf.setToolTip(
                 "补标/识别建议框上标出置信度数字。\n"
-                "建议框统一是橙色虚线（一眼就能和原有标注区分），强弱看框上的数字：\n"
-                "≥0.7 基本可信、0.5~0.7 看一眼、<0.5 重点核。\n"
+                "建议框和普通框**同色**（Node 蓝 / Tracker 红），区分看两点：\n"
+                "① 框上有没有这个置信度数字（有＝模型建议、还没人工确认）；② 线是虚线。\n"
+                "数字强弱：≥0.7 基本可信、0.5~0.7 看一眼、<0.5 重点核。\n"
                 "框在屏幕上太小时不画数字（放大就会出来），选中的框一定画。")
             self.act_show_conf.toggled.connect(self.on_toggle_show_conf)
             tb2.addAction(self.act_show_conf)
@@ -5384,6 +5441,7 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
             rows, tot = [], {"racks": 0, "strings": 0, "graded": 0}
             if not self.pm:
                 return rows, tot
+            by_name = {}                   # 名字 -> [支架数, 串数, 段数]
             nodes = [s for s in self.pm.shapes if s.get("label") == "Node"]
             racks = [s for s in self.pm.shapes if s.get("label") == "Tracker"]
             tot["racks"] = len(racks)
@@ -5407,7 +5465,15 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                 if not inside:
                     continue
                 st = sum((r.get("raw") or {}).get("strings") or 0 for r in inside)
-                rows.append(((nd.get("name") or "（没填名字）"), len(inside), st))
+                # 同一个 LBD 可能被 MATCH LINE 切成两段（同名字的两个 Node）——
+                # 按名字**合并成一行**，顺便记下分了几段。
+                nm = (nd.get("name") or "（没填名字）")
+                a = by_name.setdefault(nm, [0, 0, 0])
+                a[0] += len(inside)
+                a[1] += st
+                a[2] += 1
+            for nm, v in by_name.items():
+                rows.append((nm, v[0], v[1], v[2]))
             rows.sort(key=lambda x: str(x[0]))
             return rows, tot
 
@@ -5429,9 +5495,10 @@ def run_gui(path=None, smoke=False, memtest=0.0, roundtrip=False):
                         "还没分档：点「支架按长度分档」之后，\n这里会按 LBD 列出各有多少串。")
                     return
                 lines = ["按 LBD 汇总（本页）："]
-                for nm, n, st in rows[:30]:
-                    lines.append("  %s：%d 个支架%s"
-                                 % (nm, n, "，共 %d 串" % st if st else ""))
+                for nm, n, st, nseg in rows[:30]:
+                    lines.append("  %s：%d 个支架%s%s"
+                                 % (nm, n, "，共 %d 串" % st if st else "",
+                                    ("（分 %d 段）" % nseg) if nseg > 1 else ""))
                 if len(rows) > 30:
                     lines.append("  …还有 %d 个 LBD" % (len(rows) - 30))
                 lines.append("合计：%d 个支架，共 %d 串%s"
