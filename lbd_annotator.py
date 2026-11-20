@@ -45,7 +45,7 @@ DEFAULT_CLASS_ID = {"Node": 1, "Tracker": 0, "Box": 0}
 WS = b" \t\r\n"
 # 没有"默认打开某份文件"这回事了：要么命令行给路径，要么在工具里点「打开 JSON」。
 DEFAULT_JSON = ""
-ANNOTATOR_VERSION = "0.52"                      # 标注工具自己的版本号
+ANNOTATOR_VERSION = "0.53"                      # 标注工具自己的版本号
 def _build_stamp():
     """这份 exe（或源码）的生成时间 —— 放在窗口标题里，方便确认到底跑的哪一版。"""
     try:
@@ -593,7 +593,10 @@ from rapidocr_onnxruntime import RapidOCR
 # 原因：拼成一张 2000x7000 的超长图后，检出/识别出来的框会串行、串块，认出来的字就跑了。
 GROUP = 5
 GAP = 12
-LBD_RE = re.compile(r"INV\s*\d+\s*[A-Z]\s*\d+\s*[-_ ]?\s*LBD\s*[-_ ]?\s*\d+", re.I)
+LBD_RE = re.compile(
+    r"(?:INV\s*\d+\s*[A-Z]\s*\d+\s*[-_ ]?\s*LBD"
+    r"|INV\s*[-_ ]?\s*\d+(?:\s*[-_ ]?[A-Z]\s*\d+)?\s*[-_ ]+\s*CBX)"
+    r"\s*[-_ ]*\s*\d+", re.I)
 
 cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 img = Image.open(cfg["img"]).convert("RGB")
@@ -2203,12 +2206,19 @@ def xlsx_lbd_rows(path, sheet_name):
 
 # ------------------------------------------------------- 框内取标签 / 编号
 LBD_NUM_RE = re.compile(r"LBD\s*[_\-–—]?\s*0*(\d+)", re.I)
+# 完整设备编号：INV-1201-CBX-01（也兼容 INV1201A1-CBX-07）。
+CBX_LABEL_RE = re.compile(
+    r"^INV\s*[-_ ]?\s*\d+(?:\s*[-_ ]?[A-Z]\s*\d+)?\s*[-_ ]+\s*CBX"
+    r"\s*[-_ ]*\s*0*(\d{1,4})(?:[._-][A-Za-z0-9]+)*[\s.,;:]*$",
+    re.I)
 # 有些图里框内只印一个裸编号（"07" / "#7"），文字层里并没有 "LBD" 三个字母。
 # 只认"整条就是数字"的，别把 3.5、1:100 这种尺寸/比例当编号。
 BARE_NUM_RE = re.compile(r"^#?\s*0*(\d{1,3})\.?$")
 # 兜底：框里任何文字里的第一个数字（"1.C.1"、"LBD-07"、"07" 都行）
 ANY_NUM_RE = re.compile(r"(\d{1,3})")
-INV_RE = re.compile(r"INV\s*0*(\d+)\s*([A-Za-z])\s*0*(\d+)", re.I)
+INV_RE = re.compile(
+    r"INV\s*[-_ ]?\s*0*(\d+)(?:\s*[-_ ]?([A-Za-z])\s*0*(\d+))?",
+    re.I)
 SHEET_CLEAN_RE = re.compile(r"[^0-9A-Za-z.]")
 
 
@@ -2217,8 +2227,20 @@ def _clean_key(s):
 
 
 def _lbd_num_in(text):
-    m = LBD_NUM_RE.search(str(text or ""))
+    t = str(text or "").strip()
+    m = LBD_NUM_RE.search(t)
+    if m:
+        return int(m.group(1))
+    m = CBX_LABEL_RE.match(t)
     return int(m.group(1)) if m else None
+
+
+def _full_cbx_name(text):
+    """完整 CBX 编号按括号内文字原样归一化；不是完整编号返回 None。"""
+    t = str(text or "").strip()
+    if not CBX_LABEL_RE.match(t):
+        return None
+    return re.sub(r"\s+", "", t).upper().rstrip(".,;:")
 
 
 def _clean_lbd_label(txt):
@@ -2238,7 +2260,9 @@ def _clean_lbd_label(txt):
 
 
 LBD_LABEL_RE = re.compile(r"INV\s*\d+\s*[A-Z]\s*\d+\s*[-_ ]?LBD[-_ ]?\s*\d+", re.I)
-LBDISH_RE = re.compile(r"LBD|INV\s*\d+\s*[A-Z]\s*\d+", re.I)
+LBDISH_RE = re.compile(
+    r"LBD\s*[-_.#]?\s*\d|CBX\s*[-_.#]?\s*\d|INV\s*\d+\s*[A-Z]\s*\d+",
+    re.I)
 
 
 def ocr_text_to_name(txt):
@@ -2257,9 +2281,10 @@ def ocr_text_to_name(txt):
     if not t:
         return "", "miss"
     up = t.upper().replace(" ", "")
-    if LBD_LABEL_RE.search(up):
+    cbx_name = _full_cbx_name(up)
+    if LBD_LABEL_RE.search(up) or cbx_name:
         # 名字用原文（保留 1.01.1.C.5 这种整段），只砍掉尾巴上的 "(2)" 之类注解
-        return re.split(r"[()\[\]{}]", t)[0].strip().replace(" ", "").upper(), "ok"
+        return cbx_name or re.split(r"[()\[\]{}]", t)[0].strip().replace(" ", "").upper(), "ok"
     if LBDISH_RE.search(up):
         return t[:40], "check"
     return "", "noise"
@@ -2433,11 +2458,14 @@ def _lbd_name(sheet, label, num):
 
 
 def _inv_in(text):
-    """文字里自带的 INV 分表名（如 INV31B102_LBD_07 -> INV31B102），没有返回 None。"""
+    """文字里自带的 INV 分表名（INV31B102_LBD_07 / INV-1201-CBX-01），没有返回 None。"""
     m = INV_RE.search(str(text or ""))
     if not m:
         return None
-    return ("INV%s%s%s" % (m.group(1), m.group(2).upper(), m.group(3))).upper()
+    out = "INV%s" % m.group(1)
+    if m.group(2) and m.group(3):
+        out += "%s%s" % (m.group(2).upper(), m.group(3))
+    return out.upper()
 
 
 def norm_sheet(s):
